@@ -1,0 +1,20 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "ai.openclaw.dashboard"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "ai.openclaw.dashboard"
+        minSdk 31
+        targetSdk 35
+        versionCode 1
+        versionName "1.0"
+    }
+}
+
+dependencies {
+    implementation "com.squareup.okhttp3:okhttp:4.12.0"
+}
