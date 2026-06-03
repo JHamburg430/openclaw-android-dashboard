@@ -1,6 +1,6 @@
 # OpenClaw Android Dashboard
 
-Native Android dashboard/node client for an OpenClaw Gateway.
+Native Android shell for the real OpenClaw Control UI.
 
 ## APK
 
@@ -10,7 +10,7 @@ Built debug APK:
 app/build/outputs/apk/debug/app-debug.apk
 ```
 
-## Pairing
+## Usage
 
 Generate a setup code on the gateway host:
 
@@ -18,15 +18,27 @@ Generate a setup code on the gateway host:
 openclaw qr --json --no-ascii
 ```
 
-Paste the `setupCode` into the app and tap `Decode setup code`, then `Connect`.
+Paste the `setupCode` into the app and tap `Decode setup code`.
+
+Then enter either:
+
+- a gateway token, or
+- the gateway password
+
+Tap `Open UI` to load the actual OpenClaw Control UI inside the app `WebView`.
+
+Notes:
+
+- `ws://` and `wss://` gateway URLs are converted to the matching dashboard `http://` or `https://` URL automatically.
+- The app passes the shared secret in both the query string and `#token=...` fragment so the embedded Control UI and its gated runtime endpoints can authenticate.
+- Cleartext `http://` gateways are allowed because many local OpenClaw setups, including this one, are not TLS-enabled.
+
 If the gateway reports pairing is required, approve the pending request from the host:
 
 ```sh
-openclaw nodes pending
-openclaw nodes approve <requestId>
+openclaw devices list
+openclaw devices approve <requestId>
 ```
-
-The app persists its Ed25519 device identity and any gateway-issued device token locally.
 
 ## Build
 

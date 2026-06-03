@@ -7,270 +7,222 @@ import android.os.Bundle;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
+import android.webkit.WebChromeClient;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
-import org.json.JSONArray;
-import org.json.JSONObject;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 
-public final class MainActivity extends Activity implements OpenClawClient.Listener {
+public final class MainActivity extends Activity {
     private static final String PREFS = "openclaw_dashboard";
 
     private SharedPreferences prefs;
-    private IdentityStore identityStore;
-    private OpenClawClient client;
 
     private EditText setupCodeInput;
     private EditText urlInput;
-    private EditText bootstrapInput;
     private EditText tokenInput;
     private EditText passwordInput;
-    private EditText displayNameInput;
     private TextView statusText;
-    private TextView identityText;
-    private TextView metricsText;
-    private TextView dashboardText;
-    private TextView logText;
-    private JSONObject dashboardState = new JSONObject();
+    private TextView hintText;
+    private LinearLayout settingsPanel;
+    private WebView webView;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
-        identityStore = new IdentityStore(this);
-        client = new OpenClawClient(identityStore, this);
         buildUi();
         loadPrefs();
-        showIdentity();
     }
 
     @Override
     protected void onDestroy() {
-        client.disconnect();
+        if (webView != null) {
+            webView.destroy();
+            webView = null;
+        }
         super.onDestroy();
     }
 
     private void buildUi() {
-        ScrollView scroll = new ScrollView(this);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(18), dp(14), dp(18), dp(24));
-        root.setBackgroundColor(Color.rgb(246, 248, 250));
-        scroll.addView(root);
+        root.setBackgroundColor(Color.rgb(14, 18, 24));
 
-        TextView title = text("OpenClaw Dashboard", 26, Color.rgb(20, 28, 33), true);
-        root.addView(title);
-        statusText = text("Not connected", 15, Color.rgb(80, 88, 96), false);
-        root.addView(statusText);
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.VERTICAL);
+        header.setPadding(dp(18), dp(18), dp(18), dp(10));
+        root.addView(header, new LinearLayout.LayoutParams(-1, -2));
 
-        LinearLayout controls = section(root);
+        TextView title = text("OpenClaw Control", 26, Color.rgb(236, 242, 248), true);
+        header.addView(title);
+        statusText = text("Configure the gateway URL and auth, then load the real Control UI.", 14, Color.rgb(150, 164, 178), false);
+        header.addView(statusText);
+
+        ScrollView controlsScroll = new ScrollView(this);
+        settingsPanel = section();
+        controlsScroll.addView(settingsPanel);
+        root.addView(controlsScroll, new LinearLayout.LayoutParams(-1, -2));
+
+        LinearLayout controls = settingsPanel;
         setupCodeInput = input("Paste setup code from openclaw qr --json", false);
         controls.addView(label("Setup code"));
         controls.addView(setupCodeInput);
         Button decode = button("Decode setup code");
         controls.addView(decode);
 
-        urlInput = input("wss://gateway.example", false);
-        bootstrapInput = input("bootstrap token", false);
-        tokenInput = input("gateway/device token", false);
+        urlInput = input("http://100.76.133.101:18789/ or ws://...", false);
+        tokenInput = input("gateway token", false);
         passwordInput = input("gateway password", true);
-        displayNameInput = input("Android OpenClaw Node", false);
         controls.addView(label("Gateway URL"));
         controls.addView(urlInput);
-        controls.addView(label("Bootstrap token"));
-        controls.addView(bootstrapInput);
-        controls.addView(label("Gateway token or saved device token override"));
+        controls.addView(label("Gateway token"));
         controls.addView(tokenInput);
         controls.addView(label("Password"));
         controls.addView(passwordInput);
-        controls.addView(label("Node display name"));
-        controls.addView(displayNameInput);
 
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        Button connect = button("Connect");
-        Button refresh = button("Refresh");
-        Button disconnect = button("Disconnect");
-        row.addView(connect, new LinearLayout.LayoutParams(0, dp(46), 1));
-        row.addView(refresh, new LinearLayout.LayoutParams(0, dp(46), 1));
-        row.addView(disconnect, new LinearLayout.LayoutParams(0, dp(46), 1));
+        Button open = button("Open UI");
+        Button reload = button("Reload");
+        Button toggle = button("Hide Setup");
+        row.setPadding(0, dp(10), 0, 0);
+        row.addView(open, new LinearLayout.LayoutParams(0, dp(46), 1));
+        row.addView(reload, new LinearLayout.LayoutParams(0, dp(46), 1));
+        row.addView(toggle, new LinearLayout.LayoutParams(0, dp(46), 1));
         controls.addView(row);
 
-        identityText = card(root, "Node Identity");
-        metricsText = card(root, "Dashboard");
-        dashboardText = card(root, "Gateway Data");
-        logText = card(root, "Log");
+        hintText = text(
+                "This app now embeds the actual OpenClaw Control UI. If the gateway asks for pairing, approve the pending device request from the host once, then reload.",
+                13,
+                Color.rgb(132, 145, 159),
+                false);
+        hintText.setPadding(0, dp(12), 0, 0);
+        controls.addView(hintText);
+
+        FrameLayout webContainer = new FrameLayout(this);
+        LinearLayout.LayoutParams webLp = new LinearLayout.LayoutParams(-1, 0, 1);
+        webLp.setMargins(0, dp(8), 0, 0);
+        root.addView(webContainer, webLp);
+
+        webView = new WebView(this);
+        webView.setBackgroundColor(Color.rgb(14, 18, 24));
+        WebSettings settings = webView.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setDatabaseEnabled(true);
+        settings.setAllowFileAccess(false);
+        settings.setAllowContentAccess(false);
+        settings.setBuiltInZoomControls(false);
+        settings.setDisplayZoomControls(false);
+        settings.setUseWideViewPort(true);
+        settings.setLoadWithOverviewMode(true);
+        settings.setMediaPlaybackRequiresUserGesture(false);
+        webView.setWebChromeClient(new WebChromeClient());
+        webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                statusText.setText("Loaded Control UI");
+            }
+        });
+        webContainer.addView(webView, new FrameLayout.LayoutParams(-1, -1));
 
         decode.setOnClickListener(v -> decodeSetupCode());
-        connect.setOnClickListener(v -> connect());
-        refresh.setOnClickListener(v -> client.refreshDashboard());
-        disconnect.setOnClickListener(v -> client.disconnect());
-        setContentView(scroll);
+        open.setOnClickListener(v -> openDashboard());
+        reload.setOnClickListener(v -> webView.reload());
+        toggle.setOnClickListener(v -> toggleSettings(toggle));
+        setContentView(root);
     }
 
     private void loadPrefs() {
         urlInput.setText(prefs.getString("url", ""));
-        bootstrapInput.setText(prefs.getString("bootstrap", ""));
         tokenInput.setText(prefs.getString("token", ""));
         passwordInput.setText(prefs.getString("password", ""));
-        displayNameInput.setText(prefs.getString("displayName", "Android OpenClaw Node"));
     }
 
     private void savePrefs() {
         prefs.edit()
                 .putString("url", value(urlInput))
-                .putString("bootstrap", value(bootstrapInput))
                 .putString("token", value(tokenInput))
                 .putString("password", value(passwordInput))
-                .putString("displayName", value(displayNameInput))
                 .apply();
     }
 
     private void decodeSetupCode() {
         try {
             IdentityStore.Setup setup = IdentityStore.parseSetupCode(value(setupCodeInput));
-            urlInput.setText(setup.url);
-            bootstrapInput.setText(setup.bootstrapToken);
-            appendLog("Decoded setup code.");
+            urlInput.setText(toDashboardUrl(setup.url));
+            statusText.setText("Setup code decoded. Add a gateway token or password, then open the UI.");
             savePrefs();
         } catch (Exception e) {
-            onError("Setup decode failed: " + e.getMessage());
+            statusText.setText("Setup decode failed: " + e.getMessage());
         }
     }
 
-    private void connect() {
+    private void openDashboard() {
         savePrefs();
-        dashboardState = new JSONObject();
-        client.connect(new OpenClawClient.Config(
-                value(urlInput),
-                value(bootstrapInput),
-                value(tokenInput),
-                value(passwordInput),
-                value(displayNameInput)));
-    }
-
-    private void showIdentity() {
         try {
-            IdentityStore.Identity identity = identityStore.loadOrCreate();
-            identityText.setText("Device ID\n" + identity.deviceId + "\n\nPublic key\n" + identity.publicKeyRawBase64Url);
+            String dashboardUrl = buildDashboardUrl();
+            webView.loadUrl(dashboardUrl);
+            statusText.setText("Opening Control UI");
         } catch (Exception e) {
-            identityText.setText("Identity unavailable: " + e.getMessage());
+            statusText.setText(e.getMessage());
         }
     }
 
-    @Override
-    public void onStatus(String status) {
-        runOnUiThread(() -> statusText.setText(status));
+    private void toggleSettings(Button toggle) {
+        boolean visible = settingsPanel.getVisibility() == View.VISIBLE;
+        settingsPanel.setVisibility(visible ? View.GONE : View.VISIBLE);
+        hintText.setVisibility(visible ? View.GONE : View.VISIBLE);
+        toggle.setText(visible ? "Show Setup" : "Hide Setup");
     }
 
-    @Override
-    public void onConnected(JSONObject hello) {
-        runOnUiThread(() -> {
-            appendLog("Connected.");
-            renderMetrics();
-        });
-    }
-
-    @Override
-    public void onDashboard(JSONObject dashboard) {
-        runOnUiThread(() -> {
-            merge(dashboardState, dashboard);
-            renderMetrics();
-            dashboardText.setText(pretty(dashboardState));
-        });
-    }
-
-    @Override
-    public void onLog(String message) {
-        runOnUiThread(() -> appendLog(message));
-    }
-
-    @Override
-    public void onError(String message) {
-        runOnUiThread(() -> appendLog("ERROR: " + message));
-    }
-
-    private void renderMetrics() {
-        int nodeCount = countArray(dashboardState.optJSONObject("nodes"), "nodes");
-        int cronCount = countAnyArray(dashboardState.optJSONObject("cron"));
-        JSONObject health = dashboardState.optJSONObject("health");
-        String healthState = health == null ? "unknown" : health.optString("status", health.optString("healthState", "available"));
-        metricsText.setText(
-                "Health: " + healthState +
-                        "\nNodes: " + nodeCount +
-                        "\nCron entries: " + cronCount +
-                        "\nSaved device token: " + (identityStore.getDeviceToken() == null ? "no" : "yes"));
-    }
-
-    private static int countArray(JSONObject object, String key) {
-        if (object == null) return 0;
-        JSONArray array = object.optJSONArray(key);
-        return array == null ? 0 : array.length();
-    }
-
-    private static int countAnyArray(JSONObject object) {
-        if (object == null) return 0;
-        JSONArray jobs = object.optJSONArray("jobs");
-        if (jobs != null) return jobs.length();
-        JSONArray items = object.optJSONArray("items");
-        if (items != null) return items.length();
-        return object.length() == 0 ? 0 : 1;
-    }
-
-    private void appendLog(String message) {
-        String current = logText.getText().toString();
-        String next = current.isEmpty() || current.equals("Log") ? message : current + "\n" + message;
-        logText.setText(next);
-    }
-
-    private static void merge(JSONObject target, JSONObject source) {
-        if (source == null) return;
-        JSONArray names = source.names();
-        if (names == null) return;
-        for (int i = 0; i < names.length(); i++) {
-            String key = names.optString(i);
-            try {
-                target.put(key, source.opt(key));
-            } catch (Exception ignored) {
-            }
+    private String buildDashboardUrl() {
+        String raw = value(urlInput);
+        if (raw.isEmpty()) throw new IllegalStateException("Gateway URL is required.");
+        String dashboardUrl = toDashboardUrl(raw);
+        String secret = value(tokenInput).isEmpty() ? value(passwordInput) : value(tokenInput);
+        if (secret.isEmpty()) {
+            return dashboardUrl;
         }
+        String encoded = URLEncoder.encode(secret, StandardCharsets.UTF_8);
+        String separator = dashboardUrl.contains("?") ? "&" : "?";
+        return dashboardUrl + separator + "token=" + encoded + "#token=" + encoded;
     }
 
-    private static String pretty(JSONObject value) {
-        try {
-            return value.toString(2);
-        } catch (Exception e) {
-            return value.toString();
-        }
+    private static String toDashboardUrl(String raw) {
+        String value = raw == null ? "" : raw.trim();
+        if (value.isEmpty()) return "";
+        if (value.startsWith("ws://")) value = "http://" + value.substring(5);
+        else if (value.startsWith("wss://")) value = "https://" + value.substring(6);
+        else if (!value.startsWith("http://") && !value.startsWith("https://")) value = "https://" + value;
+        if (!value.endsWith("/")) value = value + "/";
+        return value;
     }
 
-    private LinearLayout section(LinearLayout root) {
+    private LinearLayout section() {
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
         layout.setPadding(dp(14), dp(14), dp(14), dp(14));
-        layout.setBackgroundColor(Color.WHITE);
+        layout.setBackgroundColor(Color.rgb(20, 26, 34));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.setMargins(0, dp(14), 0, dp(10));
-        root.addView(layout, lp);
+        lp.setMargins(dp(14), 0, dp(14), 0);
+        layout.setLayoutParams(lp);
         return layout;
     }
 
-    private TextView card(LinearLayout root, String title) {
-        TextView view = text(title, 14, Color.rgb(34, 40, 46), false);
-        view.setPadding(dp(14), dp(14), dp(14), dp(14));
-        view.setBackgroundColor(Color.WHITE);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.setMargins(0, dp(8), 0, dp(8));
-        root.addView(view, lp);
-        return view;
-    }
-
     private TextView label(String value) {
-        TextView view = text(value, 12, Color.rgb(74, 82, 90), true);
+        TextView view = text(value, 12, Color.rgb(130, 144, 158), true);
         view.setPadding(0, dp(8), 0, dp(4));
         return view;
     }
@@ -283,6 +235,9 @@ public final class MainActivity extends Activity implements OpenClawClient.Liste
         input.setTextSize(14);
         input.setInputType(password ? InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD : InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         input.setPadding(dp(10), dp(8), dp(10), dp(8));
+        input.setTextColor(Color.rgb(234, 240, 246));
+        input.setHintTextColor(Color.rgb(111, 124, 137));
+        input.setBackgroundColor(Color.rgb(30, 38, 48));
         return input;
     }
 
