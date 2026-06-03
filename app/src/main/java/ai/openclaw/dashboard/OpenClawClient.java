@@ -147,10 +147,12 @@ final class OpenClawClient {
             authToken = deviceToken;
         }
         long signedAtMs = System.currentTimeMillis();
-        String signatureToken = firstNonEmpty(authToken, bootstrapToken, config.password, deviceToken);
+        String signatureToken = firstNonEmpty(authToken, deviceToken, bootstrapToken);
+        String platform = normalizeMetadata("android");
+        String family = normalizeMetadata(deviceFamily());
         String payload = "v3|" + identity.deviceId + "|" + CLIENT_ID + "|node|" + role + "|" +
                 join(scopes) + "|" + signedAtMs + "|" + (signatureToken == null ? "" : signatureToken) + "|" +
-                nonce + "|android|" + deviceFamily();
+                nonce + "|" + platform + "|" + family;
         String signature = IdentityStore.sign(identity.privateKey, payload);
 
         JSONObject auth = new JSONObject();
@@ -162,8 +164,8 @@ final class OpenClawClient {
                 .put("id", CLIENT_ID)
                 .put("displayName", config.displayName)
                 .put("version", "1.0")
-                .put("platform", "android")
-                .put("deviceFamily", deviceFamily())
+                .put("platform", platform)
+                .put("deviceFamily", family)
                 .put("mode", "node")
                 .put("instanceId", identity.deviceId);
         JSONObject device = new JSONObject()
@@ -282,6 +284,11 @@ final class OpenClawClient {
     private static String deviceFamily() {
         String model = Build.MANUFACTURER + " " + Build.MODEL;
         return model.trim().isEmpty() ? "Android" : model.trim();
+    }
+
+    private static String normalizeMetadata(String value) {
+        if (value == null) return "";
+        return value.trim().toLowerCase(java.util.Locale.ROOT);
     }
 
     interface Callback { void ok(JSONObject payload); }
