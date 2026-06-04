@@ -1,10 +1,13 @@
 package ai.openclaw.dashboard;
 
+import android.Manifest;
 import android.app.Activity;
+import android.content.pm.PackageManager;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.os.Bundle;
 import android.text.InputType;
+import android.webkit.PermissionRequest;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -21,11 +24,15 @@ import android.widget.TextView;
 
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 
 public final class MainActivity extends Activity {
     private static final String PREFS = "openclaw_dashboard";
+    private static final int REQUEST_RECORD_AUDIO = 2001;
 
     private SharedPreferences prefs;
+    private PermissionRequest pendingPermissionRequest;
 
     private EditText setupCodeInput;
     private EditText urlInput;
@@ -128,7 +135,22 @@ public final class MainActivity extends Activity {
         settings.setUseWideViewPort(true);
         settings.setLoadWithOverviewMode(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
-        webView.setWebChromeClient(new WebChromeClient());
+        webView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onPermissionRequest(PermissionRequest request) {
+                runOnUiThread(() -> handleWebPermissionRequest(request));
+            }
+
+            @Override
+            public void onPermissionRequestCanceled(PermissionRequest request) {
+                runOnUiThread(() -> {
+                    if (pendingPermissionRequest == request) {
+                        pendingPermissionRequest = null;
+                    }
+                    statusText.setText("Microphone request was canceled.");
+                });
+            }
+        });
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public void onPageFinished(WebView view, String url) {
@@ -178,6 +200,77 @@ public final class MainActivity extends Activity {
         } catch (Exception e) {
             statusText.setText(e.getMessage());
         }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != REQUEST_RECORD_AUDIO) return;
+        if (hasRecordAudioPermission()) {
+            grantPendingAudioCapture();
+        } else {
+            denyPendingPermissionRequest();
+            statusText.setText("Microphone access was denied by Android. Enable it in app permissions and try again.");
+        }
+    }
+
+    private void handleWebPermissionRequest(PermissionRequest request) {
+        if (!requestsAudioCapture(request)) {
+            request.deny();
+            return;
+        }
+        if (hasRecordAudioPermission()) {
+            grantAudioCapture(request);
+            statusText.setText("Microphone access granted.");
+            return;
+        }
+        pendingPermissionRequest = request;
+        statusText.setText("OpenClaw needs microphone access for Talk. Approve the Android permission prompt.");
+        requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD_AUDIO);
+    }
+
+    private boolean hasRecordAudioPermission() {
+        return checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private boolean requestsAudioCapture(PermissionRequest request) {
+        for (String resource : request.getResources()) {
+            if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(resource)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void grantPendingAudioCapture() {
+        PermissionRequest request = pendingPermissionRequest;
+        pendingPermissionRequest = null;
+        if (request != null) {
+            grantAudioCapture(request);
+            statusText.setText("Microphone access granted.");
+        }
+    }
+
+    private void denyPendingPermissionRequest() {
+        PermissionRequest request = pendingPermissionRequest;
+        pendingPermissionRequest = null;
+        if (request != null) {
+            request.deny();
+        }
+    }
+
+    private void grantAudioCapture(PermissionRequest request) {
+        List<String> granted = new ArrayList<>();
+        for (String resource : request.getResources()) {
+            if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(resource)) {
+                granted.add(resource);
+            }
+        }
+        if (granted.isEmpty()) {
+            request.deny();
+            return;
+        }
+        request.grant(granted.toArray(new String[0]));
     }
 
     private void toggleSettings(Button toggle) {
