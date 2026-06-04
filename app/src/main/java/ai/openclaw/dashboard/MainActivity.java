@@ -187,8 +187,11 @@ public final class MainActivity extends Activity {
     private void decodeSetupCode() {
         try {
             IdentityStore.Setup setup = IdentityStore.parseSetupCode(value(setupCodeInput));
-            urlInput.setText(toDashboardUrl(setup.url));
-            statusText.setText("Setup code decoded. For Android Talk, use a secure https:// dashboard URL before opening the UI.");
+            String preferredUrl = firstNonEmpty(setup.publicUrl, setup.url);
+            urlInput.setText(toDashboardUrl(preferredUrl));
+            statusText.setText(isSecureDashboardUrl(toDashboardUrl(preferredUrl))
+                    ? "Setup code decoded. Secure dashboard URL loaded."
+                    : "Setup code decoded. For Android Talk, use a secure https:// dashboard URL before opening the UI.");
             savePrefs();
         } catch (Exception e) {
             statusText.setText("Setup decode failed: " + e.getMessage());
@@ -327,6 +330,13 @@ public final class MainActivity extends Activity {
         } catch (Exception ignored) {
             return false;
         }
+    }
+
+    private static String firstNonEmpty(String... values) {
+        for (String value : values) {
+            if (value != null && !value.trim().isEmpty()) return value;
+        }
+        return "";
     }
 
     private LinearLayout section() {

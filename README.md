@@ -30,6 +30,7 @@ Tap `Open UI` to load the actual OpenClaw Control UI inside the app `WebView`.
 Notes:
 
 - `ws://` and `wss://` gateway URLs are converted to the matching dashboard `http://` or `https://` URL automatically.
+- When a setup code includes both a raw gateway URL and a secure public URL, the app prefers the secure public URL automatically.
 - The app passes the shared secret in both the query string and `#token=...` fragment so the embedded Control UI and its gated runtime endpoints can authenticate.
 - Cleartext `http://` gateways are allowed because many local OpenClaw setups, including this one, are not TLS-enabled.
 - Realtime Talk on Android WebView requires a secure `https://` dashboard origin, or `http://localhost` during local emulator-only testing. For real devices, use your Tailscale/MagicDNS Control UI hostname rather than a raw LAN or tailnet IP.

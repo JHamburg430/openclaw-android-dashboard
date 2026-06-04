@@ -95,7 +95,11 @@ final class IdentityStore {
         if (trimmed.isEmpty()) throw new IllegalArgumentException("Setup code is empty.");
         String decoded = new String(Base64.decode(trimmed, Base64.URL_SAFE | Base64.NO_WRAP), StandardCharsets.UTF_8);
         JSONObject json = new JSONObject(decoded);
-        return new Setup(json.optString("url", ""), json.optString("bootstrapToken", ""));
+        return new Setup(
+                json.optString("url", ""),
+                json.optString("publicUrl", ""),
+                json.optString("bootstrapToken", "")
+        );
     }
 
     private static String toB64(byte[] bytes) {
@@ -140,10 +144,12 @@ final class IdentityStore {
 
     static final class Setup {
         final String url;
+        final String publicUrl;
         final String bootstrapToken;
 
-        Setup(String url, String bootstrapToken) {
+        Setup(String url, String publicUrl, String bootstrapToken) {
             this.url = url;
+            this.publicUrl = publicUrl;
             this.bootstrapToken = bootstrapToken;
         }
     }
