@@ -8,6 +8,7 @@ import android.graphics.Color;
 import android.os.Bundle;
 import android.text.InputType;
 import android.webkit.PermissionRequest;
+import android.webkit.WebStorage;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -81,15 +82,18 @@ public final class MainActivity extends Activity {
         root.addView(controlsScroll, new LinearLayout.LayoutParams(-1, -2));
 
         LinearLayout controls = settingsPanel;
-        setupCodeInput = input("Paste setup code from openclaw qr --json", false);
+        setupCodeInput = input("Paste setup code from openclaw qr --json", false, false);
+        setupCodeInput.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
         controls.addView(label("Setup code"));
         controls.addView(setupCodeInput);
         Button decode = button("Decode setup code");
         controls.addView(decode);
 
-        urlInput = input("http://100.76.133.101:18789/ or ws://...", false);
-        tokenInput = input("gateway token", false);
-        passwordInput = input("gateway password", true);
+        urlInput = input("http://100.76.133.101:18789/ or ws://...", false, true);
+        tokenInput = input("gateway token", false, true);
+        tokenInput.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+        passwordInput = input("gateway password", true, true);
+        passwordInput.setAutofillHints(View.AUTOFILL_HINT_PASSWORD);
         controls.addView(label("Gateway URL"));
         controls.addView(urlInput);
         controls.addView(label("Gateway token"));
@@ -184,7 +188,7 @@ public final class MainActivity extends Activity {
         try {
             IdentityStore.Setup setup = IdentityStore.parseSetupCode(value(setupCodeInput));
             urlInput.setText(toDashboardUrl(setup.url));
-            statusText.setText("Setup code decoded. Add a gateway token or password, then open the UI.");
+            statusText.setText("Setup code decoded. For Android Talk, use a secure https:// dashboard URL before opening the UI.");
             savePrefs();
         } catch (Exception e) {
             statusText.setText("Setup decode failed: " + e.getMessage());
@@ -195,6 +199,10 @@ public final class MainActivity extends Activity {
         savePrefs();
         try {
             String dashboardUrl = buildDashboardUrl();
+            webView.stopLoading();
+            webView.clearCache(true);
+            webView.clearHistory();
+            WebStorage.getInstance().deleteAllData();
             webView.loadUrl(dashboardUrl);
             statusText.setText("Opening Control UI");
         } catch (Exception e) {
@@ -284,6 +292,9 @@ public final class MainActivity extends Activity {
         String raw = value(urlInput);
         if (raw.isEmpty()) throw new IllegalStateException("Gateway URL is required.");
         String dashboardUrl = toDashboardUrl(raw);
+        if (!isSecureDashboardUrl(dashboardUrl)) {
+            throw new IllegalStateException("Android Talk requires a secure https:// dashboard URL. Use your Tailscale/MagicDNS hostname instead of the raw ws:// or http:// gateway address.");
+        }
         String secret = value(tokenInput).isEmpty() ? value(passwordInput) : value(tokenInput);
         if (secret.isEmpty()) {
             return dashboardUrl;
@@ -303,6 +314,21 @@ public final class MainActivity extends Activity {
         return value;
     }
 
+    private static boolean isSecureDashboardUrl(String raw) {
+        try {
+            java.net.URI uri = java.net.URI.create(raw);
+            String scheme = uri.getScheme();
+            String host = uri.getHost();
+            if (scheme == null || host == null) return false;
+            if ("https".equalsIgnoreCase(scheme)) return true;
+            if (!"http".equalsIgnoreCase(scheme)) return false;
+            String normalized = host.trim().toLowerCase();
+            return "localhost".equals(normalized) || "127.0.0.1".equals(normalized) || "::1".equals(normalized);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
     private LinearLayout section() {
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
@@ -320,13 +346,16 @@ public final class MainActivity extends Activity {
         return view;
     }
 
-    private EditText input(String hint, boolean password) {
+    private EditText input(String hint, boolean password, boolean singleLine) {
         EditText input = new EditText(this);
         input.setHint(hint);
-        input.setSingleLine(false);
-        input.setMinLines(1);
+        input.setSingleLine(singleLine);
+        input.setMinLines(singleLine ? 1 : 3);
+        input.setMaxLines(singleLine ? 1 : 6);
         input.setTextSize(14);
-        input.setInputType(password ? InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD : InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        if (password) input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        else if (singleLine) input.setInputType(InputType.TYPE_CLASS_TEXT);
+        else input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         input.setPadding(dp(10), dp(8), dp(10), dp(8));
         input.setTextColor(Color.rgb(234, 240, 246));
         input.setHintTextColor(Color.rgb(111, 124, 137));
