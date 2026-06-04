@@ -4,6 +4,7 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.util.Base64;
 
+import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.nio.charset.StandardCharsets;
@@ -93,13 +94,56 @@ final class IdentityStore {
     static Setup parseSetupCode(String input) throws Exception {
         String trimmed = input == null ? "" : input.trim();
         if (trimmed.isEmpty()) throw new IllegalArgumentException("Setup code is empty.");
-        String decoded = new String(Base64.decode(trimmed, Base64.URL_SAFE | Base64.NO_WRAP), StandardCharsets.UTF_8);
-        JSONObject json = new JSONObject(decoded);
+        String candidate = extractSetupCodeCandidate(trimmed);
+        String decoded;
+        try {
+            decoded = new String(Base64.decode(candidate, Base64.URL_SAFE | Base64.NO_WRAP), StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("Setup code is not valid base64url.", e);
+        }
+        JSONObject json;
+        try {
+            json = new JSONObject(decoded);
+        } catch (JSONException e) {
+            throw new IllegalArgumentException("Decoded setup payload is not valid JSON.", e);
+        }
         return new Setup(
                 json.optString("url", ""),
                 json.optString("publicUrl", ""),
                 json.optString("bootstrapToken", "")
         );
+    }
+
+    private static String extractSetupCodeCandidate(String input) throws Exception {
+        String trimmed = stripWrapping(input.trim());
+        if (trimmed.startsWith("{")) {
+            JSONObject outer = new JSONObject(trimmed);
+            String setupCode = outer.optString("setupCode", "").trim();
+            if (setupCode.isEmpty()) {
+                throw new IllegalArgumentException("JSON input is missing setupCode.");
+            }
+            return stripWrapping(setupCode);
+        }
+        return trimmed;
+    }
+
+    private static String stripWrapping(String input) {
+        String value = input == null ? "" : input.trim();
+        if (value.startsWith("```")) {
+            int firstNewline = value.indexOf('\n');
+            if (firstNewline >= 0) {
+                value = value.substring(firstNewline + 1);
+            }
+            int fenceEnd = value.lastIndexOf("```");
+            if (fenceEnd >= 0) {
+                value = value.substring(0, fenceEnd);
+            }
+            value = value.trim();
+        }
+        if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
+            value = value.substring(1, value.length() - 1).trim();
+        }
+        return value;
     }
 
     private static String toB64(byte[] bytes) {

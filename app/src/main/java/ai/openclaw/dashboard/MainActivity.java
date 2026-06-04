@@ -5,9 +5,14 @@ import android.app.Activity;
 import android.content.pm.PackageManager;
 import android.content.SharedPreferences;
 import android.graphics.Color;
+import android.net.Uri;
 import android.os.Bundle;
 import android.text.InputType;
+import android.util.Log;
+import android.webkit.ConsoleMessage;
 import android.webkit.PermissionRequest;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebStorage;
 import android.view.Gravity;
 import android.view.View;
@@ -23,15 +28,27 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import org.json.JSONObject;
+
+import java.io.ByteArrayInputStream;
+import java.io.InputStream;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
 
 public final class MainActivity extends Activity {
     private static final String PREFS = "openclaw_dashboard";
     private static final int REQUEST_RECORD_AUDIO = 2001;
+    private static final String TAG = "OpenClawDashboard";
 
+    private final OkHttpClient httpClient = new OkHttpClient();
     private SharedPreferences prefs;
     private PermissionRequest pendingPermissionRequest;
 
@@ -50,6 +67,7 @@ public final class MainActivity extends Activity {
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         buildUi();
         loadPrefs();
+        maybeAutoOpenDashboard();
     }
 
     @Override
@@ -128,6 +146,7 @@ public final class MainActivity extends Activity {
 
         webView = new WebView(this);
         webView.setBackgroundColor(Color.rgb(14, 18, 24));
+        WebView.setWebContentsDebuggingEnabled(true);
         WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
@@ -140,6 +159,12 @@ public final class MainActivity extends Activity {
         settings.setLoadWithOverviewMode(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
         webView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public boolean onConsoleMessage(ConsoleMessage consoleMessage) {
+                Log.d(TAG, "console " + consoleMessage.messageLevel() + " " + consoleMessage.sourceId() + ":" + consoleMessage.lineNumber() + " " + consoleMessage.message());
+                return super.onConsoleMessage(consoleMessage);
+            }
+
             @Override
             public void onPermissionRequest(PermissionRequest request) {
                 runOnUiThread(() -> handleWebPermissionRequest(request));
@@ -157,8 +182,38 @@ public final class MainActivity extends Activity {
         });
         webView.setWebViewClient(new WebViewClient() {
             @Override
+            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                return interceptControlUiHtml(request);
+            }
+
+            @Override
+            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                Log.d(TAG, "page started " + url);
+                statusText.setText("Loading Control UI");
+            }
+
+            @Override
             public void onPageFinished(WebView view, String url) {
+                Log.d(TAG, "page finished " + url);
                 statusText.setText("Loaded Control UI");
+            }
+
+            @Override
+            public void onReceivedError(WebView view, android.webkit.WebResourceRequest request, android.webkit.WebResourceError error) {
+                if (request.isForMainFrame()) {
+                    String description = error == null ? "unknown error" : String.valueOf(error.getDescription());
+                    Log.e(TAG, "page error " + request.getUrl() + " " + description);
+                    statusText.setText("Control UI load failed: " + description);
+                }
+            }
+
+            @Override
+            public void onReceivedHttpError(WebView view, android.webkit.WebResourceRequest request, android.webkit.WebResourceResponse errorResponse) {
+                if (request.isForMainFrame()) {
+                    int statusCode = errorResponse == null ? -1 : errorResponse.getStatusCode();
+                    Log.e(TAG, "http error " + request.getUrl() + " " + statusCode);
+                    statusText.setText("Control UI load failed: HTTP " + statusCode);
+                }
             }
         });
         webContainer.addView(webView, new FrameLayout.LayoutParams(-1, -1));
@@ -174,6 +229,14 @@ public final class MainActivity extends Activity {
         urlInput.setText(prefs.getString("url", ""));
         tokenInput.setText(prefs.getString("token", ""));
         passwordInput.setText(prefs.getString("password", ""));
+    }
+
+    private void maybeAutoOpenDashboard() {
+        String rawUrl = value(urlInput);
+        if (rawUrl.isEmpty()) return;
+        String dashboardUrl = toDashboardUrl(rawUrl);
+        if (!isSecureDashboardUrl(dashboardUrl)) return;
+        openDashboard();
     }
 
     private void savePrefs() {
@@ -202,6 +265,7 @@ public final class MainActivity extends Activity {
         savePrefs();
         try {
             String dashboardUrl = buildDashboardUrl();
+            Log.d(TAG, "opening " + dashboardUrl);
             webView.stopLoading();
             webView.clearCache(true);
             webView.clearHistory();
@@ -298,13 +362,75 @@ public final class MainActivity extends Activity {
         if (!isSecureDashboardUrl(dashboardUrl)) {
             throw new IllegalStateException("Android Talk requires a secure https:// dashboard URL. Use your Tailscale/MagicDNS hostname instead of the raw ws:// or http:// gateway address.");
         }
-        String secret = value(tokenInput).isEmpty() ? value(passwordInput) : value(tokenInput);
-        if (secret.isEmpty()) {
-            return dashboardUrl;
+        return dashboardUrl;
+    }
+
+    private WebResourceResponse interceptControlUiHtml(WebResourceRequest request) {
+        try {
+            if (request == null || !request.isForMainFrame()) return null;
+            if (!"GET".equalsIgnoreCase(request.getMethod())) return null;
+            Uri uri = request.getUrl();
+            if (uri == null) return null;
+            String scheme = uri.getScheme();
+            if (!"https".equalsIgnoreCase(scheme) && !"http".equalsIgnoreCase(scheme)) return null;
+
+            Request.Builder builder = new Request.Builder().url(uri.toString()).get();
+            Map<String, String> requestHeaders = request.getRequestHeaders();
+            if (requestHeaders != null) {
+                for (Map.Entry<String, String> entry : requestHeaders.entrySet()) {
+                    if (entry.getKey() != null && entry.getValue() != null) {
+                        builder.header(entry.getKey(), entry.getValue());
+                    }
+                }
+            }
+
+            Response response = httpClient.newCall(builder.build()).execute();
+            if (response.body() == null) {
+                response.close();
+                return null;
+            }
+            String contentType = response.header("Content-Type", "");
+            if (!contentType.toLowerCase().contains("text/html")) {
+                response.close();
+                return null;
+            }
+
+            String html = response.body().string();
+            response.close();
+            String injected = injectNativeAuth(html);
+            byte[] bytes = injected.getBytes(StandardCharsets.UTF_8);
+            InputStream stream = new ByteArrayInputStream(bytes);
+            Map<String, String> headers = new HashMap<>();
+            headers.put("Cache-Control", "no-store");
+            return new WebResourceResponse("text/html", "UTF-8", 200, "OK", headers, stream);
+        } catch (Exception e) {
+            Log.w(TAG, "html intercept failed: " + e.getMessage());
+            return null;
         }
-        String encoded = URLEncoder.encode(secret, StandardCharsets.UTF_8);
-        String separator = dashboardUrl.contains("?") ? "&" : "?";
-        return dashboardUrl + separator + "token=" + encoded + "#token=" + encoded;
+    }
+
+    private String injectNativeAuth(String html) {
+        String script = "<script>" + buildNativeAuthScript() + "</script>";
+        int headIndex = html.indexOf("<head>");
+        if (headIndex >= 0) {
+            return html.substring(0, headIndex + 6) + script + html.substring(headIndex + 6);
+        }
+        int htmlIndex = html.indexOf(">");
+        if (htmlIndex >= 0) {
+            return html.substring(0, htmlIndex + 1) + script + html.substring(htmlIndex + 1);
+        }
+        return script + html;
+    }
+
+    private String buildNativeAuthScript() {
+        String token = value(tokenInput);
+        String password = value(passwordInput);
+        StringBuilder auth = new StringBuilder();
+        auth.append("{\"gatewayUrl\":").append(JSONObject.quote(buildDashboardUrl()));
+        if (!token.isEmpty()) auth.append(",\"token\":").append(JSONObject.quote(token));
+        if (!password.isEmpty()) auth.append(",\"password\":").append(JSONObject.quote(password));
+        auth.append("}");
+        return "window.__OPENCLAW_NATIVE_CONTROL_AUTH__=" + auth + ";";
     }
 
     private static String toDashboardUrl(String raw) {
