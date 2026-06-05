@@ -115,15 +115,9 @@ public final class MainActivity extends Activity {
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.rgb(14, 18, 24));
 
-        LinearLayout header = new LinearLayout(this);
-        header.setOrientation(LinearLayout.VERTICAL);
-        header.setPadding(dp(18), dp(18), dp(18), dp(10));
-        root.addView(header, new LinearLayout.LayoutParams(-1, -2));
-
-        TextView title = text("OpenClaw Control", 26, Color.rgb(236, 242, 248), true);
-        header.addView(title);
         statusText = text("Configure the gateway URL and auth, then load the real Control UI.", 14, Color.rgb(150, 164, 178), false);
-        header.addView(statusText);
+        statusText.setPadding(dp(14), dp(10), dp(14), dp(6));
+        root.addView(statusText, new LinearLayout.LayoutParams(-1, -2));
 
         LinearLayout topActions = new LinearLayout(this);
         topActions.setOrientation(LinearLayout.HORIZONTAL);
@@ -132,9 +126,9 @@ public final class MainActivity extends Activity {
         Button open = button("Open UI");
         Button reload = button("Reload");
         Button toggle = button("Hide Setup");
-        topActions.addView(open, new LinearLayout.LayoutParams(0, dp(46), 1));
-        topActions.addView(reload, new LinearLayout.LayoutParams(0, dp(46), 1));
-        topActions.addView(toggle, new LinearLayout.LayoutParams(0, dp(46), 1));
+        topActions.addView(open, new LinearLayout.LayoutParams(0, dp(38), 1));
+        topActions.addView(reload, new LinearLayout.LayoutParams(0, dp(38), 1));
+        topActions.addView(toggle, new LinearLayout.LayoutParams(0, dp(38), 1));
         root.addView(topActions, new LinearLayout.LayoutParams(-1, -2));
 
         ScrollView controlsScroll = new ScrollView(this);
@@ -184,13 +178,13 @@ public final class MainActivity extends Activity {
 
         diagnosticsText = text("No diagnostics yet.", 12, Color.rgb(195, 205, 214), false);
         diagnosticsText.setTextIsSelectable(true);
-        diagnosticsText.setPadding(dp(10), dp(10), dp(10), dp(10));
+        diagnosticsText.setPadding(dp(10), dp(8), dp(10), dp(8));
         diagnosticsText.setBackgroundColor(Color.rgb(10, 14, 20));
         controls.addView(diagnosticsText);
 
         FrameLayout webContainer = new FrameLayout(this);
         LinearLayout.LayoutParams webLp = new LinearLayout.LayoutParams(-1, 0, 1);
-        webLp.setMargins(0, dp(8), 0, 0);
+        webLp.setMargins(0, dp(4), 0, 0);
         root.addView(webContainer, webLp);
 
         webView = new WebView(this);
@@ -964,17 +958,17 @@ public final class MainActivity extends Activity {
     private LinearLayout section() {
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
-        layout.setPadding(dp(14), dp(14), dp(14), dp(14));
+        layout.setPadding(dp(14), dp(10), dp(14), dp(10));
         layout.setBackgroundColor(Color.rgb(20, 26, 34));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.setMargins(dp(14), 0, dp(14), 0);
+        lp.setMargins(dp(14), dp(4), dp(14), 0);
         layout.setLayoutParams(lp);
         return layout;
     }
 
     private TextView label(String value) {
         TextView view = text(value, 12, Color.rgb(130, 144, 158), true);
-        view.setPadding(0, dp(8), 0, dp(4));
+        view.setPadding(0, dp(6), 0, dp(3));
         return view;
     }
 
