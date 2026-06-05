@@ -113,6 +113,18 @@ public final class MainActivity extends Activity {
         statusText = text("Configure the gateway URL and auth, then load the real Control UI.", 14, Color.rgb(150, 164, 178), false);
         header.addView(statusText);
 
+        LinearLayout topActions = new LinearLayout(this);
+        topActions.setOrientation(LinearLayout.HORIZONTAL);
+        topActions.setGravity(Gravity.CENTER_VERTICAL);
+        topActions.setPadding(dp(14), 0, dp(14), 0);
+        Button open = button("Open UI");
+        Button reload = button("Reload");
+        Button toggle = button("Hide Setup");
+        topActions.addView(open, new LinearLayout.LayoutParams(0, dp(46), 1));
+        topActions.addView(reload, new LinearLayout.LayoutParams(0, dp(46), 1));
+        topActions.addView(toggle, new LinearLayout.LayoutParams(0, dp(46), 1));
+        root.addView(topActions, new LinearLayout.LayoutParams(-1, -2));
+
         ScrollView controlsScroll = new ScrollView(this);
         settingsPanel = section();
         controlsScroll.addView(settingsPanel);
@@ -137,18 +149,6 @@ public final class MainActivity extends Activity {
         controls.addView(tokenInput);
         controls.addView(label("Password"));
         controls.addView(passwordInput);
-
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        Button open = button("Open UI");
-        Button reload = button("Reload");
-        Button toggle = button("Hide Setup");
-        row.setPadding(0, dp(10), 0, 0);
-        row.addView(open, new LinearLayout.LayoutParams(0, dp(46), 1));
-        row.addView(reload, new LinearLayout.LayoutParams(0, dp(46), 1));
-        row.addView(toggle, new LinearLayout.LayoutParams(0, dp(46), 1));
-        controls.addView(row);
 
         hintText = text(
                 "This app now embeds the actual OpenClaw Control UI. If the gateway asks for pairing, approve the pending device request from the host once, then reload.",
