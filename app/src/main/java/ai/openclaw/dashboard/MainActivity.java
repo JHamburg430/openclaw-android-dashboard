@@ -234,6 +234,7 @@ public final class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 recordDiagnostic("page.finished", url);
+                injectRuntimeScripts(view, "page_finished");
                 Log.d(TAG, "page finished " + url);
                 statusText.setText("Loaded Control UI");
             }
@@ -495,6 +496,8 @@ public final class MainActivity extends Activity {
                 + "function send(kind,payload){try{if(bridge&&typeof bridge.emit==='function'){bridge.emit(String(kind||'diag'),typeof payload==='string'?payload:JSON.stringify(payload||{}));}}catch(_){}}"
                 + "window.__OPENCLAW_DIAG__={emit:send};"
                 + "send('bootstrap',{href:String(location.href||''),userAgent:String(navigator.userAgent||'')});"
+                + "if(window.__OPENCLAW_DIAG_INSTALLED__){return;}"
+                + "window.__OPENCLAW_DIAG_INSTALLED__=true;"
                 + "window.addEventListener('error',function(event){send('window.error',{message:String(event.message||''),filename:String(event.filename||''),line:event.lineno||0,column:event.colno||0});});"
                 + "window.addEventListener('unhandledrejection',function(event){var reason=event&&event.reason;send('window.unhandledrejection',{reason:reason&&reason.message?String(reason.message):String(reason)});});"
                 + "var mediaDevices=navigator.mediaDevices;"
@@ -517,6 +520,14 @@ public final class MainActivity extends Activity {
                 + "var levels=['debug','log','info','warn','error'];"
                 + "for(var i=0;i<levels.length;i++){(function(level){var original=console[level];if(typeof original!=='function')return;console[level]=function(){var parts=[];for(var j=0;j<arguments.length;j++){var value=arguments[j];if(typeof value==='string'){parts.push(value);}else{try{parts.push(JSON.stringify(value));}catch(_){parts.push(String(value));}}}send('console.'+level,parts.join(' '));return original.apply(console,arguments);};})(levels[i]);}"
                 + "})();";
+    }
+
+    private void injectRuntimeScripts(WebView view, String reason) {
+        if (view == null) return;
+        String script = buildInjectedScript();
+        recordDiagnostic("js.inject.request", reason);
+        view.post(() -> view.evaluateJavascript(script, value ->
+                recordDiagnostic("js.inject.result", reason + " " + String.valueOf(value))));
     }
 
     private static String toDashboardUrl(String raw) {
