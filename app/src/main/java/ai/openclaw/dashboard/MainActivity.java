@@ -486,7 +486,10 @@ public final class MainActivity extends Activity {
     }
 
     private String buildInjectedScript() {
-        return buildNativeAuthScript() + buildDiagnosticsScript() + buildNativeAudioBridgeScript();
+        return buildNativeAuthScript()
+                + buildDiagnosticsScript()
+                + buildNativeAudioBridgeScript()
+                + buildViewportTighteningScript();
     }
 
     private String buildNativeAuthScript() {
@@ -554,6 +557,24 @@ public final class MainActivity extends Activity {
                 + "node.disconnect=function(){if(node.__openclawNativeTimer){window.clearInterval(node.__openclawNativeTimer);node.__openclawNativeTimer=null;}try{bridge.stopCapture();diag('native_audio.capture.stop',{});}catch(_){ }return originalDisconnect?originalDisconnect():void 0;};"
                 + "node.connect=function(){return originalConnect?originalConnect.apply(node,arguments):void 0;};"
                 + "return node;};"
+                + "})();";
+    }
+
+    private String buildViewportTighteningScript() {
+        return "(function(){"
+                + "function apply(){"
+                + "try{"
+                + "var root=document.documentElement;"
+                + "if(root){root.style.setProperty('--safe-area-bottom','0px','important');root.style.setProperty('--safe-area-top','0px','important');}"
+                + "var body=document.body;"
+                + "if(body){body.style.paddingBottom='0px';body.style.marginBottom='0px';body.style.minHeight='100dvh';}"
+                + "var app=document.querySelector('openclaw-app');"
+                + "if(app){app.style.height='100dvh';app.style.minHeight='100dvh';app.style.paddingBottom='0px';app.style.marginBottom='0px';}"
+                + "var style=document.getElementById('openclaw-android-tighten');"
+                + "if(!style){style=document.createElement('style');style.id='openclaw-android-tighten';style.textContent='html,body,openclaw-app,.shell,.shell--chat{height:100dvh!important;min-height:100dvh!important;max-height:100dvh!important;}body,openclaw-app{padding-bottom:0!important;margin-bottom:0!important;}[class*=composer],[class*=chat]{padding-bottom:0!important;margin-bottom:0!important;}';document.head&&document.head.appendChild(style);}"
+                + "}catch(_){}}"
+                + "if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',apply,{once:true});}"
+                + "apply();"
                 + "})();";
     }
 
