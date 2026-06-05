@@ -17,7 +17,6 @@ import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
-import android.webkit.WebStorage;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -315,9 +314,6 @@ public final class MainActivity extends Activity {
             recordDiagnostic("open_dashboard", dashboardUrl);
             Log.d(TAG, "opening " + dashboardUrl);
             webView.stopLoading();
-            webView.clearCache(true);
-            webView.clearHistory();
-            WebStorage.getInstance().deleteAllData();
             webView.loadUrl(dashboardUrl);
             statusText.setText("Opening Control UI");
         } catch (Exception e) {
