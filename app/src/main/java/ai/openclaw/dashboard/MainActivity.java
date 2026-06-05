@@ -8,6 +8,9 @@ import android.content.Context;
 import android.content.pm.PackageManager;
 import android.content.SharedPreferences;
 import android.graphics.Color;
+import android.media.AudioFormat;
+import android.media.AudioRecord;
+import android.media.MediaRecorder;
 import android.net.Uri;
 import android.os.Bundle;
 import android.text.InputType;
@@ -164,8 +167,10 @@ public final class MainActivity extends Activity {
         diagnosticsActions.setGravity(Gravity.CENTER_VERTICAL);
         Button copyDiagnostics = button("Copy Diagnostics");
         Button clearDiagnostics = button("Clear");
+        Button probeMic = button("Probe Mic");
         diagnosticsActions.addView(copyDiagnostics, new LinearLayout.LayoutParams(0, dp(42), 1));
         diagnosticsActions.addView(clearDiagnostics, new LinearLayout.LayoutParams(0, dp(42), 1));
+        diagnosticsActions.addView(probeMic, new LinearLayout.LayoutParams(0, dp(42), 1));
         controls.addView(diagnosticsActions);
 
         diagnosticsText = text("No diagnostics yet.", 12, Color.rgb(195, 205, 214), false);
@@ -267,6 +272,7 @@ public final class MainActivity extends Activity {
         toggle.setOnClickListener(v -> toggleSettings(toggle));
         copyDiagnostics.setOnClickListener(v -> copyDiagnostics());
         clearDiagnostics.setOnClickListener(v -> clearDiagnostics());
+        probeMic.setOnClickListener(v -> runNativeMicProbe());
         setContentView(root);
         recordDiagnostic("app.ready", "Diagnostics bridge initialized");
     }
@@ -591,6 +597,70 @@ public final class MainActivity extends Activity {
         CharSequence text = diagnosticsText.getText();
         clipboard.setPrimaryClip(ClipData.newPlainText("OpenClaw diagnostics", text));
         statusText.setText("Diagnostics copied.");
+    }
+
+    private void runNativeMicProbe() {
+        if (!hasRecordAudioPermission()) {
+            recordDiagnostic("native_mic_probe.skipped", "RECORD_AUDIO permission missing");
+            statusText.setText("Grant microphone permission first.");
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD_AUDIO);
+            return;
+        }
+        statusText.setText("Running native mic probe");
+        recordDiagnostic("native_mic_probe.start", "AudioRecord");
+        new Thread(() -> {
+            AudioRecord recorder = null;
+            try {
+                int sampleRate = 16000;
+                int channelConfig = AudioFormat.CHANNEL_IN_MONO;
+                int encoding = AudioFormat.ENCODING_PCM_16BIT;
+                int minBuffer = AudioRecord.getMinBufferSize(sampleRate, channelConfig, encoding);
+                if (minBuffer <= 0) {
+                    throw new IllegalStateException("getMinBufferSize returned " + minBuffer);
+                }
+                int bufferSize = Math.max(minBuffer, sampleRate);
+                recordDiagnostic("native_mic_probe.config",
+                        "sampleRate=" + sampleRate + " minBuffer=" + minBuffer + " bufferSize=" + bufferSize);
+                recorder = new AudioRecord(
+                        MediaRecorder.AudioSource.MIC,
+                        sampleRate,
+                        channelConfig,
+                        encoding,
+                        bufferSize);
+                recordDiagnostic("native_mic_probe.record_state",
+                        "state=" + recorder.getState() + " sessionId=" + recorder.getAudioSessionId());
+                if (recorder.getState() != AudioRecord.STATE_INITIALIZED) {
+                    throw new IllegalStateException("AudioRecord failed to initialize: state=" + recorder.getState());
+                }
+                recorder.startRecording();
+                recordDiagnostic("native_mic_probe.recording_state",
+                        "state=" + recorder.getRecordingState());
+                if (recorder.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) {
+                    throw new IllegalStateException("AudioRecord failed to start: state=" + recorder.getRecordingState());
+                }
+                byte[] buffer = new byte[bufferSize];
+                int bytesRead = recorder.read(buffer, 0, buffer.length);
+                recordDiagnostic("native_mic_probe.read",
+                        "bytesRead=" + bytesRead);
+                if (bytesRead <= 0) {
+                    throw new IllegalStateException("AudioRecord read failed: " + bytesRead);
+                }
+                runOnUiThread(() -> statusText.setText("Native mic probe passed."));
+                recordDiagnostic("native_mic_probe.success", "AudioRecord captured audio");
+            } catch (Exception e) {
+                recordDiagnostic("native_mic_probe.error",
+                        e.getClass().getSimpleName() + ": " + e.getMessage());
+                runOnUiThread(() -> statusText.setText("Native mic probe failed: " + e.getMessage()));
+            } finally {
+                if (recorder != null) {
+                    try {
+                        recorder.stop();
+                    } catch (Exception ignored) {
+                    }
+                    recorder.release();
+                }
+            }
+        }, "openclaw-native-mic-probe").start();
     }
 
     private final class DiagnosticsBridge {
