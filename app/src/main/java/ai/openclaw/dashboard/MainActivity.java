@@ -2,6 +2,9 @@ package ai.openclaw.dashboard;
 
 import android.Manifest;
 import android.app.Activity;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
 import android.content.pm.PackageManager;
 import android.content.SharedPreferences;
 import android.graphics.Color;
@@ -10,6 +13,7 @@ import android.os.Bundle;
 import android.text.InputType;
 import android.util.Log;
 import android.webkit.ConsoleMessage;
+import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
@@ -31,14 +35,24 @@ import android.widget.TextView;
 import org.json.JSONObject;
 
 import java.io.ByteArrayInputStream;
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
 import java.io.InputStream;
-import java.net.URLEncoder;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.ArrayDeque;
+import java.util.Collections;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.text.SimpleDateFormat;
+import java.util.Locale;
 
+import okhttp3.Dns;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
@@ -47,8 +61,13 @@ public final class MainActivity extends Activity {
     private static final String PREFS = "openclaw_dashboard";
     private static final int REQUEST_RECORD_AUDIO = 2001;
     private static final String TAG = "OpenClawDashboard";
+    private static final int MAX_DIAGNOSTIC_LINES = 120;
 
-    private final OkHttpClient httpClient = new OkHttpClient();
+    private final OkHttpClient httpClient = new OkHttpClient.Builder()
+            .dns(new HostsFileDns())
+            .build();
+    private final ArrayDeque<String> diagnosticsLines = new ArrayDeque<>();
+    private final SimpleDateFormat diagnosticsTimeFormat = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
     private SharedPreferences prefs;
     private PermissionRequest pendingPermissionRequest;
 
@@ -58,6 +77,7 @@ public final class MainActivity extends Activity {
     private EditText passwordInput;
     private TextView statusText;
     private TextView hintText;
+    private TextView diagnosticsText;
     private LinearLayout settingsPanel;
     private WebView webView;
 
@@ -139,6 +159,22 @@ public final class MainActivity extends Activity {
         hintText.setPadding(0, dp(12), 0, 0);
         controls.addView(hintText);
 
+        controls.addView(label("Diagnostics"));
+        LinearLayout diagnosticsActions = new LinearLayout(this);
+        diagnosticsActions.setOrientation(LinearLayout.HORIZONTAL);
+        diagnosticsActions.setGravity(Gravity.CENTER_VERTICAL);
+        Button copyDiagnostics = button("Copy Diagnostics");
+        Button clearDiagnostics = button("Clear");
+        diagnosticsActions.addView(copyDiagnostics, new LinearLayout.LayoutParams(0, dp(42), 1));
+        diagnosticsActions.addView(clearDiagnostics, new LinearLayout.LayoutParams(0, dp(42), 1));
+        controls.addView(diagnosticsActions);
+
+        diagnosticsText = text("No diagnostics yet.", 12, Color.rgb(195, 205, 214), false);
+        diagnosticsText.setTextIsSelectable(true);
+        diagnosticsText.setPadding(dp(10), dp(10), dp(10), dp(10));
+        diagnosticsText.setBackgroundColor(Color.rgb(10, 14, 20));
+        controls.addView(diagnosticsText);
+
         FrameLayout webContainer = new FrameLayout(this);
         LinearLayout.LayoutParams webLp = new LinearLayout.LayoutParams(-1, 0, 1);
         webLp.setMargins(0, dp(8), 0, 0);
@@ -158,9 +194,12 @@ public final class MainActivity extends Activity {
         settings.setUseWideViewPort(true);
         settings.setLoadWithOverviewMode(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
+        webView.addJavascriptInterface(new DiagnosticsBridge(), "OpenClawDiag");
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
             public boolean onConsoleMessage(ConsoleMessage consoleMessage) {
+                recordDiagnostic("console." + consoleMessage.messageLevel().name().toLowerCase(Locale.US),
+                        consoleMessage.message());
                 Log.d(TAG, "console " + consoleMessage.messageLevel() + " " + consoleMessage.sourceId() + ":" + consoleMessage.lineNumber() + " " + consoleMessage.message());
                 return super.onConsoleMessage(consoleMessage);
             }
@@ -188,12 +227,14 @@ public final class MainActivity extends Activity {
 
             @Override
             public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                recordDiagnostic("page.started", url);
                 Log.d(TAG, "page started " + url);
                 statusText.setText("Loading Control UI");
             }
 
             @Override
             public void onPageFinished(WebView view, String url) {
+                recordDiagnostic("page.finished", url);
                 Log.d(TAG, "page finished " + url);
                 statusText.setText("Loaded Control UI");
             }
@@ -202,6 +243,7 @@ public final class MainActivity extends Activity {
             public void onReceivedError(WebView view, android.webkit.WebResourceRequest request, android.webkit.WebResourceError error) {
                 if (request.isForMainFrame()) {
                     String description = error == null ? "unknown error" : String.valueOf(error.getDescription());
+                    recordDiagnostic("page.error", description);
                     Log.e(TAG, "page error " + request.getUrl() + " " + description);
                     statusText.setText("Control UI load failed: " + description);
                 }
@@ -211,6 +253,7 @@ public final class MainActivity extends Activity {
             public void onReceivedHttpError(WebView view, android.webkit.WebResourceRequest request, android.webkit.WebResourceResponse errorResponse) {
                 if (request.isForMainFrame()) {
                     int statusCode = errorResponse == null ? -1 : errorResponse.getStatusCode();
+                    recordDiagnostic("page.http_error", String.valueOf(statusCode));
                     Log.e(TAG, "http error " + request.getUrl() + " " + statusCode);
                     statusText.setText("Control UI load failed: HTTP " + statusCode);
                 }
@@ -222,7 +265,10 @@ public final class MainActivity extends Activity {
         open.setOnClickListener(v -> openDashboard());
         reload.setOnClickListener(v -> webView.reload());
         toggle.setOnClickListener(v -> toggleSettings(toggle));
+        copyDiagnostics.setOnClickListener(v -> copyDiagnostics());
+        clearDiagnostics.setOnClickListener(v -> clearDiagnostics());
         setContentView(root);
+        recordDiagnostic("app.ready", "Diagnostics bridge initialized");
     }
 
     private void loadPrefs() {
@@ -265,6 +311,8 @@ public final class MainActivity extends Activity {
         savePrefs();
         try {
             String dashboardUrl = buildDashboardUrl();
+            clearDiagnostics();
+            recordDiagnostic("open_dashboard", dashboardUrl);
             Log.d(TAG, "opening " + dashboardUrl);
             webView.stopLoading();
             webView.clearCache(true);
@@ -285,21 +333,25 @@ public final class MainActivity extends Activity {
             grantPendingAudioCapture();
         } else {
             denyPendingPermissionRequest();
+            recordDiagnostic("android.permission.denied", "RECORD_AUDIO");
             statusText.setText("Microphone access was denied by Android. Enable it in app permissions and try again.");
         }
     }
 
     private void handleWebPermissionRequest(PermissionRequest request) {
         if (!requestsAudioCapture(request)) {
+            recordDiagnostic("web.permission.denied", "Non-audio permission request");
             request.deny();
             return;
         }
         if (hasRecordAudioPermission()) {
             grantAudioCapture(request);
+            recordDiagnostic("android.permission.already_granted", "RECORD_AUDIO");
             statusText.setText("Microphone access granted.");
             return;
         }
         pendingPermissionRequest = request;
+        recordDiagnostic("android.permission.requested", "RECORD_AUDIO");
         statusText.setText("OpenClaw needs microphone access for Talk. Approve the Android permission prompt.");
         requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD_AUDIO);
     }
@@ -322,6 +374,7 @@ public final class MainActivity extends Activity {
         pendingPermissionRequest = null;
         if (request != null) {
             grantAudioCapture(request);
+            recordDiagnostic("android.permission.granted", "RECORD_AUDIO");
             statusText.setText("Microphone access granted.");
         }
     }
@@ -342,9 +395,11 @@ public final class MainActivity extends Activity {
             }
         }
         if (granted.isEmpty()) {
+            recordDiagnostic("web.permission.denied", "Audio capture resources missing");
             request.deny();
             return;
         }
+        recordDiagnostic("web.permission.granted", "RESOURCE_AUDIO_CAPTURE");
         request.grant(granted.toArray(new String[0]));
     }
 
@@ -404,13 +459,14 @@ public final class MainActivity extends Activity {
             headers.put("Cache-Control", "no-store");
             return new WebResourceResponse("text/html", "UTF-8", 200, "OK", headers, stream);
         } catch (Exception e) {
+            recordDiagnostic("html.intercept.failed", e.getMessage());
             Log.w(TAG, "html intercept failed: " + e.getMessage());
             return null;
         }
     }
 
     private String injectNativeAuth(String html) {
-        String script = "<script>" + buildNativeAuthScript() + "</script>";
+        String script = "<script>" + buildInjectedScript() + "</script>";
         int headIndex = html.indexOf("<head>");
         if (headIndex >= 0) {
             return html.substring(0, headIndex + 6) + script + html.substring(headIndex + 6);
@@ -422,6 +478,10 @@ public final class MainActivity extends Activity {
         return script + html;
     }
 
+    private String buildInjectedScript() {
+        return buildNativeAuthScript() + buildDiagnosticsScript();
+    }
+
     private String buildNativeAuthScript() {
         String token = value(tokenInput);
         String password = value(passwordInput);
@@ -431,6 +491,36 @@ public final class MainActivity extends Activity {
         if (!password.isEmpty()) auth.append(",\"password\":").append(JSONObject.quote(password));
         auth.append("}");
         return "window.__OPENCLAW_NATIVE_CONTROL_AUTH__=" + auth + ";";
+    }
+
+    private String buildDiagnosticsScript() {
+        return "(function(){"
+                + "var bridge=window.OpenClawDiag;"
+                + "function send(kind,payload){try{if(bridge&&typeof bridge.emit==='function'){bridge.emit(String(kind||'diag'),typeof payload==='string'?payload:JSON.stringify(payload||{}));}}catch(_){}}"
+                + "window.__OPENCLAW_DIAG__={emit:send};"
+                + "send('bootstrap',{href:String(location.href||''),userAgent:String(navigator.userAgent||'')});"
+                + "window.addEventListener('error',function(event){send('window.error',{message:String(event.message||''),filename:String(event.filename||''),line:event.lineno||0,column:event.colno||0});});"
+                + "window.addEventListener('unhandledrejection',function(event){var reason=event&&event.reason;send('window.unhandledrejection',{reason:reason&&reason.message?String(reason.message):String(reason)});});"
+                + "var mediaDevices=navigator.mediaDevices;"
+                + "if(mediaDevices&&typeof mediaDevices.getUserMedia==='function'){"
+                + "var originalGetUserMedia=mediaDevices.getUserMedia.bind(mediaDevices);"
+                + "mediaDevices.getUserMedia=function(constraints){send('gum.request',constraints||{});return originalGetUserMedia(constraints).then(function(stream){var track=stream&&stream.getAudioTracks&&stream.getAudioTracks()[0];send('gum.success',{trackState:track&&track.readyState?String(track.readyState):'unknown',sampleRate:track&&track.getSettings&&track.getSettings().sampleRate||null});return stream;}).catch(function(error){send('gum.error',{name:error&&error.name?String(error.name):'',message:error&&error.message?String(error.message):String(error)});throw error;});};"
+                + "}"
+                + "var AudioContextCtor=window.AudioContext||window.webkitAudioContext;"
+                + "if(AudioContextCtor&& !window.__OPENCLAW_DIAG_AUDIO_PATCHED__){"
+                + "window.__OPENCLAW_DIAG_AUDIO_PATCHED__=true;"
+                + "function WrappedAudioContext(){var args=Array.prototype.slice.call(arguments);var ctx=new (Function.prototype.bind.apply(AudioContextCtor,[null].concat(args)))();send('audio.context.created',{state:String(ctx.state||''),sampleRate:ctx.sampleRate||null});"
+                + "var originalResume=ctx.resume&&ctx.resume.bind(ctx);if(originalResume){ctx.resume=function(){send('audio.context.resume.request',{state:String(ctx.state||'')});return originalResume().then(function(result){send('audio.context.resume.success',{state:String(ctx.state||'')});return result;}).catch(function(error){send('audio.context.resume.error',{message:error&&error.message?String(error.message):String(error)});throw error;});};}"
+                + "var originalCreateMediaStreamSource=ctx.createMediaStreamSource&&ctx.createMediaStreamSource.bind(ctx);if(originalCreateMediaStreamSource){ctx.createMediaStreamSource=function(stream){send('audio.media_stream_source.request',{});try{var node=originalCreateMediaStreamSource(stream);send('audio.media_stream_source.success',{});return node;}catch(error){send('audio.media_stream_source.error',{message:error&&error.message?String(error.message):String(error)});throw error;}};}"
+                + "var originalCreateScriptProcessor=ctx.createScriptProcessor&&ctx.createScriptProcessor.bind(ctx);if(originalCreateScriptProcessor){ctx.createScriptProcessor=function(){var node=originalCreateScriptProcessor.apply(ctx,arguments);send('audio.script_processor.created',{bufferSize:arguments[0]||null});var seen=false;var previous=node.onaudioprocess;Object.defineProperty(node,'onaudioprocess',{configurable:true,enumerable:true,get:function(){return previous;},set:function(handler){previous=function(event){if(!seen){seen=true;send('audio.script_processor.first_frame',{inputChannels:event&&event.inputBuffer?event.inputBuffer.numberOfChannels:null,length:event&&event.inputBuffer?event.inputBuffer.length:null});}return handler&&handler.call(this,event);};}});return node;};}"
+                + "return ctx;}"
+                + "WrappedAudioContext.prototype=AudioContextCtor.prototype;"
+                + "window.AudioContext=WrappedAudioContext;"
+                + "if(window.webkitAudioContext){window.webkitAudioContext=WrappedAudioContext;}"
+                + "}"
+                + "var levels=['debug','log','info','warn','error'];"
+                + "for(var i=0;i<levels.length;i++){(function(level){var original=console[level];if(typeof original!=='function')return;console[level]=function(){var parts=[];for(var j=0;j<arguments.length;j++){var value=arguments[j];if(typeof value==='string'){parts.push(value);}else{try{parts.push(JSON.stringify(value));}catch(_){parts.push(String(value));}}}send('console.'+level,parts.join(' '));return original.apply(console,arguments);};})(levels[i]);}"
+                + "})();";
     }
 
     private static String toDashboardUrl(String raw) {
@@ -463,6 +553,84 @@ public final class MainActivity extends Activity {
             if (value != null && !value.trim().isEmpty()) return value;
         }
         return "";
+    }
+
+    private void recordDiagnostic(String kind, String message) {
+        String safeMessage = message == null ? "" : message;
+        String line = diagnosticsTimeFormat.format(new Date()) + "  " + kind + "  " + safeMessage;
+        Log.d(TAG, "diag " + line);
+        runOnUiThread(() -> {
+            diagnosticsLines.addLast(line);
+            while (diagnosticsLines.size() > MAX_DIAGNOSTIC_LINES) {
+                diagnosticsLines.removeFirst();
+            }
+            StringBuilder builder = new StringBuilder();
+            for (String entry : diagnosticsLines) {
+                if (builder.length() > 0) builder.append('\n');
+                builder.append(entry);
+            }
+            diagnosticsText.setText(builder.length() == 0 ? "No diagnostics yet." : builder.toString());
+        });
+    }
+
+    private void clearDiagnostics() {
+        diagnosticsLines.clear();
+        diagnosticsText.setText("No diagnostics yet.");
+    }
+
+    private void copyDiagnostics() {
+        ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        if (clipboard == null) return;
+        CharSequence text = diagnosticsText.getText();
+        clipboard.setPrimaryClip(ClipData.newPlainText("OpenClaw diagnostics", text));
+        statusText.setText("Diagnostics copied.");
+    }
+
+    private final class DiagnosticsBridge {
+        @JavascriptInterface
+        public void emit(String kind, String payload) {
+            recordDiagnostic("js." + kind, payload);
+        }
+    }
+
+    private static final class HostsFileDns implements Dns {
+        @Override
+        public List<InetAddress> lookup(String hostname) throws UnknownHostException {
+            try {
+                return Dns.SYSTEM.lookup(hostname);
+            } catch (UnknownHostException firstError) {
+                InetAddress mapped = lookupHostsFile(hostname);
+                if (mapped != null) {
+                    return Collections.singletonList(mapped);
+                }
+                throw firstError;
+            }
+        }
+
+        private InetAddress lookupHostsFile(String hostname) {
+            try (BufferedReader reader = new BufferedReader(new FileReader("/etc/hosts"))) {
+                String normalizedHost = hostname == null ? "" : hostname.trim().toLowerCase();
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    String trimmed = line.trim();
+                    if (trimmed.isEmpty() || trimmed.startsWith("#")) continue;
+                    int commentIndex = trimmed.indexOf('#');
+                    if (commentIndex >= 0) {
+                        trimmed = trimmed.substring(0, commentIndex).trim();
+                    }
+                    String[] parts = trimmed.split("\\s+");
+                    if (parts.length < 2) continue;
+                    for (int i = 1; i < parts.length; i++) {
+                        if (normalizedHost.equals(parts[i].trim().toLowerCase())) {
+                            return InetAddress.getByName(parts[0]);
+                        }
+                    }
+                }
+            } catch (IOException ignored) {
+                return null;
+            }
+            return null;
+        }
     }
 
     private LinearLayout section() {
