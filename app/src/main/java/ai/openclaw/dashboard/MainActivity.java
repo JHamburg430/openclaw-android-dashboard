@@ -8,9 +8,13 @@ import android.content.Context;
 import android.content.pm.PackageManager;
 import android.content.SharedPreferences;
 import android.graphics.Color;
+import android.media.AudioManager;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
+import android.media.audiofx.AcousticEchoCanceler;
+import android.media.audiofx.AutomaticGainControl;
+import android.media.audiofx.NoiseSuppressor;
 import android.net.Uri;
 import android.os.Bundle;
 import android.text.InputType;
@@ -67,6 +71,7 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_RECORD_AUDIO = 2001;
     private static final String TAG = "OpenClawDashboard";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
+    private static final int TALK_FRAME_MS = 10;
 
     private final OkHttpClient httpClient = new OkHttpClient.Builder()
             .dns(new HostsFileDns())
@@ -551,7 +556,7 @@ public final class MainActivity extends Activity {
                 + "var originalCreateMediaStreamSource=AudioContextCtor.prototype.createMediaStreamSource;"
                 + "var originalCreateScriptProcessor=AudioContextCtor.prototype.createScriptProcessor;"
                 + "AudioContextCtor.prototype.createMediaStreamSource=function(stream){if(!stream||!stream.__openclawNativeAudio)return originalCreateMediaStreamSource.call(this,stream);var ctx=this;return{connect:function(node){node&&typeof node.__openclawNativeAttach==='function'&&node.__openclawNativeAttach(ctx);},disconnect:function(){try{bridge.stopCapture();}catch(_){}}};};"
-                + "AudioContextCtor.prototype.createScriptProcessor=function(bufferSize,inputChannels,outputChannels){var node=originalCreateScriptProcessor.call(this,bufferSize,inputChannels,outputChannels);var originalConnect=node.connect?node.connect.bind(node):null;var originalDisconnect=node.disconnect?node.disconnect.bind(node):null;node.__openclawNativeTimer=null;node.__openclawNativeCtx=null;node.__openclawNativeAttach=function(ctx){node.__openclawNativeCtx=ctx;try{bridge.startCapture(16000,20);diag('native_audio.capture.start',{'bufferSize':bufferSize||0,'ctxSampleRate':ctx&&ctx.sampleRate||null});}catch(error){diag('native_audio.capture.error',{'message':String(error)});}if(node.__openclawNativeTimer)return;node.__openclawNativeTimer=window.setInterval(function(){if(typeof node.onaudioprocess!=='function')return;var chunk='';try{chunk=bridge.readChunkBase64()||'';}catch(error){diag('native_audio.read.error',{'message':String(error)});return;}if(!chunk)return;var floats=decodePcm16(chunk);var targetRate=node.__openclawNativeCtx&&node.__openclawNativeCtx.sampleRate?node.__openclawNativeCtx.sampleRate:16000;var resampled=resampleLinear(floats,16000,targetRate);var inputBuffer={length:resampled.length,numberOfChannels:1,getChannelData:function(){return resampled;}};node.onaudioprocess({inputBuffer:inputBuffer});},20);};"
+                + "AudioContextCtor.prototype.createScriptProcessor=function(bufferSize,inputChannels,outputChannels){var node=originalCreateScriptProcessor.call(this,bufferSize,inputChannels,outputChannels);var originalConnect=node.connect?node.connect.bind(node):null;var originalDisconnect=node.disconnect?node.disconnect.bind(node):null;node.__openclawNativeTimer=null;node.__openclawNativeCtx=null;node.__openclawNativeAttach=function(ctx){node.__openclawNativeCtx=ctx;try{bridge.startCapture(16000,10);diag('native_audio.capture.start',{'bufferSize':bufferSize||0,'ctxSampleRate':ctx&&ctx.sampleRate||null});}catch(error){diag('native_audio.capture.error',{'message':String(error)});}if(node.__openclawNativeTimer)return;node.__openclawNativeTimer=window.setInterval(function(){if(typeof node.onaudioprocess!=='function')return;var chunk='';try{chunk=bridge.readChunkBase64()||'';}catch(error){diag('native_audio.read.error',{'message':String(error)});return;}if(!chunk)return;var floats=decodePcm16(chunk);var targetRate=node.__openclawNativeCtx&&node.__openclawNativeCtx.sampleRate?node.__openclawNativeCtx.sampleRate:16000;var resampled=resampleLinear(floats,16000,targetRate);var inputBuffer={length:resampled.length,numberOfChannels:1,getChannelData:function(){return resampled;}};node.onaudioprocess({inputBuffer:inputBuffer});},10);};"
                 + "node.disconnect=function(){if(node.__openclawNativeTimer){window.clearInterval(node.__openclawNativeTimer);node.__openclawNativeTimer=null;}try{bridge.stopCapture();diag('native_audio.capture.stop',{});}catch(_){ }return originalDisconnect?originalDisconnect():void 0;};"
                 + "node.connect=function(){return originalConnect?originalConnect.apply(node,arguments):void 0;};"
                 + "return node;};"
@@ -706,8 +711,13 @@ public final class MainActivity extends Activity {
         private final Object lock = new Object();
         private final ArrayDeque<String> chunkQueue = new ArrayDeque<>();
         private final AtomicBoolean running = new AtomicBoolean(false);
+        private final AudioManager audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         private AudioRecord recorder;
         private Thread readerThread;
+        private Integer previousAudioMode;
+        private AcousticEchoCanceler acousticEchoCanceler;
+        private NoiseSuppressor noiseSuppressor;
+        private AutomaticGainControl automaticGainControl;
 
         @JavascriptInterface
         public boolean isAvailable() {
@@ -718,7 +728,7 @@ public final class MainActivity extends Activity {
         public void startCapture(int sampleRateHz, int frameMs) {
             synchronized (lock) {
                 stopCaptureLocked();
-                int requestedFrameMs = frameMs > 0 ? frameMs : 20;
+                int requestedFrameMs = frameMs > 0 ? Math.max(TALK_FRAME_MS, frameMs) : TALK_FRAME_MS;
                 int samplesPerChunk = Math.max(160, NATIVE_SAMPLE_RATE * requestedFrameMs / 1000);
                 int minBuffer = AudioRecord.getMinBufferSize(
                         NATIVE_SAMPLE_RATE,
@@ -729,8 +739,9 @@ public final class MainActivity extends Activity {
                     return;
                 }
                 int bufferSize = Math.max(minBuffer, samplesPerChunk * 2);
+                setCommunicationAudioMode();
                 recorder = new AudioRecord(
-                        MediaRecorder.AudioSource.MIC,
+                        MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                         NATIVE_SAMPLE_RATE,
                         AudioFormat.CHANNEL_IN_MONO,
                         AudioFormat.ENCODING_PCM_16BIT,
@@ -739,12 +750,17 @@ public final class MainActivity extends Activity {
                     recordDiagnostic("native_audio_bridge.error", "AudioRecord state=" + recorder.getState());
                     recorder.release();
                     recorder = null;
+                    restoreAudioMode();
                     return;
                 }
+                enableVoiceProcessingEffects(recorder.getAudioSessionId());
                 recorder.startRecording();
                 running.set(true);
                 recordDiagnostic("native_audio_bridge.start",
-                        "sampleRate=" + sampleRateHz + " nativeRate=" + NATIVE_SAMPLE_RATE + " frameMs=" + requestedFrameMs);
+                        "sampleRate=" + sampleRateHz
+                                + " nativeRate=" + NATIVE_SAMPLE_RATE
+                                + " frameMs=" + requestedFrameMs
+                                + " source=VOICE_COMMUNICATION");
                 readerThread = new Thread(() -> readNativeAudioLoop(samplesPerChunk), "openclaw-native-audio");
                 readerThread.start();
             }
@@ -796,6 +812,7 @@ public final class MainActivity extends Activity {
         private void stopCaptureLocked() {
             running.set(false);
             chunkQueue.clear();
+            releaseVoiceProcessingEffects();
             if (recorder != null) {
                 try {
                     recorder.stop();
@@ -812,7 +829,90 @@ public final class MainActivity extends Activity {
                 }
                 readerThread = null;
             }
+            restoreAudioMode();
             recordDiagnostic("native_audio_bridge.stop", "stopped");
+        }
+
+        private void setCommunicationAudioMode() {
+            if (audioManager == null) return;
+            if (previousAudioMode == null) {
+                previousAudioMode = audioManager.getMode();
+            }
+            audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
+            recordDiagnostic("native_audio_bridge.audio_mode", "mode=MODE_IN_COMMUNICATION");
+        }
+
+        private void restoreAudioMode() {
+            if (audioManager == null || previousAudioMode == null) return;
+            audioManager.setMode(previousAudioMode);
+            recordDiagnostic("native_audio_bridge.audio_mode", "mode=" + previousAudioMode);
+            previousAudioMode = null;
+        }
+
+        private void enableVoiceProcessingEffects(int audioSessionId) {
+            acousticEchoCanceler = enableAcousticEchoCanceler(audioSessionId);
+            noiseSuppressor = enableNoiseSuppressor(audioSessionId);
+            automaticGainControl = enableAutomaticGainControl(audioSessionId);
+        }
+
+        private AcousticEchoCanceler enableAcousticEchoCanceler(int audioSessionId) {
+            if (!AcousticEchoCanceler.isAvailable()) {
+                recordDiagnostic("native_audio_bridge.effect", "aec=unavailable");
+                return null;
+            }
+            AcousticEchoCanceler effect = AcousticEchoCanceler.create(audioSessionId);
+            if (effect == null) {
+                recordDiagnostic("native_audio_bridge.effect", "aec=create_failed");
+                return null;
+            }
+            effect.setEnabled(true);
+            recordDiagnostic("native_audio_bridge.effect", "aec=" + effect.getEnabled());
+            return effect;
+        }
+
+        private NoiseSuppressor enableNoiseSuppressor(int audioSessionId) {
+            if (!NoiseSuppressor.isAvailable()) {
+                recordDiagnostic("native_audio_bridge.effect", "ns=unavailable");
+                return null;
+            }
+            NoiseSuppressor effect = NoiseSuppressor.create(audioSessionId);
+            if (effect == null) {
+                recordDiagnostic("native_audio_bridge.effect", "ns=create_failed");
+                return null;
+            }
+            effect.setEnabled(true);
+            recordDiagnostic("native_audio_bridge.effect", "ns=" + effect.getEnabled());
+            return effect;
+        }
+
+        private AutomaticGainControl enableAutomaticGainControl(int audioSessionId) {
+            if (!AutomaticGainControl.isAvailable()) {
+                recordDiagnostic("native_audio_bridge.effect", "agc=unavailable");
+                return null;
+            }
+            AutomaticGainControl effect = AutomaticGainControl.create(audioSessionId);
+            if (effect == null) {
+                recordDiagnostic("native_audio_bridge.effect", "agc=create_failed");
+                return null;
+            }
+            effect.setEnabled(true);
+            recordDiagnostic("native_audio_bridge.effect", "agc=" + effect.getEnabled());
+            return effect;
+        }
+
+        private void releaseVoiceProcessingEffects() {
+            if (acousticEchoCanceler != null) {
+                acousticEchoCanceler.release();
+                acousticEchoCanceler = null;
+            }
+            if (noiseSuppressor != null) {
+                noiseSuppressor.release();
+                noiseSuppressor = null;
+            }
+            if (automaticGainControl != null) {
+                automaticGainControl.release();
+                automaticGainControl = null;
+            }
         }
     }
 
