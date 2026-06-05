@@ -711,7 +711,6 @@ public final class MainActivity extends Activity {
         private final Object lock = new Object();
         private final ArrayDeque<String> chunkQueue = new ArrayDeque<>();
         private final AtomicBoolean running = new AtomicBoolean(false);
-        private final AudioManager audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         private AudioRecord recorder;
         private Thread readerThread;
         private Integer previousAudioMode;
@@ -834,6 +833,7 @@ public final class MainActivity extends Activity {
         }
 
         private void setCommunicationAudioMode() {
+            AudioManager audioManager = getAudioManager();
             if (audioManager == null) return;
             if (previousAudioMode == null) {
                 previousAudioMode = audioManager.getMode();
@@ -843,10 +843,15 @@ public final class MainActivity extends Activity {
         }
 
         private void restoreAudioMode() {
+            AudioManager audioManager = getAudioManager();
             if (audioManager == null || previousAudioMode == null) return;
             audioManager.setMode(previousAudioMode);
             recordDiagnostic("native_audio_bridge.audio_mode", "mode=" + previousAudioMode);
             previousAudioMode = null;
+        }
+
+        private AudioManager getAudioManager() {
+            return (AudioManager) MainActivity.this.getSystemService(Context.AUDIO_SERVICE);
         }
 
         private void enableVoiceProcessingEffects(int audioSessionId) {
