@@ -8,6 +8,7 @@ import android.content.Context;
 import android.content.pm.PackageManager;
 import android.content.SharedPreferences;
 import android.graphics.Color;
+import android.graphics.Insets;
 import android.media.AudioManager;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
@@ -28,6 +29,7 @@ import android.webkit.WebResourceResponse;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -89,6 +91,7 @@ public final class MainActivity extends Activity {
     private TextView statusText;
     private TextView hintText;
     private TextView diagnosticsText;
+    private LinearLayout chromeContainer;
     private LinearLayout settingsPanel;
     private WebView webView;
 
@@ -114,10 +117,15 @@ public final class MainActivity extends Activity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.rgb(14, 18, 24));
+        applyStatusBarInset(root);
+
+        chromeContainer = new LinearLayout(this);
+        chromeContainer.setOrientation(LinearLayout.VERTICAL);
+        root.addView(chromeContainer, new LinearLayout.LayoutParams(-1, -2));
 
         statusText = text("Configure the gateway URL and auth, then load the real Control UI.", 14, Color.rgb(150, 164, 178), false);
         statusText.setPadding(dp(14), dp(10), dp(14), dp(6));
-        root.addView(statusText, new LinearLayout.LayoutParams(-1, -2));
+        chromeContainer.addView(statusText, new LinearLayout.LayoutParams(-1, -2));
 
         LinearLayout topActions = new LinearLayout(this);
         topActions.setOrientation(LinearLayout.HORIZONTAL);
@@ -129,12 +137,12 @@ public final class MainActivity extends Activity {
         topActions.addView(open, new LinearLayout.LayoutParams(0, dp(38), 1));
         topActions.addView(reload, new LinearLayout.LayoutParams(0, dp(38), 1));
         topActions.addView(toggle, new LinearLayout.LayoutParams(0, dp(38), 1));
-        root.addView(topActions, new LinearLayout.LayoutParams(-1, -2));
+        chromeContainer.addView(topActions, new LinearLayout.LayoutParams(-1, -2));
 
         ScrollView controlsScroll = new ScrollView(this);
         settingsPanel = section();
         controlsScroll.addView(settingsPanel);
-        root.addView(controlsScroll, new LinearLayout.LayoutParams(-1, -2));
+        chromeContainer.addView(controlsScroll, new LinearLayout.LayoutParams(-1, -2));
 
         LinearLayout controls = settingsPanel;
         setupCodeInput = input("Paste setup code from openclaw qr --json", false, false);
@@ -237,6 +245,7 @@ public final class MainActivity extends Activity {
             public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
                 recordDiagnostic("page.started", url);
                 Log.d(TAG, "page started " + url);
+                setConnectedUiVisible(false);
                 statusText.setText("Loading Control UI");
             }
 
@@ -245,7 +254,7 @@ public final class MainActivity extends Activity {
                 recordDiagnostic("page.finished", url);
                 injectRuntimeScripts(view, "page_finished");
                 Log.d(TAG, "page finished " + url);
-                statusText.setText("Loaded Control UI");
+                setConnectedUiVisible(true);
             }
 
             @Override
@@ -254,6 +263,7 @@ public final class MainActivity extends Activity {
                     String description = error == null ? "unknown error" : String.valueOf(error.getDescription());
                     recordDiagnostic("page.error", description);
                     Log.e(TAG, "page error " + request.getUrl() + " " + description);
+                    setConnectedUiVisible(false);
                     statusText.setText("Control UI load failed: " + description);
                 }
             }
@@ -264,6 +274,7 @@ public final class MainActivity extends Activity {
                     int statusCode = errorResponse == null ? -1 : errorResponse.getStatusCode();
                     recordDiagnostic("page.http_error", String.valueOf(statusCode));
                     Log.e(TAG, "http error " + request.getUrl() + " " + statusCode);
+                    setConnectedUiVisible(false);
                     statusText.setText("Control UI load failed: HTTP " + statusCode);
                 }
             }
@@ -279,6 +290,23 @@ public final class MainActivity extends Activity {
         probeMic.setOnClickListener(v -> runNativeMicProbe());
         setContentView(root);
         recordDiagnostic("app.ready", "Diagnostics bridge initialized");
+    }
+
+    private void applyStatusBarInset(View view) {
+        final int baseLeft = view.getPaddingLeft();
+        final int baseTop = view.getPaddingTop();
+        final int baseRight = view.getPaddingRight();
+        final int baseBottom = view.getPaddingBottom();
+        view.setOnApplyWindowInsetsListener((target, insets) -> {
+            Insets statusBars = insets.getInsets(WindowInsets.Type.statusBars());
+            target.setPadding(
+                    baseLeft,
+                    baseTop + statusBars.top,
+                    baseRight,
+                    baseBottom);
+            return insets;
+        });
+        view.requestApplyInsets();
     }
 
     private void loadPrefs() {
@@ -324,10 +352,12 @@ public final class MainActivity extends Activity {
             clearDiagnostics();
             recordDiagnostic("open_dashboard", dashboardUrl);
             Log.d(TAG, "opening " + dashboardUrl);
+            setConnectedUiVisible(false);
             webView.stopLoading();
             webView.loadUrl(dashboardUrl);
             statusText.setText("Opening Control UI");
         } catch (Exception e) {
+            setConnectedUiVisible(false);
             statusText.setText(e.getMessage());
         }
     }
@@ -415,6 +445,16 @@ public final class MainActivity extends Activity {
         settingsPanel.setVisibility(visible ? View.GONE : View.VISIBLE);
         hintText.setVisibility(visible ? View.GONE : View.VISIBLE);
         toggle.setText(visible ? "Show Setup" : "Hide Setup");
+    }
+
+    private void setConnectedUiVisible(boolean connected) {
+        if (chromeContainer == null) return;
+        chromeContainer.setVisibility(connected ? View.GONE : View.VISIBLE);
+        ViewGroup.MarginLayoutParams layoutParams = (ViewGroup.MarginLayoutParams) webView.getLayoutParams();
+        if (layoutParams != null) {
+            layoutParams.topMargin = connected ? 0 : dp(4);
+            webView.setLayoutParams(layoutParams);
+        }
     }
 
     private String buildDashboardUrl() {
