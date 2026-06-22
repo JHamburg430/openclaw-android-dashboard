@@ -2,9 +2,14 @@ package ai.openclaw.dashboard;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.SharedPreferences;
 import android.graphics.Color;
@@ -17,6 +22,7 @@ import android.media.audiofx.AcousticEchoCanceler;
 import android.media.audiofx.AutomaticGainControl;
 import android.media.audiofx.NoiseSuppressor;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.text.InputType;
 import android.util.Log;
@@ -71,9 +77,13 @@ import okhttp3.Response;
 public final class MainActivity extends Activity {
     private static final String PREFS = "openclaw_dashboard";
     private static final int REQUEST_RECORD_AUDIO = 2001;
+    private static final int REQUEST_POST_NOTIFICATIONS = 2002;
     private static final String TAG = "OpenClawDashboard";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
+    private static final String NOTIFICATION_CHANNEL_ID = "openclaw_updates";
+    private static final int NOTIFICATION_ID = 41001;
+    private static final String PREF_NOTIFICATION_COUNT = "notification_count";
 
     private final OkHttpClient httpClient = new OkHttpClient.Builder()
             .dns(new HostsFileDns())
@@ -99,9 +109,17 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        createNotificationChannel();
         buildUi();
         loadPrefs();
+        ensureNotificationPermission();
         maybeAutoOpenDashboard();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        clearNativeNotifications();
     }
 
     @Override
@@ -210,6 +228,7 @@ public final class MainActivity extends Activity {
         settings.setLoadWithOverviewMode(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
         webView.addJavascriptInterface(new DiagnosticsBridge(), "OpenClawDiag");
+        webView.addJavascriptInterface(new NativeNotificationsBridge(), "OpenClawNativeNotifications");
         webView.addJavascriptInterface(nativeAudioBridge, "OpenClawNativeAudio");
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
@@ -365,13 +384,20 @@ public final class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode != REQUEST_RECORD_AUDIO) return;
-        if (hasRecordAudioPermission()) {
-            grantPendingAudioCapture();
-        } else {
-            denyPendingPermissionRequest();
-            recordDiagnostic("android.permission.denied", "RECORD_AUDIO");
-            statusText.setText("Microphone access was denied by Android. Enable it in app permissions and try again.");
+        if (requestCode == REQUEST_RECORD_AUDIO) {
+            if (hasRecordAudioPermission()) {
+                grantPendingAudioCapture();
+            } else {
+                denyPendingPermissionRequest();
+                recordDiagnostic("android.permission.denied", "RECORD_AUDIO");
+                statusText.setText("Microphone access was denied by Android. Enable it in app permissions and try again.");
+            }
+            return;
+        }
+        if (requestCode == REQUEST_POST_NOTIFICATIONS) {
+            recordDiagnostic(
+                    hasNotificationPermission() ? "android.permission.granted" : "android.permission.denied",
+                    "POST_NOTIFICATIONS");
         }
     }
 
@@ -527,9 +553,44 @@ public final class MainActivity extends Activity {
 
     private String buildInjectedScript() {
         return buildNativeAuthScript()
+                + buildNotificationBridgeScript()
                 + buildDiagnosticsScript()
                 + buildNativeAudioBridgeScript()
                 + buildViewportTighteningScript();
+    }
+
+    private String buildNotificationBridgeScript() {
+        return "(function(){"
+                + "var bridge=window.OpenClawNativeNotifications;"
+                + "if(!bridge||typeof bridge.isAvailable!=='function'||!bridge.isAvailable())return;"
+                + "if(window.__OPENCLAW_NATIVE_NOTIFICATIONS_PATCHED__)return;"
+                + "window.__OPENCLAW_NATIVE_NOTIFICATIONS_PATCHED__=true;"
+                + "function permission(){try{return String(bridge.getPermissionStatus()||'default');}catch(_){return 'default';}}"
+                + "function notify(title,options){options=options||{};try{bridge.notify(String(title||''),JSON.stringify(options));}catch(_){}}"
+                + "function NativeNotification(title,options){"
+                + "this.title=String(title||'');"
+                + "this.options=options||{};"
+                + "this.data=this.options.data;"
+                + "this.tag=this.options.tag||'';"
+                + "this.body=this.options.body||'';"
+                + "notify(this.title,this.options);"
+                + "}"
+                + "NativeNotification.permission=permission();"
+                + "NativeNotification.requestPermission=function(callback){"
+                + "var value=permission();"
+                + "if(value!=='granted'){value=String(bridge.requestPermission()||value||'default');}"
+                + "NativeNotification.permission=value;"
+                + "if(typeof callback==='function'){try{callback(value);}catch(_){}}"
+                + "return Promise.resolve(value);"
+                + "};"
+                + "NativeNotification.prototype.close=function(){try{bridge.clearAll();}catch(_){}};"
+                + "Object.defineProperty(window,'Notification',{configurable:true,writable:true,value:NativeNotification});"
+                + "if(typeof ServiceWorkerRegistration!=='undefined'&&ServiceWorkerRegistration.prototype&&typeof ServiceWorkerRegistration.prototype.showNotification==='function'){"
+                + "ServiceWorkerRegistration.prototype.showNotification=function(title,options){notify(title,options);return Promise.resolve();};"
+                + "}"
+                + "if(navigator&&typeof navigator.setAppBadge==='undefined'){navigator.setAppBadge=function(){return Promise.resolve();};}"
+                + "if(navigator&&typeof navigator.clearAppBadge==='undefined'){navigator.clearAppBadge=function(){try{bridge.clearAll();}catch(_){ }return Promise.resolve();};}"
+                + "})();";
     }
 
     private String buildNativeAuthScript() {
@@ -760,6 +821,34 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private final class NativeNotificationsBridge {
+        @JavascriptInterface
+        public boolean isAvailable() {
+            return true;
+        }
+
+        @JavascriptInterface
+        public String getPermissionStatus() {
+            return hasNotificationPermission() ? "granted" : "default";
+        }
+
+        @JavascriptInterface
+        public String requestPermission() {
+            ensureNotificationPermission();
+            return getPermissionStatus();
+        }
+
+        @JavascriptInterface
+        public void notify(String title, String optionsJson) {
+            runOnUiThread(() -> postNativeNotification(title, optionsJson));
+        }
+
+        @JavascriptInterface
+        public void clearAll() {
+            runOnUiThread(MainActivity.this::clearNativeNotifications);
+        }
+    }
+
     private final class NativeAudioBridge {
         private static final int NATIVE_SAMPLE_RATE = 16000;
         private static final int MAX_QUEUED_CHUNKS = 64;
@@ -974,6 +1063,84 @@ public final class MainActivity extends Activity {
                 automaticGainControl = null;
             }
         }
+    }
+
+    private boolean hasNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return true;
+        return checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void ensureNotificationPermission() {
+        if (hasNotificationPermission()) return;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQUEST_POST_NOTIFICATIONS);
+        }
+    }
+
+    private void createNotificationChannel() {
+        NotificationManager manager = getNotificationManager();
+        if (manager == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
+        NotificationChannel channel = new NotificationChannel(
+                NOTIFICATION_CHANNEL_ID,
+                "OpenClaw updates",
+                NotificationManager.IMPORTANCE_DEFAULT);
+        channel.setDescription("Notifications from the OpenClaw dashboard");
+        channel.setShowBadge(true);
+        manager.createNotificationChannel(channel);
+    }
+
+    private void postNativeNotification(String title, String optionsJson) {
+        if (!hasNotificationPermission()) {
+            ensureNotificationPermission();
+            recordDiagnostic("native_notification.skipped", "POST_NOTIFICATIONS permission missing");
+            return;
+        }
+        String safeTitle = title == null || title.trim().isEmpty() ? "OpenClaw" : title.trim();
+        String body = "";
+        try {
+            if (optionsJson != null && !optionsJson.isEmpty()) {
+                JSONObject options = new JSONObject(optionsJson);
+                body = options.optString("body", "");
+            }
+        } catch (Exception e) {
+            recordDiagnostic("native_notification.parse_error", e.getMessage());
+        }
+        int count = prefs.getInt(PREF_NOTIFICATION_COUNT, 0) + 1;
+        prefs.edit().putInt(PREF_NOTIFICATION_COUNT, count).apply();
+        NotificationManager manager = getNotificationManager();
+        if (manager == null) return;
+        Intent intent = new Intent(this, MainActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        PendingIntent contentIntent = PendingIntent.getActivity(
+                this,
+                0,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        Notification notification = new Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_notify_more)
+                .setContentTitle(safeTitle)
+                .setContentText(body.isEmpty() ? "OpenClaw has a new update." : body)
+                .setStyle(new Notification.BigTextStyle().bigText(body.isEmpty() ? safeTitle : body))
+                .setAutoCancel(true)
+                .setContentIntent(contentIntent)
+                .setNumber(count)
+                .setBadgeIconType(Notification.BADGE_ICON_SMALL)
+                .build();
+        manager.notify(NOTIFICATION_ID, notification);
+        recordDiagnostic("native_notification.posted", safeTitle + " count=" + count);
+    }
+
+    private void clearNativeNotifications() {
+        prefs.edit().putInt(PREF_NOTIFICATION_COUNT, 0).apply();
+        NotificationManager manager = getNotificationManager();
+        if (manager != null) {
+            manager.cancel(NOTIFICATION_ID);
+        }
+        recordDiagnostic("native_notification.cleared", "count=0");
+    }
+
+    private NotificationManager getNotificationManager() {
+        return (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
     }
 
     private static final class HostsFileDns implements Dns {
