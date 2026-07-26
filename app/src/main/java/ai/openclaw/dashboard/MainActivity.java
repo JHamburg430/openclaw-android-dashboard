@@ -30,11 +30,13 @@ import android.util.Base64;
 import android.webkit.ConsoleMessage;
 import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
+import android.webkit.ValueCallback;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
 import android.view.WindowInsets;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
@@ -78,6 +80,8 @@ public final class MainActivity extends Activity {
     private static final String PREFS = "openclaw_dashboard";
     private static final int REQUEST_RECORD_AUDIO = 2001;
     private static final int REQUEST_POST_NOTIFICATIONS = 2002;
+    private static final int REQUEST_CAMERA = 2003;
+    private static final int REQUEST_FILE_CHOOSER = 2004;
     private static final String TAG = "OpenClawDashboard";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
@@ -93,6 +97,7 @@ public final class MainActivity extends Activity {
     private final NativeAudioBridge nativeAudioBridge = new NativeAudioBridge();
     private SharedPreferences prefs;
     private PermissionRequest pendingPermissionRequest;
+    private ValueCallback<Uri[]> pendingFilePathCallback;
 
     private EditText setupCodeInput;
     private EditText urlInput;
@@ -110,16 +115,27 @@ public final class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         createNotificationChannel();
+        configureSystemBars();
         buildUi();
         loadPrefs();
         ensureNotificationPermission();
-        maybeAutoOpenDashboard();
+        if (!restoreWebViewState(savedInstanceState)) {
+            maybeAutoOpenDashboard();
+        }
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         clearNativeNotifications();
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        if (webView != null) {
+            webView.saveState(outState);
+        }
+        super.onSaveInstanceState(outState);
     }
 
     @Override
@@ -250,8 +266,33 @@ public final class MainActivity extends Activity {
                     if (pendingPermissionRequest == request) {
                         pendingPermissionRequest = null;
                     }
-                    statusText.setText("Microphone request was canceled.");
+                    statusText.setText("Media permission request was canceled.");
                 });
+            }
+
+            @Override
+            public boolean onShowFileChooser(WebView webView, ValueCallback<Uri[]> filePathCallback, FileChooserParams fileChooserParams) {
+                if (pendingFilePathCallback != null) {
+                    pendingFilePathCallback.onReceiveValue(null);
+                }
+                pendingFilePathCallback = filePathCallback;
+                Intent intent;
+                try {
+                    intent = fileChooserParams.createIntent();
+                } catch (Exception e) {
+                    intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                    intent.addCategory(Intent.CATEGORY_OPENABLE);
+                    intent.setType("*/*");
+                }
+                try {
+                    startActivityForResult(intent, REQUEST_FILE_CHOOSER);
+                    return true;
+                } catch (Exception e) {
+                    pendingFilePathCallback = null;
+                    statusText.setText("File picker is unavailable on this device.");
+                    recordDiagnostic("file_chooser.failed", e.getMessage());
+                    return false;
+                }
             }
         });
         webView.setWebViewClient(new WebViewClient() {
@@ -311,6 +352,34 @@ public final class MainActivity extends Activity {
         recordDiagnostic("app.ready", "Diagnostics bridge initialized");
     }
 
+    private void configureSystemBars() {
+        Window window = getWindow();
+        if (window == null) return;
+        int chromeColor = Color.rgb(14, 18, 24);
+        window.setStatusBarColor(chromeColor);
+        window.setNavigationBarColor(chromeColor);
+        View decorView = window.getDecorView();
+        if (decorView == null) return;
+        int flags = decorView.getSystemUiVisibility();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            flags &= ~View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            flags &= ~View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+        }
+        decorView.setSystemUiVisibility(flags);
+    }
+
+    private boolean restoreWebViewState(Bundle savedInstanceState) {
+        if (savedInstanceState == null || webView == null) return false;
+        webView.restoreState(savedInstanceState);
+        String restoredUrl = webView.getUrl();
+        if (restoredUrl == null || restoredUrl.trim().isEmpty()) return false;
+        recordDiagnostic("webview.restored", restoredUrl);
+        setConnectedUiVisible(true);
+        return true;
+    }
+
     private void applyStatusBarInset(View view) {
         final int baseLeft = view.getPaddingLeft();
         final int baseTop = view.getPaddingTop();
@@ -338,7 +407,7 @@ public final class MainActivity extends Activity {
         String rawUrl = value(urlInput);
         if (rawUrl.isEmpty()) return;
         String dashboardUrl = toDashboardUrl(rawUrl);
-        if (!isSecureDashboardUrl(dashboardUrl)) return;
+        if (!isDashboardUrl(dashboardUrl)) return;
         openDashboard();
     }
 
@@ -386,11 +455,21 @@ public final class MainActivity extends Activity {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == REQUEST_RECORD_AUDIO) {
             if (hasRecordAudioPermission()) {
-                grantPendingAudioCapture();
+                grantPendingMediaCapture();
             } else {
                 denyPendingPermissionRequest();
                 recordDiagnostic("android.permission.denied", "RECORD_AUDIO");
                 statusText.setText("Microphone access was denied by Android. Enable it in app permissions and try again.");
+            }
+            return;
+        }
+        if (requestCode == REQUEST_CAMERA) {
+            if (hasCameraPermission()) {
+                grantPendingMediaCapture();
+            } else {
+                denyPendingPermissionRequest();
+                recordDiagnostic("android.permission.denied", "CAMERA");
+                statusText.setText("Camera access was denied by Android. Enable it in app permissions and try again.");
             }
             return;
         }
@@ -401,26 +480,51 @@ public final class MainActivity extends Activity {
         }
     }
 
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode == REQUEST_FILE_CHOOSER) {
+            ValueCallback<Uri[]> callback = pendingFilePathCallback;
+            pendingFilePathCallback = null;
+            if (callback != null) {
+                callback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data));
+            }
+            return;
+        }
+        super.onActivityResult(requestCode, resultCode, data);
+    }
+
     private void handleWebPermissionRequest(PermissionRequest request) {
-        if (!requestsAudioCapture(request)) {
-            recordDiagnostic("web.permission.denied", "Non-audio permission request");
+        if (!requestsSupportedMediaCapture(request)) {
+            recordDiagnostic("web.permission.denied", "Unsupported permission request");
             request.deny();
             return;
         }
-        if (hasRecordAudioPermission()) {
-            grantAudioCapture(request);
-            recordDiagnostic("android.permission.already_granted", "RECORD_AUDIO");
-            statusText.setText("Microphone access granted.");
+        if (canGrantMediaCapture(request)) {
+            grantMediaCapture(request);
+            recordDiagnostic("android.permission.already_granted", describeRequestedMediaPermissions(request));
+            statusText.setText("Media capture access granted.");
             return;
         }
         pendingPermissionRequest = request;
-        recordDiagnostic("android.permission.requested", "RECORD_AUDIO");
-        statusText.setText("OpenClaw needs microphone access for Talk. Approve the Android permission prompt.");
-        requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD_AUDIO);
+        if (requestsAudioCapture(request) && !hasRecordAudioPermission()) {
+            recordDiagnostic("android.permission.requested", "RECORD_AUDIO");
+            statusText.setText("OpenClaw needs microphone access for Talk. Approve the Android permission prompt.");
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD_AUDIO);
+            return;
+        }
+        if (requestsVideoCapture(request) && !hasCameraPermission()) {
+            recordDiagnostic("android.permission.requested", "CAMERA");
+            statusText.setText("OpenClaw needs camera access. Approve the Android permission prompt.");
+            requestPermissions(new String[]{Manifest.permission.CAMERA}, REQUEST_CAMERA);
+        }
     }
 
     private boolean hasRecordAudioPermission() {
         return checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private boolean hasCameraPermission() {
+        return checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
     }
 
     private boolean requestsAudioCapture(PermissionRequest request) {
@@ -432,13 +536,42 @@ public final class MainActivity extends Activity {
         return false;
     }
 
-    private void grantPendingAudioCapture() {
+    private boolean requestsVideoCapture(PermissionRequest request) {
+        for (String resource : request.getResources()) {
+            if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(resource)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean requestsSupportedMediaCapture(PermissionRequest request) {
+        for (String resource : request.getResources()) {
+            if (!PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(resource)
+                    && !PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(resource)) {
+                return false;
+            }
+        }
+        return request.getResources().length > 0;
+    }
+
+    private boolean canGrantMediaCapture(PermissionRequest request) {
+        return (!requestsAudioCapture(request) || hasRecordAudioPermission())
+                && (!requestsVideoCapture(request) || hasCameraPermission());
+    }
+
+    private void grantPendingMediaCapture() {
         PermissionRequest request = pendingPermissionRequest;
         pendingPermissionRequest = null;
         if (request != null) {
-            grantAudioCapture(request);
-            recordDiagnostic("android.permission.granted", "RECORD_AUDIO");
-            statusText.setText("Microphone access granted.");
+            if (canGrantMediaCapture(request)) {
+                grantMediaCapture(request);
+                recordDiagnostic("android.permission.granted", describeRequestedMediaPermissions(request));
+                statusText.setText("Media capture access granted.");
+            } else {
+                pendingPermissionRequest = request;
+                handleWebPermissionRequest(request);
+            }
         }
     }
 
@@ -450,20 +583,28 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void grantAudioCapture(PermissionRequest request) {
+    private void grantMediaCapture(PermissionRequest request) {
         List<String> granted = new ArrayList<>();
         for (String resource : request.getResources()) {
-            if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(resource)) {
+            if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(resource)
+                    || PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(resource)) {
                 granted.add(resource);
             }
         }
         if (granted.isEmpty()) {
-            recordDiagnostic("web.permission.denied", "Audio capture resources missing");
+            recordDiagnostic("web.permission.denied", "Media capture resources missing");
             request.deny();
             return;
         }
-        recordDiagnostic("web.permission.granted", "RESOURCE_AUDIO_CAPTURE");
+        recordDiagnostic("web.permission.granted", String.join(",", granted));
         request.grant(granted.toArray(new String[0]));
+    }
+
+    private String describeRequestedMediaPermissions(PermissionRequest request) {
+        List<String> permissions = new ArrayList<>();
+        if (requestsAudioCapture(request)) permissions.add("RECORD_AUDIO");
+        if (requestsVideoCapture(request)) permissions.add("CAMERA");
+        return String.join(",", permissions);
     }
 
     private void toggleSettings(Button toggle) {
@@ -474,8 +615,10 @@ public final class MainActivity extends Activity {
     }
 
     private void setConnectedUiVisible(boolean connected) {
-        if (chromeContainer == null) return;
-        chromeContainer.setVisibility(connected ? View.GONE : View.VISIBLE);
+        if (chromeContainer == null || settingsPanel == null || hintText == null) return;
+        chromeContainer.setVisibility(View.VISIBLE);
+        settingsPanel.setVisibility(connected ? View.GONE : View.VISIBLE);
+        hintText.setVisibility(connected ? View.GONE : View.VISIBLE);
         ViewGroup.MarginLayoutParams layoutParams = (ViewGroup.MarginLayoutParams) webView.getLayoutParams();
         if (layoutParams != null) {
             layoutParams.topMargin = connected ? 0 : dp(4);
@@ -487,8 +630,8 @@ public final class MainActivity extends Activity {
         String raw = value(urlInput);
         if (raw.isEmpty()) throw new IllegalStateException("Gateway URL is required.");
         String dashboardUrl = toDashboardUrl(raw);
-        if (!isSecureDashboardUrl(dashboardUrl)) {
-            throw new IllegalStateException("Android Talk requires a secure https:// dashboard URL. Use your Tailscale/MagicDNS hostname instead of the raw ws:// or http:// gateway address.");
+        if (!isDashboardUrl(dashboardUrl)) {
+            throw new IllegalStateException("Gateway URL must be an http:// or https:// dashboard URL.");
         }
         return dashboardUrl;
     }
@@ -707,6 +850,18 @@ public final class MainActivity extends Activity {
             if (!"http".equalsIgnoreCase(scheme)) return false;
             String normalized = host.trim().toLowerCase();
             return "localhost".equals(normalized) || "127.0.0.1".equals(normalized) || "::1".equals(normalized);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isDashboardUrl(String raw) {
+        try {
+            java.net.URI uri = java.net.URI.create(raw);
+            String scheme = uri.getScheme();
+            String host = uri.getHost();
+            if (scheme == null || host == null) return false;
+            return "https".equalsIgnoreCase(scheme) || "http".equalsIgnoreCase(scheme);
         } catch (Exception ignored) {
             return false;
         }
