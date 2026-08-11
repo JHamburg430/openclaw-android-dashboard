@@ -121,6 +121,7 @@ public final class MainActivity extends Activity {
     private Button openButton;
     private Button reloadButton;
     private Button chromeToggleButton;
+    private Button overlayToggleButton;
     private WebView webView;
     private boolean chromeExpanded = true;
 
@@ -162,14 +163,18 @@ public final class MainActivity extends Activity {
     }
 
     private void buildUi() {
+        FrameLayout shellRoot = new FrameLayout(this);
+        shellRoot.setBackgroundColor(COLOR_APP_CHROME);
+
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(COLOR_APP_CHROME);
-        applyStatusBarInset(root);
+        shellRoot.addView(root, new FrameLayout.LayoutParams(-1, -1));
 
         chromeContainer = new LinearLayout(this);
         chromeContainer.setOrientation(LinearLayout.VERTICAL);
         chromeContainer.setBackgroundColor(COLOR_APP_CHROME);
+        applyStatusBarInset(chromeContainer);
         root.addView(chromeContainer, new LinearLayout.LayoutParams(-1, -2));
 
         statusText = text("Configure the gateway URL and auth, then load the real Control UI.", 14, COLOR_TEXT_SECONDARY, true);
@@ -360,14 +365,25 @@ public final class MainActivity extends Activity {
         });
         webContainer.addView(webView, new FrameLayout.LayoutParams(-1, -1));
 
+        overlayToggleButton = button("+");
+        overlayToggleButton.setTextSize(12);
+        overlayToggleButton.setPadding(0, 0, 0, dp(1));
+        overlayToggleButton.setContentDescription("Expand controls");
+        overlayToggleButton.setVisibility(View.GONE);
+        FrameLayout.LayoutParams overlayLp = new FrameLayout.LayoutParams(dp(24), dp(22), Gravity.TOP | Gravity.RIGHT);
+        overlayLp.setMargins(0, dp(2), dp(4), 0);
+        shellRoot.addView(overlayToggleButton, overlayLp);
+        applyStatusBarMargin(overlayToggleButton, dp(2));
+
         decode.setOnClickListener(v -> decodeSetupCode());
         openButton.setOnClickListener(v -> openDashboard());
         reloadButton.setOnClickListener(v -> webView.reload());
         chromeToggleButton.setOnClickListener(v -> setChromeExpanded(!chromeExpanded));
+        overlayToggleButton.setOnClickListener(v -> setChromeExpanded(true));
         copyDiagnostics.setOnClickListener(v -> copyDiagnostics());
         clearDiagnostics.setOnClickListener(v -> clearDiagnostics());
         probeMic.setOnClickListener(v -> runNativeMicProbe());
-        setContentView(root);
+        setContentView(shellRoot);
         recordDiagnostic("app.ready", "Diagnostics bridge initialized");
     }
 
@@ -414,6 +430,17 @@ public final class MainActivity extends Activity {
                     baseTop + statusBars.top,
                     baseRight,
                     baseBottom);
+            return insets;
+        });
+        view.requestApplyInsets();
+    }
+
+    private void applyStatusBarMargin(View view, int topOffset) {
+        view.setOnApplyWindowInsetsListener((target, insets) -> {
+            Insets statusBars = insets.getInsets(WindowInsets.Type.statusBars());
+            ViewGroup.MarginLayoutParams params = (ViewGroup.MarginLayoutParams) target.getLayoutParams();
+            params.topMargin = statusBars.top + topOffset;
+            target.setLayoutParams(params);
             return insets;
         });
         view.requestApplyInsets();
@@ -637,8 +664,11 @@ public final class MainActivity extends Activity {
 
     private void setChromeExpanded(boolean expanded) {
         if (statusText == null || topActions == null || controlsScroll == null
-                || openButton == null || reloadButton == null || chromeToggleButton == null) return;
+                || openButton == null || reloadButton == null || chromeToggleButton == null
+                || overlayToggleButton == null || chromeContainer == null) return;
         chromeExpanded = expanded;
+        chromeContainer.setVisibility(expanded ? View.VISIBLE : View.GONE);
+        overlayToggleButton.setVisibility(expanded ? View.GONE : View.VISIBLE);
         statusText.setVisibility(expanded ? View.VISIBLE : View.GONE);
         controlsScroll.setVisibility(expanded ? View.VISIBLE : View.GONE);
         openButton.setVisibility(expanded ? View.VISIBLE : View.GONE);
