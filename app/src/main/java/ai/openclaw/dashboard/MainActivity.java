@@ -14,6 +14,7 @@ import android.content.pm.PackageManager;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Insets;
+import android.graphics.drawable.GradientDrawable;
 import android.media.AudioManager;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
@@ -88,6 +89,13 @@ public final class MainActivity extends Activity {
     private static final String NOTIFICATION_CHANNEL_ID = "openclaw_updates";
     private static final int NOTIFICATION_ID = 41001;
     private static final String PREF_NOTIFICATION_COUNT = "notification_count";
+    private static final int COLOR_APP_CHROME = Color.rgb(6, 10, 16);
+    private static final int COLOR_PANEL = Color.rgb(20, 26, 34);
+    private static final int COLOR_CONTROL = Color.rgb(30, 38, 48);
+    private static final int COLOR_TEXT_PRIMARY = Color.rgb(244, 248, 252);
+    private static final int COLOR_TEXT_SECONDARY = Color.rgb(198, 211, 224);
+    private static final int COLOR_TEXT_MUTED = Color.rgb(154, 169, 184);
+    private static final int COLOR_ACCENT = Color.rgb(0, 171, 126);
 
     private final OkHttpClient httpClient = new OkHttpClient.Builder()
             .dns(new HostsFileDns())
@@ -150,21 +158,25 @@ public final class MainActivity extends Activity {
     private void buildUi() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Color.rgb(14, 18, 24));
+        root.setBackgroundColor(COLOR_APP_CHROME);
         applyStatusBarInset(root);
 
         chromeContainer = new LinearLayout(this);
         chromeContainer.setOrientation(LinearLayout.VERTICAL);
+        chromeContainer.setBackgroundColor(COLOR_APP_CHROME);
         root.addView(chromeContainer, new LinearLayout.LayoutParams(-1, -2));
 
-        statusText = text("Configure the gateway URL and auth, then load the real Control UI.", 14, Color.rgb(150, 164, 178), false);
-        statusText.setPadding(dp(14), dp(10), dp(14), dp(6));
+        statusText = text("Configure the gateway URL and auth, then load the real Control UI.", 14, COLOR_TEXT_SECONDARY, true);
+        statusText.setGravity(Gravity.CENTER_VERTICAL);
+        statusText.setMinHeight(dp(44));
+        statusText.setPadding(dp(14), dp(8), dp(14), dp(6));
         chromeContainer.addView(statusText, new LinearLayout.LayoutParams(-1, -2));
 
         LinearLayout topActions = new LinearLayout(this);
         topActions.setOrientation(LinearLayout.HORIZONTAL);
         topActions.setGravity(Gravity.CENTER_VERTICAL);
-        topActions.setPadding(dp(14), 0, dp(14), 0);
+        topActions.setPadding(dp(14), dp(2), dp(14), dp(10));
+        topActions.setBackgroundColor(COLOR_APP_CHROME);
         Button open = button("Open UI");
         Button reload = button("Reload");
         Button toggle = button("Hide Setup");
@@ -201,7 +213,7 @@ public final class MainActivity extends Activity {
         hintText = text(
                 "This app now embeds the actual OpenClaw Control UI. If the gateway asks for pairing, approve the pending device request from the host once, then reload.",
                 13,
-                Color.rgb(132, 145, 159),
+                COLOR_TEXT_MUTED,
                 false);
         hintText.setPadding(0, dp(12), 0, 0);
         controls.addView(hintText);
@@ -218,7 +230,7 @@ public final class MainActivity extends Activity {
         diagnosticsActions.addView(probeMic, new LinearLayout.LayoutParams(0, dp(42), 1));
         controls.addView(diagnosticsActions);
 
-        diagnosticsText = text("No diagnostics yet.", 12, Color.rgb(195, 205, 214), false);
+        diagnosticsText = text("No diagnostics yet.", 12, COLOR_TEXT_SECONDARY, false);
         diagnosticsText.setTextIsSelectable(true);
         diagnosticsText.setPadding(dp(10), dp(8), dp(10), dp(8));
         diagnosticsText.setBackgroundColor(Color.rgb(10, 14, 20));
@@ -230,7 +242,7 @@ public final class MainActivity extends Activity {
         root.addView(webContainer, webLp);
 
         webView = new WebView(this);
-        webView.setBackgroundColor(Color.rgb(14, 18, 24));
+        webView.setBackgroundColor(COLOR_APP_CHROME);
         WebView.setWebContentsDebuggingEnabled(true);
         WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(true);
@@ -355,9 +367,12 @@ public final class MainActivity extends Activity {
     private void configureSystemBars() {
         Window window = getWindow();
         if (window == null) return;
-        int chromeColor = Color.rgb(14, 18, 24);
-        window.setStatusBarColor(chromeColor);
-        window.setNavigationBarColor(chromeColor);
+        window.setStatusBarColor(COLOR_APP_CHROME);
+        window.setNavigationBarColor(COLOR_APP_CHROME);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            window.setStatusBarContrastEnforced(false);
+            window.setNavigationBarContrastEnforced(false);
+        }
         View decorView = window.getDecorView();
         if (decorView == null) return;
         int flags = decorView.getSystemUiVisibility();
@@ -1342,7 +1357,7 @@ public final class MainActivity extends Activity {
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
         layout.setPadding(dp(14), dp(10), dp(14), dp(10));
-        layout.setBackgroundColor(Color.rgb(20, 26, 34));
+        layout.setBackgroundColor(COLOR_PANEL);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
         lp.setMargins(dp(14), dp(4), dp(14), 0);
         layout.setLayoutParams(lp);
@@ -1350,7 +1365,7 @@ public final class MainActivity extends Activity {
     }
 
     private TextView label(String value) {
-        TextView view = text(value, 12, Color.rgb(130, 144, 158), true);
+        TextView view = text(value, 12, COLOR_TEXT_MUTED, true);
         view.setPadding(0, dp(6), 0, dp(3));
         return view;
     }
@@ -1366,9 +1381,9 @@ public final class MainActivity extends Activity {
         else if (singleLine) input.setInputType(InputType.TYPE_CLASS_TEXT);
         else input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         input.setPadding(dp(10), dp(8), dp(10), dp(8));
-        input.setTextColor(Color.rgb(234, 240, 246));
-        input.setHintTextColor(Color.rgb(111, 124, 137));
-        input.setBackgroundColor(Color.rgb(30, 38, 48));
+        input.setTextColor(COLOR_TEXT_PRIMARY);
+        input.setHintTextColor(COLOR_TEXT_MUTED);
+        input.setBackgroundColor(COLOR_CONTROL);
         return input;
     }
 
@@ -1376,6 +1391,14 @@ public final class MainActivity extends Activity {
         Button button = new Button(this);
         button.setText(text);
         button.setAllCaps(false);
+        button.setTextColor(COLOR_TEXT_PRIMARY);
+        button.setTextSize(13);
+        button.setPadding(dp(8), 0, dp(8), 0);
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(COLOR_CONTROL);
+        background.setCornerRadius(dp(6));
+        background.setStroke(dp(1), COLOR_ACCENT);
+        button.setBackground(background);
         return button;
     }
 
