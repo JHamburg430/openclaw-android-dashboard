@@ -115,8 +115,14 @@ public final class MainActivity extends Activity {
     private TextView hintText;
     private TextView diagnosticsText;
     private LinearLayout chromeContainer;
+    private LinearLayout topActions;
     private LinearLayout settingsPanel;
+    private ScrollView controlsScroll;
+    private Button openButton;
+    private Button reloadButton;
+    private Button chromeToggleButton;
     private WebView webView;
+    private boolean chromeExpanded = true;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -172,20 +178,21 @@ public final class MainActivity extends Activity {
         statusText.setPadding(dp(14), dp(8), dp(14), dp(6));
         chromeContainer.addView(statusText, new LinearLayout.LayoutParams(-1, -2));
 
-        LinearLayout topActions = new LinearLayout(this);
+        topActions = new LinearLayout(this);
         topActions.setOrientation(LinearLayout.HORIZONTAL);
         topActions.setGravity(Gravity.CENTER_VERTICAL);
         topActions.setPadding(dp(14), dp(2), dp(14), dp(10));
         topActions.setBackgroundColor(COLOR_APP_CHROME);
-        Button open = button("Open UI");
-        Button reload = button("Reload");
-        Button toggle = button("Hide Setup");
-        topActions.addView(open, new LinearLayout.LayoutParams(0, dp(38), 1));
-        topActions.addView(reload, new LinearLayout.LayoutParams(0, dp(38), 1));
-        topActions.addView(toggle, new LinearLayout.LayoutParams(0, dp(38), 1));
+        openButton = button("Open UI");
+        reloadButton = button("Reload");
+        chromeToggleButton = button("-");
+        chromeToggleButton.setContentDescription("Collapse controls");
+        topActions.addView(openButton, new LinearLayout.LayoutParams(0, dp(38), 1));
+        topActions.addView(reloadButton, new LinearLayout.LayoutParams(0, dp(38), 1));
+        topActions.addView(chromeToggleButton, new LinearLayout.LayoutParams(dp(38), dp(38)));
         chromeContainer.addView(topActions, new LinearLayout.LayoutParams(-1, -2));
 
-        ScrollView controlsScroll = new ScrollView(this);
+        controlsScroll = new ScrollView(this);
         settingsPanel = section();
         controlsScroll.addView(settingsPanel);
         chromeContainer.addView(controlsScroll, new LinearLayout.LayoutParams(-1, -2));
@@ -354,9 +361,9 @@ public final class MainActivity extends Activity {
         webContainer.addView(webView, new FrameLayout.LayoutParams(-1, -1));
 
         decode.setOnClickListener(v -> decodeSetupCode());
-        open.setOnClickListener(v -> openDashboard());
-        reload.setOnClickListener(v -> webView.reload());
-        toggle.setOnClickListener(v -> toggleSettings(toggle));
+        openButton.setOnClickListener(v -> openDashboard());
+        reloadButton.setOnClickListener(v -> webView.reload());
+        chromeToggleButton.setOnClickListener(v -> setChromeExpanded(!chromeExpanded));
         copyDiagnostics.setOnClickListener(v -> copyDiagnostics());
         clearDiagnostics.setOnClickListener(v -> clearDiagnostics());
         probeMic.setOnClickListener(v -> runNativeMicProbe());
@@ -622,21 +629,31 @@ public final class MainActivity extends Activity {
         return String.join(",", permissions);
     }
 
-    private void toggleSettings(Button toggle) {
-        boolean visible = settingsPanel.getVisibility() == View.VISIBLE;
-        settingsPanel.setVisibility(visible ? View.GONE : View.VISIBLE);
-        hintText.setVisibility(visible ? View.GONE : View.VISIBLE);
-        toggle.setText(visible ? "Show Setup" : "Hide Setup");
-    }
-
     private void setConnectedUiVisible(boolean connected) {
         if (chromeContainer == null || settingsPanel == null || hintText == null) return;
         chromeContainer.setVisibility(View.VISIBLE);
-        settingsPanel.setVisibility(connected ? View.GONE : View.VISIBLE);
-        hintText.setVisibility(connected ? View.GONE : View.VISIBLE);
+        setChromeExpanded(!connected);
+    }
+
+    private void setChromeExpanded(boolean expanded) {
+        if (statusText == null || topActions == null || controlsScroll == null
+                || openButton == null || reloadButton == null || chromeToggleButton == null) return;
+        chromeExpanded = expanded;
+        statusText.setVisibility(expanded ? View.VISIBLE : View.GONE);
+        controlsScroll.setVisibility(expanded ? View.VISIBLE : View.GONE);
+        openButton.setVisibility(expanded ? View.VISIBLE : View.GONE);
+        reloadButton.setVisibility(expanded ? View.VISIBLE : View.GONE);
+        topActions.setGravity(expanded ? Gravity.CENTER_VERTICAL : Gravity.RIGHT);
+        topActions.setPadding(
+                dp(expanded ? 14 : 0),
+                dp(expanded ? 2 : 0),
+                dp(expanded ? 14 : 4),
+                dp(expanded ? 10 : 2));
+        chromeToggleButton.setText(expanded ? "-" : "+");
+        chromeToggleButton.setContentDescription(expanded ? "Collapse controls" : "Expand controls");
         ViewGroup.MarginLayoutParams layoutParams = (ViewGroup.MarginLayoutParams) webView.getLayoutParams();
         if (layoutParams != null) {
-            layoutParams.topMargin = connected ? 0 : dp(4);
+            layoutParams.topMargin = expanded ? dp(4) : 0;
             webView.setLayoutParams(layoutParams);
         }
     }
@@ -1394,6 +1411,10 @@ public final class MainActivity extends Activity {
         button.setTextColor(COLOR_TEXT_PRIMARY);
         button.setTextSize(13);
         button.setPadding(dp(8), 0, dp(8), 0);
+        button.setMinWidth(0);
+        button.setMinimumWidth(0);
+        button.setMinHeight(0);
+        button.setMinimumHeight(0);
         GradientDrawable background = new GradientDrawable();
         background.setColor(COLOR_CONTROL);
         background.setCornerRadius(dp(6));
