@@ -90,8 +90,8 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_FILE_CHOOSER = 2004;
     private static final int REQUEST_BLUETOOTH_CONNECT = 2005;
     private static final String TAG = "OpenClawDashboard";
-    private static final int APP_VERSION_CODE = 33;
-    private static final String APP_VERSION_NAME = "1.0.33";
+    private static final int APP_VERSION_CODE = 34;
+    private static final String APP_VERSION_NAME = "1.0.34";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final String NOTIFICATION_CHANNEL_ID = "openclaw_updates";
@@ -1654,6 +1654,9 @@ public final class MainActivity extends Activity {
         private static final int OUTPUT_SAMPLE_RATE = 24000;
         private static final int MAX_QUEUED_CHUNKS = 64;
         private static final int MAX_OUTPUT_QUEUED_CHUNKS = 96;
+        private static final double OUTPUT_GAIN = 2.5;
+        private static final double TEST_TONE_AMPLITUDE = 26000.0;
+        private static final double MIN_PLAYBACK_VOLUME_RATIO = 0.8;
         private final Object lock = new Object();
         private final Object outputLock = new Object();
         private final ArrayDeque<String> chunkQueue = new ArrayDeque<>();
@@ -1756,7 +1759,13 @@ public final class MainActivity extends Activity {
                 return;
             }
             if (pcm.length == 0) return;
-            recordDiagnostic("native_audio_output.enqueue", "reason=" + routeReason + " sampleRate=" + outputSampleRate + " bytes=" + pcm.length);
+            int clippedSamples = applyPcm16Gain(pcm, OUTPUT_GAIN);
+            recordDiagnostic("native_audio_output.enqueue",
+                    "reason=" + routeReason
+                            + " sampleRate=" + outputSampleRate
+                            + " bytes=" + pcm.length
+                            + " gain=" + OUTPUT_GAIN
+                            + " clipped=" + clippedSamples);
             synchronized (outputLock) {
                 outputQueue.addLast(pcm);
                 while (outputQueue.size() > MAX_OUTPUT_QUEUED_CHUNKS) {
@@ -1787,20 +1796,14 @@ public final class MainActivity extends Activity {
                     AudioDeviceInfo bluetoothOutput = preferBluetoothAudioRoute(false, routeReason);
                     AudioManager audioManager = getAudioManager();
                     if (audioManager != null) {
-                        int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
-                        int max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
-                        recordDiagnostic("native_audio_output.volume", "music=" + current + "/" + max + " mode=" + audioManager.getMode());
-                        if (current == 0 && max > 0) {
-                            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, Math.max(1, max / 4), 0);
-                            recordDiagnostic("native_audio_output.volume_adjusted", "music stream was muted");
-                        }
+                        ensurePlaybackStreamVolume(audioManager);
                     }
                     int durationMs = 700;
                     int samples = OUTPUT_SAMPLE_RATE * durationMs / 1000;
                     byte[] pcm = new byte[samples * 2];
                     for (int i = 0; i < samples; i++) {
                         double envelope = Math.min(1.0, Math.min(i / 1200.0, (samples - i) / 1200.0));
-                        short value = (short) Math.round(Math.sin(2.0 * Math.PI * frequency * i / OUTPUT_SAMPLE_RATE) * 12000.0 * envelope);
+                        short value = (short) Math.round(Math.sin(2.0 * Math.PI * frequency * i / OUTPUT_SAMPLE_RATE) * TEST_TONE_AMPLITUDE * envelope);
                         pcm[i * 2] = (byte) (value & 0xff);
                         pcm[i * 2 + 1] = (byte) ((value >> 8) & 0xff);
                     }
@@ -1854,12 +1857,7 @@ public final class MainActivity extends Activity {
                 AudioDeviceInfo bluetoothOutput = preferBluetoothAudioRoute(false, routeReason);
                 AudioManager audioManager = getAudioManager();
                 if (audioManager != null) {
-                    int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
-                    int max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
-                    if (current == 0 && max > 0) {
-                        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, Math.max(1, max / 4), 0);
-                        recordDiagnostic("native_audio_output.volume_adjusted", "music stream was muted");
-                    }
+                    ensurePlaybackStreamVolume(audioManager);
                 }
                 int minBuffer = AudioTrack.getMinBufferSize(
                         sampleRateHz,
@@ -1929,6 +1927,37 @@ public final class MainActivity extends Activity {
                 outputThread = null;
                 restoreBluetoothAudioRouteIfIdle();
             }
+        }
+
+        private void ensurePlaybackStreamVolume(AudioManager audioManager) {
+            int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+            int max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+            recordDiagnostic("native_audio_output.volume", "music=" + current + "/" + max + " mode=" + audioManager.getMode());
+            if (max <= 0) return;
+            int minimum = Math.max(1, (int) Math.ceil(max * MIN_PLAYBACK_VOLUME_RATIO));
+            if (current < minimum) {
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, minimum, 0);
+                recordDiagnostic("native_audio_output.volume_adjusted", "music=" + current + "/" + max + " -> " + minimum + "/" + max);
+            }
+        }
+
+        private int applyPcm16Gain(byte[] pcm, double gain) {
+            if (gain <= 0.0 || gain == 1.0) return 0;
+            int clipped = 0;
+            for (int i = 0; i + 1 < pcm.length; i += 2) {
+                int sample = (pcm[i] & 0xff) | (pcm[i + 1] << 8);
+                int amplified = (int) Math.round(sample * gain);
+                if (amplified > Short.MAX_VALUE) {
+                    amplified = Short.MAX_VALUE;
+                    clipped++;
+                } else if (amplified < Short.MIN_VALUE) {
+                    amplified = Short.MIN_VALUE;
+                    clipped++;
+                }
+                pcm[i] = (byte) (amplified & 0xff);
+                pcm[i + 1] = (byte) ((amplified >> 8) & 0xff);
+            }
+            return clipped;
         }
 
         private void readNativeAudioLoop(int samplesPerChunk) {
