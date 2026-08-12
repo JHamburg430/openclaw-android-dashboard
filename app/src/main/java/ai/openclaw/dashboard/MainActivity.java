@@ -90,8 +90,8 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_FILE_CHOOSER = 2004;
     private static final int REQUEST_BLUETOOTH_CONNECT = 2005;
     private static final String TAG = "OpenClawDashboard";
-    private static final int APP_VERSION_CODE = 34;
-    private static final String APP_VERSION_NAME = "1.0.34";
+    private static final int APP_VERSION_CODE = 35;
+    private static final String APP_VERSION_NAME = "1.0.35";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final String NOTIFICATION_CHANNEL_ID = "openclaw_updates";
@@ -1654,9 +1654,9 @@ public final class MainActivity extends Activity {
         private static final int OUTPUT_SAMPLE_RATE = 24000;
         private static final int MAX_QUEUED_CHUNKS = 64;
         private static final int MAX_OUTPUT_QUEUED_CHUNKS = 96;
-        private static final double OUTPUT_GAIN = 2.5;
-        private static final double TEST_TONE_AMPLITUDE = 26000.0;
-        private static final double MIN_PLAYBACK_VOLUME_RATIO = 0.8;
+        private static final double OUTPUT_GAIN = 5.0;
+        private static final double TEST_TONE_AMPLITUDE = 30000.0;
+        private static final double MIN_PLAYBACK_VOLUME_RATIO = 1.0;
         private final Object lock = new Object();
         private final Object outputLock = new Object();
         private final ArrayDeque<String> chunkQueue = new ArrayDeque<>();
