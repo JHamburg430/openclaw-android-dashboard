@@ -90,8 +90,8 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_FILE_CHOOSER = 2004;
     private static final int REQUEST_BLUETOOTH_CONNECT = 2005;
     private static final String TAG = "OpenClawDashboard";
-    private static final int APP_VERSION_CODE = 37;
-    private static final String APP_VERSION_NAME = "1.0.37";
+    private static final int APP_VERSION_CODE = 38;
+    private static final String APP_VERSION_NAME = "1.0.38";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final String NOTIFICATION_CHANNEL_ID = "openclaw_updates";
@@ -1660,7 +1660,7 @@ public final class MainActivity extends Activity {
         private static final double OUTPUT_GAIN = 5.0;
         private static final double TEST_TONE_AMPLITUDE = 30000.0;
         private static final double MIN_PLAYBACK_VOLUME_RATIO = 1.0;
-        private static final int OUTPUT_TAIL_WAIT_MS = 80;
+        private static final int OUTPUT_TAIL_WAIT_MS = 350;
         private final Object lock = new Object();
         private final Object outputLock = new Object();
         private final ArrayDeque<String> chunkQueue = new ArrayDeque<>();
@@ -1867,7 +1867,7 @@ public final class MainActivity extends Activity {
                         sampleRateHz,
                         AudioFormat.CHANNEL_OUT_MONO,
                         AudioFormat.ENCODING_PCM_16BIT);
-                int bufferSize = Math.max(minBuffer, sampleRateHz / 5);
+                int bufferSize = Math.max(minBuffer, sampleRateHz / 2);
                 track = new AudioTrack(
                         AudioManager.STREAM_MUSIC,
                         sampleRateHz,
