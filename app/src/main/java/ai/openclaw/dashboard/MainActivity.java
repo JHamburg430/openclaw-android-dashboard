@@ -522,12 +522,14 @@ public final class MainActivity extends Activity {
     private String buildSiblingAppUrl(int port) {
         String dashboard = buildDashboardUrl();
         java.net.URI uri = java.net.URI.create(dashboard);
-        String scheme = uri.getScheme() == null ? "http" : uri.getScheme();
         String host = uri.getHost();
         if (host == null || host.trim().isEmpty()) {
             throw new IllegalStateException("Dashboard host is missing.");
         }
-        return scheme + "://" + host + ":" + port + "/";
+        // The custom Streamlit/monitor apps are served directly by local
+        // user services on plain HTTP ports, even when Control UI is reached
+        // through a secure Tailscale/OpenClaw dashboard URL.
+        return "http://" + host + ":" + port + "/";
     }
 
     private void connectDashboardNode() {
