@@ -90,8 +90,8 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_FILE_CHOOSER = 2004;
     private static final int REQUEST_BLUETOOTH_CONNECT = 2005;
     private static final String TAG = "OpenClawDashboard";
-    private static final int APP_VERSION_CODE = 38;
-    private static final String APP_VERSION_NAME = "1.0.38";
+    private static final int APP_VERSION_CODE = 39;
+    private static final String APP_VERSION_NAME = "1.0.39";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final String NOTIFICATION_CHANNEL_ID = "openclaw_updates";
@@ -1271,7 +1271,7 @@ public final class MainActivity extends Activity {
                 + "function audioBase64(payload){if(!payload||typeof payload!=='object')return '';var nested=payload.payload&&typeof payload.payload==='object'?payload.payload:{};var audio=payload.audio&&typeof payload.audio==='object'?payload.audio:{};var value=firstString(payload.audioBase64,payload.base64,payload.delta,payload.audio,nested.audioBase64,nested.base64,nested.delta,audio.audioBase64,audio.base64,audio.delta,audio.data);if(value.indexOf('base64,')>=0)value=value.substring(value.indexOf('base64,')+7);return value;}"
                 + "function audioSampleRate(payload){if(!payload||typeof payload!=='object')return 24000;var nested=payload.payload&&typeof payload.payload==='object'?payload.payload:{};var audio=payload.audio&&typeof payload.audio==='object'?payload.audio:{};return payload.sampleRate||payload.sampleRateHz||nested.sampleRate||nested.sampleRateHz||audio.sampleRate||audio.sampleRateHz||24000;}"
                 + "function relayText(payload){if(!payload||typeof payload!=='object')return '';var nested=payload.payload&&typeof payload.payload==='object'?payload.payload:{};var response=payload.response&&typeof payload.response==='object'?payload.response:{};var output=payload.output&&typeof payload.output==='object'?payload.output:{};return firstString(payload.text,payload.transcript,payload.message,payload.delta,nested.text,nested.transcript,nested.message,nested.delta,response.text,response.output_text,output.text,output.transcript);}"
-                + "function shouldSuppressRelayMessage(payload){var kind=String(payload&&payload.type||'');var text=relayText(payload).trim();if(text==='NO_REPLY')return true;if((kind.indexOf('text')>=0||kind.indexOf('transcript')>=0)&&!text)return true;return false;}"
+                + "function shouldSuppressRelayMessage(payload){var kind=String(payload&&payload.type||'');var text=relayText(payload).trim();var lower=text.toLowerCase();if(text==='NO_REPLY')return true;if(lower==='openclaw finished with no text')return true;if((kind.indexOf('text')>=0||kind.indexOf('transcript')>=0)&&!text)return true;return false;}"
                 + "function cleanGatewayRelayParams(params){"
                 + "params=params&&typeof params==='object'?params:{};"
                 + "var clean={mode:'realtime',transport:'gateway-relay',brain:'agent-consult'};"
@@ -1660,7 +1660,9 @@ public final class MainActivity extends Activity {
         private static final double OUTPUT_GAIN = 5.0;
         private static final double TEST_TONE_AMPLITUDE = 30000.0;
         private static final double MIN_PLAYBACK_VOLUME_RATIO = 1.0;
-        private static final int OUTPUT_TAIL_WAIT_MS = 350;
+        private static final int OUTPUT_TAIL_WAIT_MS = 600;
+        private static final int OUTPUT_BUFFER_SECONDS = 2;
+        private static final int OUTPUT_BYTES_PER_SAMPLE = 2;
         private final Object lock = new Object();
         private final Object outputLock = new Object();
         private final ArrayDeque<String> chunkQueue = new ArrayDeque<>();
@@ -1867,7 +1869,8 @@ public final class MainActivity extends Activity {
                         sampleRateHz,
                         AudioFormat.CHANNEL_OUT_MONO,
                         AudioFormat.ENCODING_PCM_16BIT);
-                int bufferSize = Math.max(minBuffer, sampleRateHz / 2);
+                int targetBuffer = sampleRateHz * OUTPUT_BYTES_PER_SAMPLE * OUTPUT_BUFFER_SECONDS;
+                int bufferSize = Math.max(minBuffer, targetBuffer);
                 track = new AudioTrack(
                         AudioManager.STREAM_MUSIC,
                         sampleRateHz,
