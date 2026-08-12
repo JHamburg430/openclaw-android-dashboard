@@ -18,6 +18,7 @@ import android.graphics.Insets;
 import android.graphics.drawable.GradientDrawable;
 import android.media.AudioManager;
 import android.media.AudioFormat;
+import android.media.AudioDeviceInfo;
 import android.media.AudioRecord;
 import android.media.AudioTrack;
 import android.media.MediaRecorder;
@@ -87,9 +88,10 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_POST_NOTIFICATIONS = 2002;
     private static final int REQUEST_CAMERA = 2003;
     private static final int REQUEST_FILE_CHOOSER = 2004;
+    private static final int REQUEST_BLUETOOTH_CONNECT = 2005;
     private static final String TAG = "OpenClawDashboard";
-    private static final int APP_VERSION_CODE = 30;
-    private static final String APP_VERSION_NAME = "1.0.30";
+    private static final int APP_VERSION_CODE = 32;
+    private static final String APP_VERSION_NAME = "1.0.32";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final String NOTIFICATION_CHANNEL_ID = "openclaw_updates";
@@ -172,6 +174,7 @@ public final class MainActivity extends Activity {
             webView.destroy();
             webView = null;
         }
+        nativeAudioBridge.shutdown();
         if (nodeClient != null) {
             nodeClient.disconnect();
             nodeClient = null;
@@ -639,6 +642,7 @@ public final class MainActivity extends Activity {
                 .put("batteryPercent", battery >= 0 ? battery : JSONObject.NULL)
                 .put("notifications", hasNotificationPermission())
                 .put("microphone", hasRecordAudioPermission())
+                .put("bluetoothConnect", hasBluetoothConnectPermission())
                 .put("camera", hasCameraPermission())
                 .put("ts", System.currentTimeMillis());
     }
@@ -647,6 +651,7 @@ public final class MainActivity extends Activity {
         return new JSONObject()
                 .put("recordAudio", hasRecordAudioPermission())
                 .put("camera", hasCameraPermission())
+                .put("bluetoothConnect", hasBluetoothConnectPermission())
                 .put("notifications", hasNotificationPermission())
                 .put("contacts", checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED)
                 .put("mediaAudio", Build.VERSION.SDK_INT < 33 || checkSelfPermission(Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED)
@@ -910,6 +915,12 @@ public final class MainActivity extends Activity {
             }
             return;
         }
+        if (requestCode == REQUEST_BLUETOOTH_CONNECT) {
+            recordDiagnostic(
+                    hasBluetoothConnectPermission() ? "android.permission.granted" : "android.permission.denied",
+                    "BLUETOOTH_CONNECT");
+            return;
+        }
         if (requestCode == REQUEST_POST_NOTIFICATIONS) {
             recordDiagnostic(
                     hasNotificationPermission() ? "android.permission.granted" : "android.permission.denied",
@@ -962,6 +973,20 @@ public final class MainActivity extends Activity {
 
     private boolean hasCameraPermission() {
         return checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private boolean hasBluetoothConnectPermission() {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.S
+                || checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void requestBluetoothConnectPermission() {
+        if (hasBluetoothConnectPermission() || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return;
+        runOnUiThread(() -> {
+            if (hasBluetoothConnectPermission()) return;
+            recordDiagnostic("android.permission.requested", "BLUETOOTH_CONNECT");
+            requestPermissions(new String[]{Manifest.permission.BLUETOOTH_CONNECT}, REQUEST_BLUETOOTH_CONNECT);
+        });
     }
 
     private boolean requestsAudioCapture(PermissionRequest request) {
@@ -1633,6 +1658,8 @@ public final class MainActivity extends Activity {
         private Thread readerThread;
         private Thread outputThread;
         private Integer previousAudioMode;
+        private AudioDeviceInfo previousCommunicationDevice;
+        private boolean bluetoothRouteActive;
         private AcousticEchoCanceler acousticEchoCanceler;
         private NoiseSuppressor noiseSuppressor;
         private AutomaticGainControl automaticGainControl;
@@ -1658,6 +1685,7 @@ public final class MainActivity extends Activity {
                 }
                 int bufferSize = Math.max(minBuffer, samplesPerChunk * 2);
                 setCommunicationAudioMode();
+                AudioDeviceInfo bluetoothInput = preferBluetoothAudioRoute(true, "capture");
                 recorder = new AudioRecord(
                         MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                         NATIVE_SAMPLE_RATE,
@@ -1670,6 +1698,9 @@ public final class MainActivity extends Activity {
                     recorder = null;
                     restoreAudioMode();
                     return;
+                }
+                if (bluetoothInput != null && recorder.setPreferredDevice(bluetoothInput)) {
+                    recordDiagnostic("native_audio_bridge.input_route", describeAudioDevice(bluetoothInput));
                 }
                 enableVoiceProcessingEffects(recorder.getAudioSessionId());
                 recorder.startRecording();
@@ -1728,6 +1759,7 @@ public final class MainActivity extends Activity {
             new Thread(() -> {
                 AudioTrack track = null;
                 try {
+                    AudioDeviceInfo bluetoothOutput = preferBluetoothAudioRoute(false, "test_tone");
                     AudioManager audioManager = getAudioManager();
                     if (audioManager != null) {
                         int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
@@ -1763,6 +1795,9 @@ public final class MainActivity extends Activity {
                     if (track.getState() != AudioTrack.STATE_INITIALIZED) {
                         throw new IllegalStateException("AudioTrack failed to initialize: state=" + track.getState());
                     }
+                    if (bluetoothOutput != null && track.setPreferredDevice(bluetoothOutput)) {
+                        recordDiagnostic("native_audio_output.route", describeAudioDevice(bluetoothOutput));
+                    }
                     recordDiagnostic("native_audio_output.start", "AudioTrack tone sampleRate=" + OUTPUT_SAMPLE_RATE + " bytes=" + pcm.length);
                     track.play();
                     int written = track.write(pcm, 0, pcm.length);
@@ -1780,6 +1815,7 @@ public final class MainActivity extends Activity {
                         }
                         track.release();
                     }
+                    restoreBluetoothAudioRouteIfIdle();
                 }
             }, "openclaw-native-speaker-test").start();
         }
@@ -1787,6 +1823,7 @@ public final class MainActivity extends Activity {
         private void playPcmOutputLoop(int sampleRateHz) {
             AudioTrack track = null;
             try {
+                AudioDeviceInfo bluetoothOutput = preferBluetoothAudioRoute(false, "playback");
                 AudioManager audioManager = getAudioManager();
                 if (audioManager != null) {
                     int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
@@ -1810,6 +1847,9 @@ public final class MainActivity extends Activity {
                         AudioTrack.MODE_STREAM);
                 if (track.getState() != AudioTrack.STATE_INITIALIZED) {
                     throw new IllegalStateException("AudioTrack failed to initialize: state=" + track.getState());
+                }
+                if (bluetoothOutput != null && track.setPreferredDevice(bluetoothOutput)) {
+                    recordDiagnostic("native_audio_output.route", describeAudioDevice(bluetoothOutput));
                 }
                 recordDiagnostic("native_audio_output.stream_start", "sampleRate=" + sampleRateHz + " buffer=" + bufferSize);
                 track.play();
@@ -1859,6 +1899,7 @@ public final class MainActivity extends Activity {
                 }
                 outputRunning.set(false);
                 outputThread = null;
+                restoreBluetoothAudioRouteIfIdle();
             }
         }
 
@@ -1912,6 +1953,7 @@ public final class MainActivity extends Activity {
                 readerThread = null;
             }
             restoreAudioMode();
+            restoreBluetoothAudioRouteIfIdle();
             recordDiagnostic("native_audio_bridge.stop", "stopped");
         }
 
@@ -1931,6 +1973,111 @@ public final class MainActivity extends Activity {
             audioManager.setMode(previousAudioMode);
             recordDiagnostic("native_audio_bridge.audio_mode", "mode=" + previousAudioMode);
             previousAudioMode = null;
+        }
+
+        private AudioDeviceInfo preferBluetoothAudioRoute(boolean needsInput, String reason) {
+            if (!hasBluetoothConnectPermission()) {
+                requestBluetoothConnectPermission();
+                recordDiagnostic("native_audio_route.bluetooth", "permission_missing reason=" + reason);
+                return null;
+            }
+            AudioManager audioManager = getAudioManager();
+            if (audioManager == null) return null;
+            try {
+                AudioDeviceInfo preferred = findPreferredBluetoothDevice(audioManager, needsInput);
+                if (preferred == null) {
+                    recordDiagnostic("native_audio_route.bluetooth", "none_connected reason=" + reason);
+                    return null;
+                }
+                if (previousCommunicationDevice == null) {
+                    previousCommunicationDevice = audioManager.getCommunicationDevice();
+                }
+                boolean selected = audioManager.setCommunicationDevice(preferred);
+                bluetoothRouteActive = selected || bluetoothRouteActive;
+                recordDiagnostic("native_audio_route.bluetooth",
+                        (selected ? "selected " : "select_failed ")
+                                + describeAudioDevice(preferred)
+                                + " reason=" + reason);
+                return selected ? preferred : null;
+            } catch (SecurityException e) {
+                recordDiagnostic("native_audio_route.bluetooth", "security=" + e.getMessage());
+                requestBluetoothConnectPermission();
+                return null;
+            } catch (Exception e) {
+                recordDiagnostic("native_audio_route.bluetooth", e.getClass().getSimpleName() + ": " + e.getMessage());
+                return null;
+            }
+        }
+
+        private AudioDeviceInfo findPreferredBluetoothDevice(AudioManager audioManager, boolean needsInput) {
+            AudioDeviceInfo[] devices = audioManager.getDevices(
+                    needsInput ? AudioManager.GET_DEVICES_INPUTS : AudioManager.GET_DEVICES_OUTPUTS);
+            AudioDeviceInfo fallback = null;
+            for (AudioDeviceInfo device : devices) {
+                if (!isBluetoothAudioDevice(device)) continue;
+                if (needsInput && !device.isSource()) continue;
+                if (!needsInput && !device.isSink()) continue;
+                int type = device.getType();
+                if (type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                        || type == AudioDeviceInfo.TYPE_BLE_HEADSET) {
+                    return device;
+                }
+                if (!needsInput && (type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+                        || type == AudioDeviceInfo.TYPE_BLE_SPEAKER
+                        || type == AudioDeviceInfo.TYPE_BLE_BROADCAST)) {
+                    return device;
+                }
+                if (fallback == null) fallback = device;
+            }
+            return fallback;
+        }
+
+        private boolean isBluetoothAudioDevice(AudioDeviceInfo device) {
+            int type = device.getType();
+            return type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                    || type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+                    || type == AudioDeviceInfo.TYPE_BLE_HEADSET
+                    || type == AudioDeviceInfo.TYPE_BLE_SPEAKER
+                    || type == AudioDeviceInfo.TYPE_BLE_BROADCAST;
+        }
+
+        private String describeAudioDevice(AudioDeviceInfo device) {
+            String name = device.getProductName() == null ? "unknown" : device.getProductName().toString();
+            return "id=" + device.getId()
+                    + " type=" + device.getType()
+                    + " name=" + name;
+        }
+
+        private void restoreBluetoothAudioRouteIfIdle() {
+            if (running.get() || outputRunning.get() || !bluetoothRouteActive) return;
+            if (!hasBluetoothConnectPermission()) return;
+            AudioManager audioManager = getAudioManager();
+            if (audioManager == null) return;
+            try {
+                if (previousCommunicationDevice != null) {
+                    audioManager.setCommunicationDevice(previousCommunicationDevice);
+                    recordDiagnostic("native_audio_route.restore", describeAudioDevice(previousCommunicationDevice));
+                } else {
+                    audioManager.clearCommunicationDevice();
+                    recordDiagnostic("native_audio_route.restore", "default");
+                }
+            } catch (Exception e) {
+                recordDiagnostic("native_audio_route.restore", e.getClass().getSimpleName() + ": " + e.getMessage());
+            } finally {
+                previousCommunicationDevice = null;
+                bluetoothRouteActive = false;
+            }
+        }
+
+        private void shutdown() {
+            synchronized (lock) {
+                stopCaptureLocked();
+            }
+            synchronized (outputLock) {
+                outputQueue.clear();
+                outputLock.notifyAll();
+            }
+            restoreBluetoothAudioRouteIfIdle();
         }
 
         private AudioManager getAudioManager() {
