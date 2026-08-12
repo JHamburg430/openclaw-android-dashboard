@@ -1367,6 +1367,7 @@ public final class MainActivity extends Activity {
                 + "var WebSocketCtor=window.WebSocket;"
                 + "if(typeof WebSocketCtor!=='function')return;"
                 + "var relayAudioChunks=0;"
+                + "var relayTextSequence=0;"
                 + "function parse(data){if(typeof data!=='string')return null;try{return JSON.parse(data);}catch(_){return null;}}"
                 + "function firstString(){for(var i=0;i<arguments.length;i++){var value=arguments[i];if(typeof value==='string'&&value.trim())return value.trim();}return '';}"
                 + "function audioBase64(payload){if(!payload||typeof payload!=='object')return '';var nested=payload.payload&&typeof payload.payload==='object'?payload.payload:{};var audio=payload.audio&&typeof payload.audio==='object'?payload.audio:{};var value=firstString(payload.audioBase64,payload.base64,payload.delta,payload.audio,nested.audioBase64,nested.base64,nested.delta,audio.audioBase64,audio.base64,audio.delta,audio.data);if(value.indexOf('base64,')>=0)value=value.substring(value.indexOf('base64,')+7);return value;}"
@@ -1403,7 +1404,7 @@ public final class MainActivity extends Activity {
                 + "diag('talk.relay.audio_missing',{'type':kind,'keys':Object.keys(payload).join(',')});"
                 + "}else{"
                 + "var text=relayText(payload);"
-                + "if(text&&(kind.indexOf('text')>=0||kind.indexOf('transcript')>=0||kind.indexOf('response')>=0)){try{if(nativeAudio&&typeof nativeAudio.showAgentResponseText==='function'){nativeAudio.showAgentResponseText(text);}var before=relayAudioChunks;if(typeof window.setTimeout==='function'){window.setTimeout(function(){try{if(relayAudioChunks===before&&nativeAudio&&typeof nativeAudio.speakAgentResponseText==='function'){nativeAudio.speakAgentResponseText(text);diag('talk.relay.tts_fallback',{'reason':'no_audio_chunks_after_text'});}}catch(error){diag('talk.relay.tts_fallback.error',{'message':String(error)});}},900);}}catch(error){diag('talk.relay.text_display.error',{'message':String(error)});}}"
+                + "if(text&&(kind.indexOf('text')>=0||kind.indexOf('transcript')>=0||kind.indexOf('response')>=0)){try{if(nativeAudio&&typeof nativeAudio.showAgentResponseText==='function'){nativeAudio.showAgentResponseText(text);}var textSeq=++relayTextSequence;if(relayAudioChunks===0&&typeof window.setTimeout==='function'){window.setTimeout(function(){try{if(textSeq===relayTextSequence&&relayAudioChunks===0&&nativeAudio&&typeof nativeAudio.speakAgentResponseText==='function'){nativeAudio.speakAgentResponseText(text);diag('talk.relay.tts_fallback',{'reason':'no_audio_chunks_after_text'});}}catch(error){diag('talk.relay.tts_fallback.error',{'message':String(error)});}},900);}}catch(error){diag('talk.relay.text_display.error',{'message':String(error)});}}"
                 + "if(kind){diag('talk.relay.event',{'type':kind});}"
                 + "}"
                 + "}"
@@ -1781,6 +1782,7 @@ public final class MainActivity extends Activity {
         private TextToSpeech fallbackTts;
         private boolean fallbackTtsReady;
         private String pendingFallbackTtsText;
+        private long lastPcmOutputRequestedAtMs;
         private AcousticEchoCanceler acousticEchoCanceler;
         private NoiseSuppressor noiseSuppressor;
         private AutomaticGainControl automaticGainControl;
@@ -1872,6 +1874,10 @@ public final class MainActivity extends Activity {
 
         private void speakTextFallback(String text) {
             if (text == null || text.trim().isEmpty()) return;
+            if (shouldSkipFallbackTts()) {
+                recordDiagnostic("native_tts_fallback.skipped", "pcm_output_active_or_recent");
+                return;
+            }
             String normalized = text.trim();
             recordDiagnostic("native_tts_fallback.request", normalized);
             runOnUiThread(() -> {
@@ -1911,8 +1917,13 @@ public final class MainActivity extends Activity {
 
         private void speakReadyFallbackText(String text) {
             if (fallbackTts == null || text == null || text.trim().isEmpty()) return;
+            if (shouldSkipFallbackTts()) {
+                recordDiagnostic("native_tts_fallback.skipped", "pcm_output_active_or_recent");
+                return;
+            }
             AudioManager audioManager = getAudioManager();
             if (audioManager != null) {
+                prepareSpeakerPlaybackRoute(audioManager, "tts_fallback");
                 ensurePlaybackStreamVolume(audioManager);
             }
             fallbackTts.speak(text.trim(), TextToSpeech.QUEUE_FLUSH, null, "openclaw-agent-response");
@@ -1928,6 +1939,23 @@ public final class MainActivity extends Activity {
             pendingFallbackTtsText = null;
         }
 
+        private boolean shouldSkipFallbackTts() {
+            return outputRunning.get() || System.currentTimeMillis() - lastPcmOutputRequestedAtMs < 2500L;
+        }
+
+        private void stopFallbackTtsPlayback(String reason) {
+            runOnUiThread(() -> {
+                pendingFallbackTtsText = null;
+                if (fallbackTts == null) return;
+                try {
+                    fallbackTts.stop();
+                    recordDiagnostic("native_tts_fallback.stop", reason);
+                } catch (Exception e) {
+                    recordDiagnostic("native_tts_fallback.stop_error", e.getClass().getSimpleName() + ": " + e.getMessage());
+                }
+            });
+        }
+
         private void playPcm16Base64(String base64Pcm16, int sampleRateHz, String routeReason) {
             if (base64Pcm16 == null || base64Pcm16.isEmpty()) return;
             int outputSampleRate = sampleRateHz > 0 ? sampleRateHz : OUTPUT_SAMPLE_RATE;
@@ -1939,6 +1967,8 @@ public final class MainActivity extends Activity {
                 return;
             }
             if (pcm.length == 0) return;
+            lastPcmOutputRequestedAtMs = System.currentTimeMillis();
+            stopFallbackTtsPlayback("pcm_output_requested");
             int clippedSamples = applyPcm16Gain(pcm, OUTPUT_GAIN);
             recordDiagnostic("native_audio_output.enqueue",
                     "reason=" + routeReason
@@ -1976,6 +2006,9 @@ public final class MainActivity extends Activity {
                     AudioDeviceInfo bluetoothOutput = preferBluetoothAudioRoute(false, routeReason);
                     AudioManager audioManager = getAudioManager();
                     if (audioManager != null) {
+                        if (bluetoothOutput == null) {
+                            prepareSpeakerPlaybackRoute(audioManager, routeReason);
+                        }
                         ensurePlaybackStreamVolume(audioManager);
                     }
                     int durationMs = 700;
@@ -2037,6 +2070,9 @@ public final class MainActivity extends Activity {
                 AudioDeviceInfo bluetoothOutput = preferBluetoothAudioRoute(false, routeReason);
                 AudioManager audioManager = getAudioManager();
                 if (audioManager != null) {
+                    if (bluetoothOutput == null) {
+                        prepareSpeakerPlaybackRoute(audioManager, routeReason);
+                    }
                     ensurePlaybackStreamVolume(audioManager);
                 }
                 int minBuffer = AudioTrack.getMinBufferSize(
@@ -2119,6 +2155,19 @@ public final class MainActivity extends Activity {
             if (current < minimum) {
                 audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, minimum, 0);
                 recordDiagnostic("native_audio_output.volume_adjusted", "music=" + current + "/" + max + " -> " + minimum + "/" + max);
+            }
+        }
+
+        private void prepareSpeakerPlaybackRoute(AudioManager audioManager, String reason) {
+            if (audioManager == null) return;
+            try {
+                if (Build.VERSION.SDK_INT >= 31) {
+                    audioManager.clearCommunicationDevice();
+                }
+                audioManager.setSpeakerphoneOn(true);
+                recordDiagnostic("native_audio_output.route", "speaker reason=" + reason);
+            } catch (Exception e) {
+                recordDiagnostic("native_audio_output.route_error", e.getClass().getSimpleName() + ": " + e.getMessage());
             }
         }
 

@@ -18,8 +18,10 @@ const script = Array.from(returnedExpression.matchAll(/"((?:\\.|[^"\\])*)"/g))
 
 const diagnostics = [];
 const played = [];
+const spoken = [];
 const sent = [];
 const sockets = [];
+const timers = [];
 
 class FakeSocket {
   constructor(url, protocols) {
@@ -68,6 +70,9 @@ const window = {
     playPcm16Base64(base64, sampleRate) {
       played.push({ base64, sampleRate, agent: false });
     },
+    speakAgentResponseText(text) {
+      spoken.push(text);
+    },
   },
   __OPENCLAW_DIAG__: {
     emit(kind, payload) {
@@ -77,7 +82,16 @@ const window = {
   WebSocket: FakeSocket,
 };
 
-vm.runInNewContext(script, { window, Object, JSON, String });
+vm.runInNewContext(script, {
+  window,
+  Object,
+  JSON,
+  String,
+  setTimeout(callback) {
+    timers.push(callback);
+    return timers.length;
+  },
+});
 
 const socket = new window.WebSocket("wss://gateway.example/ws");
 
@@ -117,9 +131,11 @@ emitTalk({ type: "output.audio.delta", delta: "BBBB", sampleRateHz: 16000 });
 emitTalk({ type: "output.audio.delta", payload: { audioBase64: "CCCC", sampleRateHz: 22050 } });
 emitTalk({ type: "response.audio.delta", audio: { data: "data:audio/pcm;base64,DDDD", sampleRateHz: 8000 } });
 emitTalk({ type: "output.audio.delta" });
+emitTalk({ type: "output.text.done", text: "This text already has relay audio." });
 const noReplyStopped = emitTalk({ type: "output.text.done", text: "NO_REPLY" });
 const emptyTextStopped = emitTalk({ type: "output.text.done" });
 emitTalk({ type: "session.ready" });
+for (const timer of timers.splice(0)) timer();
 
 assert.deepEqual(played, [
   { base64: "AAAA", sampleRate: 24000, agent: true },
@@ -129,6 +145,7 @@ assert.deepEqual(played, [
 ]);
 assert.equal(noReplyStopped, true);
 assert.equal(emptyTextStopped, true);
+assert.deepEqual(spoken, []);
 assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.audio_missing"));
 assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.event" && entry.payload.type === "session.ready"));
 assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.suppressed"));
