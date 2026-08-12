@@ -29,7 +29,8 @@ final class OpenClawClient {
         JSONObject handle(String command, JSONObject params) throws Exception;
     }
 
-    private static final String CLIENT_ID = "openclaw-android";
+    private static final String CLIENT_ID = "openclaw-android-dashboard";
+    private static final String CLIENT_VERSION = "1.0.43";
     private final OkHttpClient http = new OkHttpClient.Builder()
             .pingInterval(20, TimeUnit.SECONDS)
             .connectTimeout(10, TimeUnit.SECONDS)
@@ -169,7 +170,7 @@ final class OpenClawClient {
         JSONObject client = new JSONObject()
                 .put("id", CLIENT_ID)
                 .put("displayName", config.displayName)
-                .put("version", "1.0.42")
+                .put("version", CLIENT_VERSION)
                 .put("platform", platform)
                 .put("deviceFamily", family)
                 .put("mode", "node")

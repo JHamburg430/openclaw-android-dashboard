@@ -91,8 +91,8 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_FILE_CHOOSER = 2004;
     private static final int REQUEST_BLUETOOTH_CONNECT = 2005;
     private static final String TAG = "OpenClawDashboard";
-    private static final int APP_VERSION_CODE = 42;
-    private static final String APP_VERSION_NAME = "1.0.42";
+    private static final int APP_VERSION_CODE = 43;
+    private static final String APP_VERSION_NAME = "1.0.43";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final String NOTIFICATION_CHANNEL_ID = "openclaw_updates";
@@ -591,7 +591,7 @@ public final class MainActivity extends Activity {
             nodeStatusText.setText("Connecting custom dashboard node...");
             nodeClient.connect(new OpenClawClient.Config(
                     gatewayWsUrl,
-                    "",
+                    storedBootstrapToken(),
                     value(tokenInput),
                     value(passwordInput),
                     "OpenClaw Dashboard " + Build.MODEL));
@@ -748,6 +748,9 @@ public final class MainActivity extends Activity {
         }
         if (!text.isEmpty()) {
             showCollapsedAssistantOutput(text);
+            if (audioBase64.isEmpty()) {
+                nativeAudioBridge.speakAgentResponseText(text);
+            }
         }
         if (audioBase64.isEmpty() && text.isEmpty()) {
             runOnUiThread(this::openLiveConversation);
@@ -933,6 +936,10 @@ public final class MainActivity extends Activity {
         passwordInput.setText(prefs.getString("password", ""));
     }
 
+    private String storedBootstrapToken() {
+        return prefs.getString("bootstrapToken", "");
+    }
+
     private void maybeAutoOpenDashboard() {
         String rawUrl = value(urlInput);
         if (rawUrl.isEmpty()) return;
@@ -954,6 +961,7 @@ public final class MainActivity extends Activity {
             IdentityStore.Setup setup = IdentityStore.parseSetupCode(value(setupCodeInput));
             String preferredUrl = firstNonEmpty(setup.publicUrl, setup.url);
             urlInput.setText(toDashboardUrl(preferredUrl));
+            prefs.edit().putString("bootstrapToken", setup.bootstrapToken == null ? "" : setup.bootstrapToken).apply();
             statusText.setText(isSecureDashboardUrl(toDashboardUrl(preferredUrl))
                     ? "Setup code decoded. Secure dashboard URL loaded."
                     : "Setup code decoded. For Android Talk, use a secure https:// dashboard URL before opening the UI.");
