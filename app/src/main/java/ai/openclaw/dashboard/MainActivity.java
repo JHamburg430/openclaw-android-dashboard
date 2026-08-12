@@ -90,8 +90,8 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_FILE_CHOOSER = 2004;
     private static final int REQUEST_BLUETOOTH_CONNECT = 2005;
     private static final String TAG = "OpenClawDashboard";
-    private static final int APP_VERSION_CODE = 40;
-    private static final String APP_VERSION_NAME = "1.0.40";
+    private static final int APP_VERSION_CODE = 41;
+    private static final String APP_VERSION_NAME = "1.0.41";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final String NOTIFICATION_CHANNEL_ID = "openclaw_updates";
@@ -136,6 +136,7 @@ public final class MainActivity extends Activity {
     private Button connectNodeButton;
     private Button chromeToggleButton;
     private Button overlayToggleButton;
+    private TextView collapsedOutputText;
     private WebView webView;
     private boolean chromeExpanded = true;
     private boolean appsDrawerVisible = false;
@@ -422,6 +423,16 @@ public final class MainActivity extends Activity {
         shellRoot.addView(overlayToggleButton, overlayLp);
         applyStatusBarMargin(overlayToggleButton, dp(2));
 
+        collapsedOutputText = text("", 12, COLOR_TEXT_PRIMARY, false);
+        collapsedOutputText.setVisibility(View.GONE);
+        collapsedOutputText.setMaxLines(3);
+        collapsedOutputText.setPadding(dp(10), dp(7), dp(36), dp(7));
+        collapsedOutputText.setBackground(panelBackground(Color.rgb(10, 14, 20), dp(6)));
+        FrameLayout.LayoutParams outputLp = new FrameLayout.LayoutParams(-1, -2, Gravity.TOP | Gravity.LEFT);
+        outputLp.setMargins(dp(8), dp(28), dp(8), 0);
+        shellRoot.addView(collapsedOutputText, outputLp);
+        applyStatusBarMargin(collapsedOutputText, dp(28));
+
         decode.setOnClickListener(v -> decodeSetupCode());
         openButton.setOnClickListener(v -> openDashboard());
         reloadButton.setOnClickListener(v -> webView.reload());
@@ -621,6 +632,18 @@ public final class MainActivity extends Activity {
             case "android.speaker.test":
                 nativeAudioBridge.playTestTone();
                 return new JSONObject().put("started", true).put("output", "AudioTrack");
+            case "talk.ptt.start":
+                runOnUiThread(this::openLiveConversation);
+                return new JSONObject().put("started", true).put("surface", "live_conversation");
+            case "talk.ptt.stop":
+                nativeAudioBridge.stopCapture();
+                return new JSONObject().put("stopped", true);
+            case "talk.ptt.cancel":
+                nativeAudioBridge.stopCapture();
+                showCollapsedAssistantOutput("Talk cancelled.");
+                return new JSONObject().put("cancelled", true);
+            case "talk.ptt.once":
+                return handleTalkPttOnce(params);
             default:
                 return new JSONObject()
                         .put("ok", false)
@@ -704,6 +727,47 @@ public final class MainActivity extends Activity {
             } catch (Exception e) {
                 recordDiagnostic("file_picker.failed", e.getMessage());
                 statusText.setText("File picker is unavailable on this device.");
+            }
+        });
+    }
+
+    private JSONObject handleTalkPttOnce(JSONObject params) throws Exception {
+        String text = firstNonEmpty(
+                params.optString("text", ""),
+                params.optString("message", ""),
+                params.optString("transcript", ""));
+        String audioBase64 = firstNonEmpty(
+                params.optString("audioBase64", ""),
+                params.optString("base64", ""),
+                params.optString("delta", ""));
+        int sampleRate = params.optInt("sampleRate", params.optInt("sampleRateHz", 24000));
+        if (!audioBase64.isEmpty()) {
+            nativeAudioBridge.playAgentResponsePcm16Base64(audioBase64, sampleRate);
+        }
+        if (!text.isEmpty()) {
+            showCollapsedAssistantOutput(text);
+        }
+        if (audioBase64.isEmpty() && text.isEmpty()) {
+            runOnUiThread(this::openLiveConversation);
+        }
+        return new JSONObject()
+                .put("handled", true)
+                .put("surface", "dashboard_foreground")
+                .put("playedAudio", !audioBase64.isEmpty())
+                .put("displayedText", !text.isEmpty());
+    }
+
+    private void showCollapsedAssistantOutput(String text) {
+        if (text == null || text.trim().isEmpty()) return;
+        runOnUiThread(() -> {
+            String normalized = text.trim();
+            recordDiagnostic("assistant.output", normalized);
+            if (statusText != null) {
+                statusText.setText(normalized);
+            }
+            if (collapsedOutputText != null && !chromeExpanded) {
+                collapsedOutputText.setText(normalized);
+                collapsedOutputText.setVisibility(View.VISIBLE);
             }
         });
     }
@@ -1105,6 +1169,9 @@ public final class MainActivity extends Activity {
         chromeExpanded = expanded;
         chromeContainer.setVisibility(expanded ? View.VISIBLE : View.GONE);
         overlayToggleButton.setVisibility(expanded ? View.GONE : View.VISIBLE);
+        if (collapsedOutputText != null && expanded) {
+            collapsedOutputText.setVisibility(View.GONE);
+        }
         statusText.setVisibility(expanded ? View.VISIBLE : View.GONE);
         controlsScroll.setVisibility(expanded ? View.VISIBLE : View.GONE);
         openButton.setVisibility(expanded ? View.VISIBLE : View.GONE);
@@ -1324,8 +1391,10 @@ public final class MainActivity extends Activity {
                 + "try{if(nativeAudio&&typeof nativeAudio.playAgentResponsePcm16Base64==='function'){nativeAudio.playAgentResponsePcm16Base64(String(base64),sampleRate);}else if(nativeAudio&&typeof nativeAudio.playPcm16Base64==='function'){nativeAudio.playPcm16Base64(String(base64),sampleRate);}else{diag('talk.relay.native_play.unavailable',{});}}catch(error){diag('talk.relay.native_play.error',{'message':String(error)});}"
                 + "}else if(kind==='audio'||kind==='output.audio.delta'||kind.indexOf('audio')>=0){"
                 + "diag('talk.relay.audio_missing',{'type':kind,'keys':Object.keys(payload).join(',')});"
-                + "}else if(kind){"
-                + "diag('talk.relay.event',{'type':kind});"
+                + "}else{"
+                + "var text=relayText(payload);"
+                + "if(text&&(kind.indexOf('text')>=0||kind.indexOf('transcript')>=0||kind.indexOf('response')>=0)){try{if(nativeAudio&&typeof nativeAudio.showAgentResponseText==='function'){nativeAudio.showAgentResponseText(text);}}catch(error){diag('talk.relay.text_display.error',{'message':String(error)});}}"
+                + "if(kind){diag('talk.relay.event',{'type':kind});}"
                 + "}"
                 + "}"
                 + "function patchSocket(socket){"
@@ -1776,6 +1845,11 @@ public final class MainActivity extends Activity {
         @JavascriptInterface
         public void playAgentResponsePcm16Base64(String base64Pcm16, int sampleRateHz) {
             playPcm16Base64(base64Pcm16, sampleRateHz, "agent_response");
+        }
+
+        @JavascriptInterface
+        public void showAgentResponseText(String text) {
+            showCollapsedAssistantOutput(text);
         }
 
         private void playPcm16Base64(String base64Pcm16, int sampleRateHz, String routeReason) {

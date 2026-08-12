@@ -169,7 +169,7 @@ final class OpenClawClient {
         JSONObject client = new JSONObject()
                 .put("id", CLIENT_ID)
                 .put("displayName", config.displayName)
-                .put("version", "1.0.25")
+                .put("version", "1.0.41")
                 .put("platform", platform)
                 .put("deviceFamily", family)
                 .put("mode", "node")
@@ -262,7 +262,11 @@ final class OpenClawClient {
                 .put("android.files.pick")
                 .put("android.liveConversation.open")
                 .put("android.mic.probe")
-                .put("android.speaker.test");
+                .put("android.speaker.test")
+                .put("talk.ptt.start")
+                .put("talk.ptt.stop")
+                .put("talk.ptt.cancel")
+                .put("talk.ptt.once");
     }
 
     private void call(String method, JSONObject params, Callback callback) {
