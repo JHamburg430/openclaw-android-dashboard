@@ -51,8 +51,11 @@ FakeSocket.CLOSED = 3;
 
 const window = {
   OpenClawNativeAudio: {
+    playAgentResponsePcm16Base64(base64, sampleRate) {
+      played.push({ base64, sampleRate, agent: true });
+    },
     playPcm16Base64(base64, sampleRate) {
-      played.push({ base64, sampleRate });
+      played.push({ base64, sampleRate, agent: false });
     },
   },
   __OPENCLAW_DIAG__: {
@@ -106,10 +109,10 @@ emitTalk({ type: "output.audio.delta" });
 emitTalk({ type: "session.ready" });
 
 assert.deepEqual(played, [
-  { base64: "AAAA", sampleRate: 24000 },
-  { base64: "BBBB", sampleRate: 16000 },
-  { base64: "CCCC", sampleRate: 22050 },
-  { base64: "DDDD", sampleRate: 8000 },
+  { base64: "AAAA", sampleRate: 24000, agent: true },
+  { base64: "BBBB", sampleRate: 16000, agent: true },
+  { base64: "CCCC", sampleRate: 22050, agent: true },
+  { base64: "DDDD", sampleRate: 8000, agent: true },
 ]);
 assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.audio_missing"));
 assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.event" && entry.payload.type === "session.ready"));

@@ -90,8 +90,8 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_FILE_CHOOSER = 2004;
     private static final int REQUEST_BLUETOOTH_CONNECT = 2005;
     private static final String TAG = "OpenClawDashboard";
-    private static final int APP_VERSION_CODE = 35;
-    private static final String APP_VERSION_NAME = "1.0.35";
+    private static final int APP_VERSION_CODE = 36;
+    private static final String APP_VERSION_NAME = "1.0.36";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final String NOTIFICATION_CHANNEL_ID = "openclaw_updates";
@@ -1363,11 +1363,11 @@ public final class MainActivity extends Activity {
                 + "var root=document.documentElement;"
                 + "if(root){root.style.setProperty('--safe-area-bottom','0px','important');root.style.setProperty('--safe-area-top','0px','important');}"
                 + "var body=document.body;"
-                + "if(body){body.style.paddingBottom='0px';body.style.marginBottom='0px';body.style.minHeight='100dvh';}"
+                + "if(body){body.style.marginBottom='0px';}"
                 + "var app=document.querySelector('openclaw-app');"
-                + "if(app){app.style.height='100dvh';app.style.minHeight='100dvh';app.style.paddingBottom='0px';app.style.marginBottom='0px';}"
+                + "if(app){app.style.marginBottom='0px';}"
                 + "var style=document.getElementById('openclaw-android-tighten');"
-                + "if(!style){style=document.createElement('style');style.id='openclaw-android-tighten';style.textContent='html,body,openclaw-app,.shell,.shell--chat{height:100dvh!important;min-height:100dvh!important;max-height:100dvh!important;}body,openclaw-app{padding-bottom:0!important;margin-bottom:0!important;}[class*=composer],[class*=chat]{padding-bottom:0!important;margin-bottom:0!important;}';document.head&&document.head.appendChild(style);}"
+                + "if(!style){style=document.createElement('style');style.id='openclaw-android-tighten';style.textContent='html,body{overscroll-behavior:none;}body,openclaw-app{margin-bottom:0!important;}';document.head&&document.head.appendChild(style);}"
                 + "}catch(_){}}"
                 + "if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',apply,{once:true});}"
                 + "apply();"
