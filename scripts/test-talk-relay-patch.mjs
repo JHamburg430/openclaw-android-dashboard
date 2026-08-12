@@ -40,7 +40,18 @@ class FakeSocket {
   }
 
   emit(type, data) {
-    for (const listener of this.listeners.get(type) ?? []) listener({ data });
+    let stopped = false;
+    const event = {
+      data,
+      stopImmediatePropagation() {
+        stopped = true;
+      },
+    };
+    for (const listener of this.listeners.get(type) ?? []) {
+      listener(event);
+      if (stopped) break;
+    }
+    return stopped;
   }
 }
 
@@ -106,6 +117,8 @@ emitTalk({ type: "output.audio.delta", delta: "BBBB", sampleRateHz: 16000 });
 emitTalk({ type: "output.audio.delta", payload: { audioBase64: "CCCC", sampleRateHz: 22050 } });
 emitTalk({ type: "response.audio.delta", audio: { data: "data:audio/pcm;base64,DDDD", sampleRateHz: 8000 } });
 emitTalk({ type: "output.audio.delta" });
+const noReplyStopped = emitTalk({ type: "output.text.done", text: "NO_REPLY" });
+const emptyTextStopped = emitTalk({ type: "output.text.done" });
 emitTalk({ type: "session.ready" });
 
 assert.deepEqual(played, [
@@ -114,7 +127,10 @@ assert.deepEqual(played, [
   { base64: "CCCC", sampleRate: 22050, agent: true },
   { base64: "DDDD", sampleRate: 8000, agent: true },
 ]);
+assert.equal(noReplyStopped, true);
+assert.equal(emptyTextStopped, true);
 assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.audio_missing"));
 assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.event" && entry.payload.type === "session.ready"));
+assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.suppressed"));
 
 console.log("talk relay patch handles rewrite and audio playback shapes");

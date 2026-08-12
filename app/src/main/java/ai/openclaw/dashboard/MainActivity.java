@@ -90,8 +90,8 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_FILE_CHOOSER = 2004;
     private static final int REQUEST_BLUETOOTH_CONNECT = 2005;
     private static final String TAG = "OpenClawDashboard";
-    private static final int APP_VERSION_CODE = 36;
-    private static final String APP_VERSION_NAME = "1.0.36";
+    private static final int APP_VERSION_CODE = 37;
+    private static final String APP_VERSION_NAME = "1.0.37";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final String NOTIFICATION_CHANNEL_ID = "openclaw_updates";
@@ -1270,6 +1270,8 @@ public final class MainActivity extends Activity {
                 + "function firstString(){for(var i=0;i<arguments.length;i++){var value=arguments[i];if(typeof value==='string'&&value.trim())return value.trim();}return '';}"
                 + "function audioBase64(payload){if(!payload||typeof payload!=='object')return '';var nested=payload.payload&&typeof payload.payload==='object'?payload.payload:{};var audio=payload.audio&&typeof payload.audio==='object'?payload.audio:{};var value=firstString(payload.audioBase64,payload.base64,payload.delta,payload.audio,nested.audioBase64,nested.base64,nested.delta,audio.audioBase64,audio.base64,audio.delta,audio.data);if(value.indexOf('base64,')>=0)value=value.substring(value.indexOf('base64,')+7);return value;}"
                 + "function audioSampleRate(payload){if(!payload||typeof payload!=='object')return 24000;var nested=payload.payload&&typeof payload.payload==='object'?payload.payload:{};var audio=payload.audio&&typeof payload.audio==='object'?payload.audio:{};return payload.sampleRate||payload.sampleRateHz||nested.sampleRate||nested.sampleRateHz||audio.sampleRate||audio.sampleRateHz||24000;}"
+                + "function relayText(payload){if(!payload||typeof payload!=='object')return '';var nested=payload.payload&&typeof payload.payload==='object'?payload.payload:{};var response=payload.response&&typeof payload.response==='object'?payload.response:{};var output=payload.output&&typeof payload.output==='object'?payload.output:{};return firstString(payload.text,payload.transcript,payload.message,payload.delta,nested.text,nested.transcript,nested.message,nested.delta,response.text,response.output_text,output.text,output.transcript);}"
+                + "function shouldSuppressRelayMessage(payload){var kind=String(payload&&payload.type||'');var text=relayText(payload).trim();if(text==='NO_REPLY')return true;if((kind.indexOf('text')>=0||kind.indexOf('transcript')>=0)&&!text)return true;return false;}"
                 + "function cleanGatewayRelayParams(params){"
                 + "params=params&&typeof params==='object'?params:{};"
                 + "var clean={mode:'realtime',transport:'gateway-relay',brain:'agent-consult'};"
@@ -1288,6 +1290,7 @@ public final class MainActivity extends Activity {
                 + "var message=parse(data);"
                 + "if(!message||message.type!=='event'||message.event!=='talk.event'||!message.payload)return;"
                 + "var payload=message.payload;"
+                + "if(shouldSuppressRelayMessage(payload)){diag('talk.relay.suppressed',{'type':String(payload.type||''),'reason':'empty_or_no_reply'});return true;}"
                 + "var kind=String(payload.type||'');"
                 + "var base64=audioBase64(payload);"
                 + "if(base64&&(kind==='audio'||kind==='output.audio.delta'||kind.indexOf('audio')>=0)){"
@@ -1302,7 +1305,7 @@ public final class MainActivity extends Activity {
                 + "}"
                 + "}"
                 + "function patchSocket(socket){"
-                + "try{socket.addEventListener('message',function(event){handleRelayMessage(event&&event.data);});}catch(_){ }"
+                + "try{socket.addEventListener('message',function(event){if(handleRelayMessage(event&&event.data)===true){try{event.stopImmediatePropagation&&event.stopImmediatePropagation();}catch(_){}}});}catch(_){ }"
                 + "var originalSend=socket.send;"
                 + "socket.send=function(data){"
                 + "try{"
@@ -1657,6 +1660,7 @@ public final class MainActivity extends Activity {
         private static final double OUTPUT_GAIN = 5.0;
         private static final double TEST_TONE_AMPLITUDE = 30000.0;
         private static final double MIN_PLAYBACK_VOLUME_RATIO = 1.0;
+        private static final int OUTPUT_TAIL_WAIT_MS = 80;
         private final Object lock = new Object();
         private final Object outputLock = new Object();
         private final ArrayDeque<String> chunkQueue = new ArrayDeque<>();
@@ -1863,7 +1867,7 @@ public final class MainActivity extends Activity {
                         sampleRateHz,
                         AudioFormat.CHANNEL_OUT_MONO,
                         AudioFormat.ENCODING_PCM_16BIT);
-                int bufferSize = Math.max(minBuffer, sampleRateHz / 2);
+                int bufferSize = Math.max(minBuffer, sampleRateHz / 5);
                 track = new AudioTrack(
                         AudioManager.STREAM_MUSIC,
                         sampleRateHz,
@@ -1886,7 +1890,7 @@ public final class MainActivity extends Activity {
                         chunk = outputQueue.pollFirst();
                         if (chunk == null) {
                             try {
-                                outputLock.wait(500);
+                                outputLock.wait(OUTPUT_TAIL_WAIT_MS);
                             } catch (InterruptedException e) {
                                 Thread.currentThread().interrupt();
                                 break;
