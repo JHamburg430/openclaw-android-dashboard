@@ -10,6 +10,7 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ResolveInfo;
 import android.content.pm.PackageManager;
 import android.content.SharedPreferences;
 import android.graphics.Color;
@@ -23,6 +24,7 @@ import android.media.audiofx.AcousticEchoCanceler;
 import android.media.audiofx.AutomaticGainControl;
 import android.media.audiofx.NoiseSuppressor;
 import android.net.Uri;
+import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.text.InputType;
@@ -51,6 +53,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 
 import org.json.JSONObject;
+import org.json.JSONArray;
 
 import java.io.ByteArrayInputStream;
 import java.io.BufferedReader;
@@ -104,6 +107,7 @@ public final class MainActivity extends Activity {
     private final SimpleDateFormat diagnosticsTimeFormat = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
     private final NativeAudioBridge nativeAudioBridge = new NativeAudioBridge();
     private SharedPreferences prefs;
+    private OpenClawClient nodeClient;
     private PermissionRequest pendingPermissionRequest;
     private ValueCallback<Uri[]> pendingFilePathCallback;
 
@@ -113,17 +117,21 @@ public final class MainActivity extends Activity {
     private EditText passwordInput;
     private TextView statusText;
     private TextView hintText;
+    private TextView nodeStatusText;
     private TextView diagnosticsText;
     private LinearLayout chromeContainer;
     private LinearLayout topActions;
     private LinearLayout settingsPanel;
+    private LinearLayout appsDrawer;
     private ScrollView controlsScroll;
     private Button openButton;
     private Button reloadButton;
+    private Button connectNodeButton;
     private Button chromeToggleButton;
     private Button overlayToggleButton;
     private WebView webView;
     private boolean chromeExpanded = true;
+    private boolean appsDrawerVisible = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -133,6 +141,7 @@ public final class MainActivity extends Activity {
         configureSystemBars();
         buildUi();
         loadPrefs();
+        nodeClient = new OpenClawClient(new IdentityStore(this), new DashboardNodeListener(), this::handleNativeNodeCommand);
         ensureNotificationPermission();
         if (!restoreWebViewState(savedInstanceState)) {
             maybeAutoOpenDashboard();
@@ -158,6 +167,10 @@ public final class MainActivity extends Activity {
         if (webView != null) {
             webView.destroy();
             webView = null;
+        }
+        if (nodeClient != null) {
+            nodeClient.disconnect();
+            nodeClient = null;
         }
         super.onDestroy();
     }
@@ -190,10 +203,12 @@ public final class MainActivity extends Activity {
         topActions.setBackgroundColor(COLOR_APP_CHROME);
         openButton = button("Open UI");
         reloadButton = button("Reload");
+        connectNodeButton = button("Node");
         chromeToggleButton = button("-");
         chromeToggleButton.setContentDescription("Collapse controls");
         topActions.addView(openButton, new LinearLayout.LayoutParams(0, dp(38), 1));
         topActions.addView(reloadButton, new LinearLayout.LayoutParams(0, dp(38), 1));
+        topActions.addView(connectNodeButton, new LinearLayout.LayoutParams(0, dp(38), 1));
         topActions.addView(chromeToggleButton, new LinearLayout.LayoutParams(dp(38), dp(38)));
         chromeContainer.addView(topActions, new LinearLayout.LayoutParams(-1, -2));
 
@@ -229,6 +244,21 @@ public final class MainActivity extends Activity {
                 false);
         hintText.setPadding(0, dp(12), 0, 0);
         controls.addView(hintText);
+
+        controls.addView(label("Android node"));
+        nodeStatusText = text("Custom dashboard node is not connected yet.", 13, COLOR_TEXT_SECONDARY, false);
+        nodeStatusText.setPadding(dp(10), dp(8), dp(10), dp(8));
+        nodeStatusText.setBackgroundColor(Color.rgb(10, 14, 20));
+        controls.addView(nodeStatusText);
+
+        LinearLayout appActions = new LinearLayout(this);
+        appActions.setOrientation(LinearLayout.HORIZONTAL);
+        appActions.setGravity(Gravity.CENTER_VERTICAL);
+        Button appsButton = button("Apps");
+        Button liveConversationButton = button("Live Conversation");
+        appActions.addView(appsButton, new LinearLayout.LayoutParams(0, dp(42), 1));
+        appActions.addView(liveConversationButton, new LinearLayout.LayoutParams(0, dp(42), 1));
+        controls.addView(appActions);
 
         controls.addView(label("Diagnostics"));
         LinearLayout diagnosticsActions = new LinearLayout(this);
@@ -365,10 +395,16 @@ public final class MainActivity extends Activity {
         });
         webContainer.addView(webView, new FrameLayout.LayoutParams(-1, -1));
 
+        appsDrawer = buildAppsDrawer();
+        appsDrawer.setVisibility(View.GONE);
+        FrameLayout.LayoutParams appsLp = new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM);
+        appsLp.setMargins(dp(10), 0, dp(10), dp(10));
+        shellRoot.addView(appsDrawer, appsLp);
+
         overlayToggleButton = button("+");
         overlayToggleButton.setTextSize(12);
         overlayToggleButton.setPadding(0, 0, 0, dp(1));
-        overlayToggleButton.setContentDescription("Expand controls");
+        overlayToggleButton.setContentDescription("Open apps");
         overlayToggleButton.setVisibility(View.GONE);
         FrameLayout.LayoutParams overlayLp = new FrameLayout.LayoutParams(dp(24), dp(22), Gravity.TOP | Gravity.RIGHT);
         overlayLp.setMargins(0, dp(2), dp(4), 0);
@@ -378,13 +414,255 @@ public final class MainActivity extends Activity {
         decode.setOnClickListener(v -> decodeSetupCode());
         openButton.setOnClickListener(v -> openDashboard());
         reloadButton.setOnClickListener(v -> webView.reload());
+        connectNodeButton.setOnClickListener(v -> connectDashboardNode());
         chromeToggleButton.setOnClickListener(v -> setChromeExpanded(!chromeExpanded));
-        overlayToggleButton.setOnClickListener(v -> setChromeExpanded(true));
+        overlayToggleButton.setOnClickListener(v -> setAppsDrawerVisible(!appsDrawerVisible));
+        appsButton.setOnClickListener(v -> setAppsDrawerVisible(true));
+        liveConversationButton.setOnClickListener(v -> openLiveConversation());
         copyDiagnostics.setOnClickListener(v -> copyDiagnostics());
         clearDiagnostics.setOnClickListener(v -> clearDiagnostics());
         probeMic.setOnClickListener(v -> runNativeMicProbe());
         setContentView(shellRoot);
         recordDiagnostic("app.ready", "Diagnostics bridge initialized");
+    }
+
+    private LinearLayout buildAppsDrawer() {
+        LinearLayout drawer = new LinearLayout(this);
+        drawer.setOrientation(LinearLayout.VERTICAL);
+        drawer.setPadding(dp(12), dp(10), dp(12), dp(12));
+        drawer.setBackground(panelBackground(COLOR_PANEL, dp(8)));
+
+        TextView title = text("Apps", 15, COLOR_TEXT_PRIMARY, true);
+        title.setPadding(0, 0, 0, dp(6));
+        drawer.addView(title);
+
+        LinearLayout row1 = appButtonRow();
+        row1.addView(appButton("Control UI", v -> {
+            setAppsDrawerVisible(false);
+            openDashboard();
+        }), new LinearLayout.LayoutParams(0, dp(46), 1));
+        row1.addView(appButton("Live Conversation", v -> {
+            setAppsDrawerVisible(false);
+            openLiveConversation();
+        }), new LinearLayout.LayoutParams(0, dp(46), 1));
+        drawer.addView(row1);
+
+        LinearLayout row2 = appButtonRow();
+        row2.addView(appButton("Teams Help", v -> openLocalApp(8504)), new LinearLayout.LayoutParams(0, dp(46), 1));
+        row2.addView(appButton("Contacts", v -> openLocalApp(8503)), new LinearLayout.LayoutParams(0, dp(46), 1));
+        drawer.addView(row2);
+
+        LinearLayout row3 = appButtonRow();
+        row3.addView(appButton("Monitor", v -> openLocalApp(8501)), new LinearLayout.LayoutParams(0, dp(46), 1));
+        row3.addView(appButton("Android Native", v -> {
+            setAppsDrawerVisible(false);
+            setChromeExpanded(true);
+            statusText.setText("Android Native tools are available from this panel and through node commands.");
+        }), new LinearLayout.LayoutParams(0, dp(46), 1));
+        drawer.addView(row3);
+
+        Button close = button("Close");
+        close.setOnClickListener(v -> setAppsDrawerVisible(false));
+        drawer.addView(close, new LinearLayout.LayoutParams(-1, dp(40)));
+        return drawer;
+    }
+
+    private LinearLayout appButtonRow() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(3), 0, dp(3));
+        return row;
+    }
+
+    private Button appButton(String label, View.OnClickListener listener) {
+        Button button = button(label);
+        button.setTextSize(13);
+        button.setOnClickListener(listener);
+        return button;
+    }
+
+    private void setAppsDrawerVisible(boolean visible) {
+        appsDrawerVisible = visible;
+        if (appsDrawer != null) {
+            appsDrawer.setVisibility(visible ? View.VISIBLE : View.GONE);
+        }
+    }
+
+    private void openLocalApp(int port) {
+        setAppsDrawerVisible(false);
+        try {
+            String url = buildSiblingAppUrl(port);
+            recordDiagnostic("app.open", url);
+            webView.stopLoading();
+            webView.loadUrl(url);
+            setConnectedUiVisible(true);
+            statusText.setText("Opening app on port " + port);
+        } catch (Exception e) {
+            statusText.setText("Could not open app: " + e.getMessage());
+            recordDiagnostic("app.open.failed", e.getMessage());
+        }
+    }
+
+    private void openLiveConversation() {
+        try {
+            connectDashboardNode();
+            webView.stopLoading();
+            webView.loadUrl(buildDashboardUrl());
+            setConnectedUiVisible(true);
+            setChromeExpanded(false);
+            statusText.setText("Live Conversation is ready. Use Talk/Mic in the Control UI; native mic and speaker bridges are enabled.");
+            recordDiagnostic("live_conversation.open", "dashboard");
+        } catch (Exception e) {
+            statusText.setText("Live Conversation unavailable: " + e.getMessage());
+            recordDiagnostic("live_conversation.failed", e.getMessage());
+        }
+    }
+
+    private String buildSiblingAppUrl(int port) {
+        String dashboard = buildDashboardUrl();
+        java.net.URI uri = java.net.URI.create(dashboard);
+        String scheme = uri.getScheme() == null ? "http" : uri.getScheme();
+        String host = uri.getHost();
+        if (host == null || host.trim().isEmpty()) {
+            throw new IllegalStateException("Dashboard host is missing.");
+        }
+        return scheme + "://" + host + ":" + port + "/";
+    }
+
+    private void connectDashboardNode() {
+        if (nodeClient == null) {
+            nodeClient = new OpenClawClient(new IdentityStore(this), new DashboardNodeListener(), this::handleNativeNodeCommand);
+        }
+        try {
+            savePrefs();
+            String gatewayWsUrl = toGatewayWebSocketUrl(value(urlInput));
+            nodeStatusText.setText("Connecting custom dashboard node...");
+            nodeClient.connect(new OpenClawClient.Config(
+                    gatewayWsUrl,
+                    "",
+                    value(tokenInput),
+                    value(passwordInput),
+                    "OpenClaw Dashboard " + Build.MODEL));
+        } catch (Exception e) {
+            nodeStatusText.setText("Node connect failed: " + e.getMessage());
+            recordDiagnostic("node.connect.failed", e.getMessage());
+        }
+    }
+
+    private JSONObject handleNativeNodeCommand(String command, JSONObject params) throws Exception {
+        recordDiagnostic("node.invoke", command);
+        switch (command) {
+            case "system.ping":
+                return new JSONObject().put("pong", true).put("ts", System.currentTimeMillis());
+            case "system.status":
+            case "device.status":
+                return nativeDeviceStatus();
+            case "device.info":
+                return nativeDeviceInfo();
+            case "device.permissions":
+                return nativePermissions();
+            case "device.apps":
+                return nativeInstalledApps();
+            case "system.notify":
+                postNativeNotification(
+                        params.optString("title", "OpenClaw"),
+                        new JSONObject().put("body", params.optString("body", params.optString("message", ""))).toString());
+                return new JSONObject().put("ok", true);
+            case "android.apps.launch":
+                return launchAndroidApp(params);
+            case "android.files.pick":
+                openAndroidFilePicker();
+                return new JSONObject().put("opened", true).put("note", "File picker opened on the device.");
+            case "android.liveConversation.open":
+                runOnUiThread(this::openLiveConversation);
+                return new JSONObject().put("opened", true).put("surface", "live_conversation");
+            case "android.mic.probe":
+                runOnUiThread(this::runNativeMicProbe);
+                return new JSONObject().put("started", true).put("permission", hasRecordAudioPermission());
+            default:
+                return new JSONObject()
+                        .put("ok", false)
+                        .put("unsupported", command);
+        }
+    }
+
+    private JSONObject nativeDeviceInfo() throws Exception {
+        return new JSONObject()
+                .put("platform", "android")
+                .put("manufacturer", Build.MANUFACTURER)
+                .put("model", Build.MODEL)
+                .put("device", Build.DEVICE)
+                .put("sdk", Build.VERSION.SDK_INT)
+                .put("release", Build.VERSION.RELEASE);
+    }
+
+    private JSONObject nativeDeviceStatus() throws Exception {
+        BatteryManager batteryManager = (BatteryManager) getSystemService(Context.BATTERY_SERVICE);
+        int battery = batteryManager == null ? -1 : batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY);
+        return nativeDeviceInfo()
+                .put("batteryPercent", battery >= 0 ? battery : JSONObject.NULL)
+                .put("notifications", hasNotificationPermission())
+                .put("microphone", hasRecordAudioPermission())
+                .put("camera", hasCameraPermission())
+                .put("ts", System.currentTimeMillis());
+    }
+
+    private JSONObject nativePermissions() throws Exception {
+        return new JSONObject()
+                .put("recordAudio", hasRecordAudioPermission())
+                .put("camera", hasCameraPermission())
+                .put("notifications", hasNotificationPermission())
+                .put("contacts", checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED)
+                .put("mediaAudio", Build.VERSION.SDK_INT < 33 || checkSelfPermission(Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED)
+                .put("mediaImages", Build.VERSION.SDK_INT < 33 || checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED)
+                .put("mediaVideo", Build.VERSION.SDK_INT < 33 || checkSelfPermission(Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED);
+    }
+
+    private JSONObject nativeInstalledApps() throws Exception {
+        PackageManager packageManager = getPackageManager();
+        Intent launcherIntent = new Intent(Intent.ACTION_MAIN, null);
+        launcherIntent.addCategory(Intent.CATEGORY_LAUNCHER);
+        List<ResolveInfo> launchables = packageManager.queryIntentActivities(launcherIntent, 0);
+        JSONArray apps = new JSONArray();
+        for (ResolveInfo info : launchables) {
+            if (info == null || info.activityInfo == null) continue;
+            JSONObject app = new JSONObject()
+                    .put("label", String.valueOf(info.loadLabel(packageManager)))
+                    .put("packageName", info.activityInfo.packageName)
+                    .put("activityName", info.activityInfo.name);
+            apps.put(app);
+            if (apps.length() >= 250) break;
+        }
+        return new JSONObject().put("apps", apps).put("count", apps.length());
+    }
+
+    private JSONObject launchAndroidApp(JSONObject params) throws Exception {
+        String packageName = firstNonEmpty(params.optString("packageName", ""), params.optString("package", ""));
+        if (packageName.isEmpty()) {
+            throw new IllegalArgumentException("packageName is required.");
+        }
+        Intent launchIntent = getPackageManager().getLaunchIntentForPackage(packageName);
+        if (launchIntent == null) {
+            throw new IllegalArgumentException("No launcher activity found for " + packageName);
+        }
+        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        startActivity(launchIntent);
+        return new JSONObject().put("launched", true).put("packageName", packageName);
+    }
+
+    private void openAndroidFilePicker() {
+        runOnUiThread(() -> {
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("*/*");
+            try {
+                startActivityForResult(intent, REQUEST_FILE_CHOOSER);
+            } catch (Exception e) {
+                recordDiagnostic("file_picker.failed", e.getMessage());
+                statusText.setText("File picker is unavailable on this device.");
+            }
+        });
     }
 
     private void configureSystemBars() {
@@ -490,6 +768,7 @@ public final class MainActivity extends Activity {
             recordDiagnostic("open_dashboard", dashboardUrl);
             Log.d(TAG, "opening " + dashboardUrl);
             setConnectedUiVisible(false);
+            connectDashboardNode();
             webView.stopLoading();
             webView.loadUrl(dashboardUrl);
             statusText.setText("Opening Control UI");
@@ -927,6 +1206,17 @@ public final class MainActivity extends Activity {
         } catch (Exception ignored) {
             return false;
         }
+    }
+
+    private static String toGatewayWebSocketUrl(String raw) {
+        String value = raw == null ? "" : raw.trim();
+        if (value.isEmpty()) throw new IllegalStateException("Gateway URL is required.");
+        if (value.startsWith("ws://") || value.startsWith("wss://")) return value;
+        if (value.startsWith("https://")) value = "wss://" + value.substring(8);
+        else if (value.startsWith("http://")) value = "ws://" + value.substring(7);
+        else value = "wss://" + value;
+        if (!value.endsWith("/")) value = value + "/";
+        return value;
     }
 
     private static String firstNonEmpty(String... values) {
@@ -1453,6 +1743,14 @@ public final class MainActivity extends Activity {
         return button;
     }
 
+    private GradientDrawable panelBackground(int color, int radiusPx) {
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(color);
+        background.setCornerRadius(radiusPx);
+        background.setStroke(dp(1), Color.rgb(48, 60, 72));
+        return background;
+    }
+
     private TextView text(String value, int sp, int color, boolean bold) {
         TextView view = new TextView(this);
         view.setText(value);
@@ -1468,5 +1766,43 @@ public final class MainActivity extends Activity {
 
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    private final class DashboardNodeListener implements OpenClawClient.Listener {
+        @Override
+        public void onStatus(String status) {
+            runOnUiThread(() -> {
+                if (nodeStatusText != null) nodeStatusText.setText(status);
+                recordDiagnostic("node.status", status);
+            });
+        }
+
+        @Override
+        public void onConnected(JSONObject hello) {
+            runOnUiThread(() -> {
+                if (nodeStatusText != null) {
+                    nodeStatusText.setText("Custom dashboard node connected. Approve pairing if the gateway requested it.");
+                }
+                recordDiagnostic("node.connected", hello == null ? "{}" : hello.toString());
+            });
+        }
+
+        @Override
+        public void onDashboard(JSONObject dashboard) {
+            recordDiagnostic("node.dashboard", dashboard == null ? "{}" : dashboard.toString());
+        }
+
+        @Override
+        public void onLog(String message) {
+            recordDiagnostic("node.log", message);
+        }
+
+        @Override
+        public void onError(String message) {
+            runOnUiThread(() -> {
+                if (nodeStatusText != null) nodeStatusText.setText("Node: " + message);
+                recordDiagnostic("node.error", message);
+            });
+        }
     }
 }

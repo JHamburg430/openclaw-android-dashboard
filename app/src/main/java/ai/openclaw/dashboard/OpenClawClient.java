@@ -25,6 +25,10 @@ final class OpenClawClient {
         void onError(String message);
     }
 
+    interface CommandHandler {
+        JSONObject handle(String command, JSONObject params) throws Exception;
+    }
+
     private static final String CLIENT_ID = "openclaw-android";
     private final OkHttpClient http = new OkHttpClient.Builder()
             .pingInterval(20, TimeUnit.SECONDS)
@@ -33,15 +37,17 @@ final class OpenClawClient {
             .build();
     private final IdentityStore identityStore;
     private final Listener listener;
+    private final CommandHandler commandHandler;
     private final Map<String, Pending> pending = new ConcurrentHashMap<>();
 
     private WebSocket socket;
     private Config config;
     private IdentityStore.Identity identity;
 
-    OpenClawClient(IdentityStore identityStore, Listener listener) {
+    OpenClawClient(IdentityStore identityStore, Listener listener, CommandHandler commandHandler) {
         this.identityStore = identityStore;
         this.listener = listener;
+        this.commandHandler = commandHandler;
     }
 
     synchronized void connect(Config config) {
@@ -138,7 +144,7 @@ final class OpenClawClient {
     }
 
     private void sendConnect(WebSocket webSocket, String nonce) throws Exception {
-        String role = "operator";
+        String role = "node";
         JSONArray scopes = scopesArray();
         String authToken = emptyToNull(config.gatewayToken);
         String bootstrapToken = authToken == null && emptyToNull(config.password) == null ? emptyToNull(config.bootstrapToken) : null;
@@ -163,7 +169,7 @@ final class OpenClawClient {
         JSONObject client = new JSONObject()
                 .put("id", CLIENT_ID)
                 .put("displayName", config.displayName)
-                .put("version", "1.0")
+                .put("version", "1.0.25")
                 .put("platform", platform)
                 .put("deviceFamily", family)
                 .put("mode", "node")
@@ -178,8 +184,15 @@ final class OpenClawClient {
                 .put("minProtocol", 4)
                 .put("maxProtocol", 4)
                 .put("client", client)
-                .put("caps", new JSONArray().put("android.dashboard").put("android.node"))
-                .put("commands", new JSONArray().put("system.ping").put("system.status"))
+                .put("caps", new JSONArray()
+                        .put("android.dashboard")
+                        .put("android.node")
+                        .put("apps")
+                        .put("device")
+                        .put("files")
+                        .put("notifications")
+                        .put("talk"))
+                .put("commands", nodeCommands())
                 .put("auth", auth.length() == 0 ? JSONObject.NULL : auth)
                 .put("role", role)
                 .put("scopes", scopes)
@@ -190,7 +203,7 @@ final class OpenClawClient {
             if (authInfo != null && authInfo.optString("deviceToken", null) != null) {
                 identityStore.saveDeviceToken(authInfo.optString("deviceToken"), authInfo.optJSONArray("scopes") == null ? "[]" : authInfo.optJSONArray("scopes").toString());
             }
-            listener.onStatus("Connected as node");
+            listener.onStatus("Connected as dashboard node");
             listener.onConnected(payloadJson == null ? new JSONObject() : payloadJson);
             refreshDashboard();
         }, error -> {
@@ -203,20 +216,52 @@ final class OpenClawClient {
         if (payload == null) return;
         String invokeId = payload.optString("invokeId", payload.optString("id", ""));
         String command = payload.optString("command", "");
-        JSONObject result = new JSONObject()
-                .put("ok", true)
-                .put("command", command)
-                .put("deviceId", identity.deviceId)
-                .put("displayName", config.displayName)
-                .put("platform", "android")
-                .put("battery", JSONObject.NULL)
-                .put("ts", System.currentTimeMillis());
+        JSONObject requestParams = payload.optJSONObject("params");
+        JSONObject result;
+        boolean ok = true;
+        try {
+            result = commandHandler == null
+                    ? defaultResult(command)
+                    : commandHandler.handle(command, requestParams == null ? new JSONObject() : requestParams);
+            if (result == null) result = defaultResult(command);
+        } catch (Exception e) {
+            ok = false;
+            result = new JSONObject()
+                    .put("code", "ANDROID_COMMAND_FAILED")
+                    .put("message", e.getMessage() == null ? e.toString() : e.getMessage())
+                    .put("command", command);
+        }
         JSONObject params = new JSONObject()
                 .put("invokeId", invokeId)
                 .put("nodeId", identity.deviceId)
-                .put("ok", true)
+                .put("ok", ok)
                 .put("result", result);
         request("node.invoke.result", params, ignored -> listener.onLog("Handled " + command), error -> listener.onError("Invoke reply failed: " + error));
+    }
+
+    private JSONObject defaultResult(String command) throws Exception {
+        return new JSONObject()
+                .put("ok", true)
+                .put("command", command)
+                .put("deviceId", identity == null ? JSONObject.NULL : identity.deviceId)
+                .put("displayName", config == null ? "Android OpenClaw Node" : config.displayName)
+                .put("platform", "android")
+                .put("ts", System.currentTimeMillis());
+    }
+
+    private static JSONArray nodeCommands() {
+        return new JSONArray()
+                .put("system.ping")
+                .put("system.status")
+                .put("system.notify")
+                .put("device.info")
+                .put("device.status")
+                .put("device.permissions")
+                .put("device.apps")
+                .put("android.apps.launch")
+                .put("android.files.pick")
+                .put("android.liveConversation.open")
+                .put("android.mic.probe");
     }
 
     private void call(String method, JSONObject params, Callback callback) {
@@ -248,7 +293,7 @@ final class OpenClawClient {
         if (identityStore.getDeviceToken() != null && storedScopes != null && storedScopes.length() > 2) {
             return new JSONArray(storedScopes);
         }
-        return new JSONArray().put("operator.admin");
+        return new JSONArray();
     }
 
     private static String join(JSONArray array) {
