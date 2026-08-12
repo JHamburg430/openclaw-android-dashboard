@@ -106,6 +106,7 @@ public final class MainActivity extends Activity {
     private final ArrayDeque<String> diagnosticsLines = new ArrayDeque<>();
     private final SimpleDateFormat diagnosticsTimeFormat = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
     private final NativeAudioBridge nativeAudioBridge = new NativeAudioBridge();
+    private final NativeAppBridge nativeAppBridge = new NativeAppBridge();
     private SharedPreferences prefs;
     private OpenClawClient nodeClient;
     private PermissionRequest pendingPermissionRequest;
@@ -300,6 +301,7 @@ public final class MainActivity extends Activity {
         webView.addJavascriptInterface(new DiagnosticsBridge(), "OpenClawDiag");
         webView.addJavascriptInterface(new NativeNotificationsBridge(), "OpenClawNativeNotifications");
         webView.addJavascriptInterface(nativeAudioBridge, "OpenClawNativeAudio");
+        webView.addJavascriptInterface(nativeAppBridge, "OpenClawNativeApp");
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
             public boolean onConsoleMessage(ConsoleMessage consoleMessage) {
@@ -456,8 +458,7 @@ public final class MainActivity extends Activity {
         row3.addView(appButton("Monitor", v -> openLocalApp(8501)), new LinearLayout.LayoutParams(0, dp(46), 1));
         row3.addView(appButton("Android Native", v -> {
             setAppsDrawerVisible(false);
-            setChromeExpanded(true);
-            statusText.setText("Android Native tools are available from this panel and through node commands.");
+            openNativeToolsPage();
         }), new LinearLayout.LayoutParams(0, dp(46), 1));
         drawer.addView(row3);
 
@@ -507,15 +508,30 @@ public final class MainActivity extends Activity {
     private void openLiveConversation() {
         try {
             connectDashboardNode();
-            webView.stopLoading();
-            webView.loadUrl(buildDashboardUrl());
             setConnectedUiVisible(true);
             setChromeExpanded(false);
-            statusText.setText("Live Conversation is ready. Use Talk/Mic in the Control UI; native mic and speaker bridges are enabled.");
-            recordDiagnostic("live_conversation.open", "dashboard");
+            webView.stopLoading();
+            webView.loadDataWithBaseURL(buildNativePageBaseUrl("live-conversation"), buildLiveConversationHtml(), "text/html", "UTF-8", null);
+            statusText.setText("Live Conversation native page loaded.");
+            recordDiagnostic("live_conversation.open", "native_page");
         } catch (Exception e) {
             statusText.setText("Live Conversation unavailable: " + e.getMessage());
             recordDiagnostic("live_conversation.failed", e.getMessage());
+        }
+    }
+
+    private void openNativeToolsPage() {
+        try {
+            connectDashboardNode();
+            setConnectedUiVisible(true);
+            setChromeExpanded(false);
+            webView.stopLoading();
+            webView.loadDataWithBaseURL(buildNativePageBaseUrl("android-native"), buildAndroidNativeHtml(), "text/html", "UTF-8", null);
+            statusText.setText("Android Native tools loaded.");
+            recordDiagnostic("android_native.open", "native_page");
+        } catch (Exception e) {
+            statusText.setText("Android Native unavailable: " + e.getMessage());
+            recordDiagnostic("android_native.failed", e.getMessage());
         }
     }
 
@@ -530,6 +546,17 @@ public final class MainActivity extends Activity {
         // user services on plain HTTP ports, even when Control UI is reached
         // through a secure Tailscale/OpenClaw dashboard URL.
         return "http://" + host + ":" + port + "/";
+    }
+
+    private String buildNativePageBaseUrl(String pageName) {
+        try {
+            java.net.URI uri = java.net.URI.create(buildDashboardUrl());
+            String scheme = uri.getScheme() == null ? "https" : uri.getScheme();
+            String host = uri.getHost() == null ? "openclaw.local" : uri.getHost();
+            return scheme + "://" + host + "/android-native/" + pageName + "/";
+        } catch (Exception ignored) {
+            return "https://openclaw.local/android-native/" + pageName + "/";
+        }
     }
 
     private void connectDashboardNode() {
@@ -665,6 +692,72 @@ public final class MainActivity extends Activity {
                 statusText.setText("File picker is unavailable on this device.");
             }
         });
+    }
+
+    private String buildLiveConversationHtml() {
+        return nativePageShell(
+                "Live Conversation",
+                "<p class=\"muted\">Native microphone capture is available here. Use the mic monitor to confirm Android audio capture, or open Control UI Talk for the full assistant conversation surface.</p>"
+                        + "<div class=\"grid\">"
+                        + "<button onclick=\"openControlUi()\">Open Control UI Talk</button>"
+                        + "<button onclick=\"startMic()\">Start Mic Monitor</button>"
+                        + "<button onclick=\"stopMic()\">Stop Mic</button>"
+                        + "<button onclick=\"micProbe()\">Run Native Mic Probe</button>"
+                        + "</div>"
+                        + "<div class=\"meter\"><div id=\"bar\"></div></div>"
+                        + "<pre id=\"out\">Ready.</pre>",
+                "var micTimer=null;"
+                        + "function log(v){document.getElementById('out').textContent=typeof v==='string'?v:JSON.stringify(v,null,2);}"
+                        + "function b64bytes(s){var bin=atob(s||'');var arr=[];for(var i=0;i<bin.length;i++)arr.push(bin.charCodeAt(i)&255);return arr;}"
+                        + "function rmsFromPcm16(s){var bytes=b64bytes(s);if(bytes.length<2)return 0;var sum=0,n=0;for(var i=0;i+1<bytes.length;i+=2){var v=bytes[i]|(bytes[i+1]<<8);if(v&32768)v-=65536;var f=v/32768;sum+=f*f;n++;}return n?Math.sqrt(sum/n):0;}"
+                        + "function startMic(){try{OpenClawNativeAudio.startCapture(16000,20);log('Listening locally. Speak and watch the level.');if(micTimer)clearInterval(micTimer);micTimer=setInterval(function(){var c=OpenClawNativeAudio.readChunkBase64();if(!c)return;var r=rmsFromPcm16(c);document.getElementById('bar').style.width=Math.min(100,Math.round(r*700))+'%';},40);}catch(e){log('Mic start failed: '+e);}}"
+                        + "function stopMic(){try{OpenClawNativeAudio.stopCapture();}catch(e){}if(micTimer)clearInterval(micTimer);micTimer=null;document.getElementById('bar').style.width='0%';log('Mic stopped.');}"
+                        + "function micProbe(){log(OpenClawNativeApp.micProbe());}"
+                        + "function openControlUi(){OpenClawNativeApp.openControlUi();}"
+        );
+    }
+
+    private String buildAndroidNativeHtml() {
+        return nativePageShell(
+                "Android Native",
+                "<p class=\"muted\">Device features exposed by the custom dashboard app. These are also available to the gateway through the custom node connection.</p>"
+                        + "<div class=\"grid\">"
+                        + "<button onclick=\"showStatus()\">Device Status</button>"
+                        + "<button onclick=\"showPerms()\">Permissions</button>"
+                        + "<button onclick=\"showApps()\">Installed Apps</button>"
+                        + "<button onclick=\"filePicker()\">File Picker</button>"
+                        + "<button onclick=\"notifyTest()\">Test Notification</button>"
+                        + "<button onclick=\"micProbe()\">Mic Probe</button>"
+                        + "<button onclick=\"openControlUi()\">Control UI</button>"
+                        + "<button onclick=\"openLive()\">Live Conversation</button>"
+                        + "</div>"
+                        + "<pre id=\"out\">Ready.</pre>",
+                "function log(v){document.getElementById('out').textContent=typeof v==='string'?v:JSON.stringify(v,null,2);}"
+                        + "function parse(s){try{return JSON.parse(s);}catch(e){return s;}}"
+                        + "function showStatus(){log(parse(OpenClawNativeApp.deviceStatus()));}"
+                        + "function showPerms(){log(parse(OpenClawNativeApp.permissions()));}"
+                        + "function showApps(){var data=parse(OpenClawNativeApp.apps());if(data&&data.apps){data.apps=data.apps.slice(0,60);}log(data);}"
+                        + "function filePicker(){log(OpenClawNativeApp.filePicker());}"
+                        + "function notifyTest(){log(OpenClawNativeApp.notifyTest());}"
+                        + "function micProbe(){log(OpenClawNativeApp.micProbe());}"
+                        + "function openControlUi(){OpenClawNativeApp.openControlUi();}"
+                        + "function openLive(){OpenClawNativeApp.openLiveConversation();}"
+        );
+    }
+
+    private String nativePageShell(String title, String body, String script) {
+        return "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+                + "<style>"
+                + "html,body{margin:0;min-height:100%;background:#060a10;color:#f4f8fc;font-family:system-ui,-apple-system,Segoe UI,sans-serif;}"
+                + "main{padding:18px 14px 28px;}"
+                + "h1{font-size:22px;margin:0 0 10px;letter-spacing:0;}"
+                + ".muted{color:#c6d3e0;font-size:14px;line-height:1.35;margin:0 0 14px;}"
+                + ".grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:12px 0;}"
+                + "button{min-height:44px;border:1px solid #00ab7e;border-radius:6px;background:#1e2630;color:#f4f8fc;font-size:14px;padding:8px;}"
+                + "pre{white-space:pre-wrap;word-break:break-word;background:#0a0e14;color:#c6d3e0;border-radius:6px;padding:12px;min-height:140px;font-size:12px;}"
+                + ".meter{height:18px;background:#101820;border:1px solid #304050;border-radius:6px;overflow:hidden;margin:12px 0;}"
+                + "#bar{height:100%;width:0%;background:#00ab7e;transition:width 80ms linear;}"
+                + "</style></head><body><main><h1>" + title + "</h1>" + body + "</main><script>" + script + "</script></body></html>";
     }
 
     private void configureSystemBars() {
@@ -1355,6 +1448,76 @@ public final class MainActivity extends Activity {
         @JavascriptInterface
         public void clearAll() {
             runOnUiThread(MainActivity.this::clearNativeNotifications);
+        }
+    }
+
+    private final class NativeAppBridge {
+        @JavascriptInterface
+        public String deviceStatus() {
+            try {
+                return nativeDeviceStatus().toString();
+            } catch (Exception e) {
+                return errorJson(e);
+            }
+        }
+
+        @JavascriptInterface
+        public String permissions() {
+            try {
+                return nativePermissions().toString();
+            } catch (Exception e) {
+                return errorJson(e);
+            }
+        }
+
+        @JavascriptInterface
+        public String apps() {
+            try {
+                return nativeInstalledApps().toString();
+            } catch (Exception e) {
+                return errorJson(e);
+            }
+        }
+
+        @JavascriptInterface
+        public String filePicker() {
+            openAndroidFilePicker();
+            return "File picker opened.";
+        }
+
+        @JavascriptInterface
+        public String notifyTest() {
+            runOnUiThread(() -> postNativeNotification(
+                    "OpenClaw Dashboard",
+                    "{\"body\":\"Native notification bridge is working.\"}"));
+            return "Notification requested.";
+        }
+
+        @JavascriptInterface
+        public String micProbe() {
+            runOnUiThread(MainActivity.this::runNativeMicProbe);
+            return "Native mic probe started. Check diagnostics for capture results.";
+        }
+
+        @JavascriptInterface
+        public void openControlUi() {
+            runOnUiThread(MainActivity.this::openDashboard);
+        }
+
+        @JavascriptInterface
+        public void openLiveConversation() {
+            runOnUiThread(MainActivity.this::openLiveConversation);
+        }
+
+        private String errorJson(Exception e) {
+            try {
+                return new JSONObject()
+                        .put("ok", false)
+                        .put("message", e.getMessage() == null ? e.toString() : e.getMessage())
+                        .toString();
+            } catch (Exception ignored) {
+                return "{\"ok\":false}";
+            }
         }
     }
 
