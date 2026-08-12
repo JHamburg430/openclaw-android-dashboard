@@ -261,7 +261,8 @@ final class OpenClawClient {
                 .put("android.apps.launch")
                 .put("android.files.pick")
                 .put("android.liveConversation.open")
-                .put("android.mic.probe");
+                .put("android.mic.probe")
+                .put("android.speaker.test");
     }
 
     private void call(String method, JSONObject params, Callback callback) {

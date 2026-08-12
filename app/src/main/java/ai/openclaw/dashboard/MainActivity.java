@@ -19,6 +19,7 @@ import android.graphics.drawable.GradientDrawable;
 import android.media.AudioManager;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
+import android.media.AudioTrack;
 import android.media.MediaRecorder;
 import android.media.audiofx.AcousticEchoCanceler;
 import android.media.audiofx.AutomaticGainControl;
@@ -609,6 +610,9 @@ public final class MainActivity extends Activity {
             case "android.mic.probe":
                 runOnUiThread(this::runNativeMicProbe);
                 return new JSONObject().put("started", true).put("permission", hasRecordAudioPermission());
+            case "android.speaker.test":
+                nativeAudioBridge.playTestTone();
+                return new JSONObject().put("started", true).put("output", "AudioTrack");
             default:
                 return new JSONObject()
                         .put("ok", false)
@@ -703,6 +707,8 @@ public final class MainActivity extends Activity {
                         + "<button onclick=\"startMic()\">Start Mic Monitor</button>"
                         + "<button onclick=\"stopMic()\">Stop Mic</button>"
                         + "<button onclick=\"micProbe()\">Run Native Mic Probe</button>"
+                        + "<button onclick=\"nativeSpeakerTest()\">Native Speaker Test</button>"
+                        + "<button onclick=\"webAudioTest()\">WebAudio Test</button>"
                         + "</div>"
                         + "<div class=\"meter\"><div id=\"bar\"></div></div>"
                         + "<pre id=\"out\">Ready.</pre>",
@@ -713,6 +719,8 @@ public final class MainActivity extends Activity {
                         + "function startMic(){try{OpenClawNativeAudio.startCapture(16000,20);log('Listening locally. Speak and watch the level.');if(micTimer)clearInterval(micTimer);micTimer=setInterval(function(){var c=OpenClawNativeAudio.readChunkBase64();if(!c)return;var r=rmsFromPcm16(c);document.getElementById('bar').style.width=Math.min(100,Math.round(r*700))+'%';},40);}catch(e){log('Mic start failed: '+e);}}"
                         + "function stopMic(){try{OpenClawNativeAudio.stopCapture();}catch(e){}if(micTimer)clearInterval(micTimer);micTimer=null;document.getElementById('bar').style.width='0%';log('Mic stopped.');}"
                         + "function micProbe(){log(OpenClawNativeApp.micProbe());}"
+                        + "function nativeSpeakerTest(){log(OpenClawNativeApp.speakerTest());}"
+                        + "function webAudioTest(){try{var C=window.AudioContext||window.webkitAudioContext;var ctx=new C();var osc=ctx.createOscillator();var gain=ctx.createGain();osc.frequency.value=880;gain.gain.value=0.18;osc.connect(gain);gain.connect(ctx.destination);osc.start();osc.stop(ctx.currentTime+0.65);log('WebAudio tone requested. If native speaker works but this is silent, WebView playback is blocked or routed incorrectly.');}catch(e){log('WebAudio test failed: '+e);}}"
                         + "function openControlUi(){OpenClawNativeApp.openControlUi();}"
         );
     }
@@ -728,6 +736,8 @@ public final class MainActivity extends Activity {
                         + "<button onclick=\"filePicker()\">File Picker</button>"
                         + "<button onclick=\"notifyTest()\">Test Notification</button>"
                         + "<button onclick=\"micProbe()\">Mic Probe</button>"
+                        + "<button onclick=\"speakerTest()\">Speaker Test</button>"
+                        + "<button onclick=\"webAudioTest()\">WebAudio Test</button>"
                         + "<button onclick=\"openControlUi()\">Control UI</button>"
                         + "<button onclick=\"openLive()\">Live Conversation</button>"
                         + "</div>"
@@ -740,6 +750,8 @@ public final class MainActivity extends Activity {
                         + "function filePicker(){log(OpenClawNativeApp.filePicker());}"
                         + "function notifyTest(){log(OpenClawNativeApp.notifyTest());}"
                         + "function micProbe(){log(OpenClawNativeApp.micProbe());}"
+                        + "function speakerTest(){log(OpenClawNativeApp.speakerTest());}"
+                        + "function webAudioTest(){try{var C=window.AudioContext||window.webkitAudioContext;var ctx=new C();var osc=ctx.createOscillator();var gain=ctx.createGain();osc.frequency.value=660;gain.gain.value=0.18;osc.connect(gain);gain.connect(ctx.destination);osc.start();osc.stop(ctx.currentTime+0.65);log('WebAudio tone requested.');}catch(e){log('WebAudio test failed: '+e);}}"
                         + "function openControlUi(){OpenClawNativeApp.openControlUi();}"
                         + "function openLive(){OpenClawNativeApp.openLiveConversation();}"
         );
@@ -1500,6 +1512,12 @@ public final class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public String speakerTest() {
+            nativeAudioBridge.playTestTone();
+            return "Native speaker test requested. You should hear a short tone.";
+        }
+
+        @JavascriptInterface
         public void openControlUi() {
             runOnUiThread(MainActivity.this::openDashboard);
         }
@@ -1523,6 +1541,7 @@ public final class MainActivity extends Activity {
 
     private final class NativeAudioBridge {
         private static final int NATIVE_SAMPLE_RATE = 16000;
+        private static final int OUTPUT_SAMPLE_RATE = 24000;
         private static final int MAX_QUEUED_CHUNKS = 64;
         private final Object lock = new Object();
         private final ArrayDeque<String> chunkQueue = new ArrayDeque<>();
@@ -1593,6 +1612,67 @@ public final class MainActivity extends Activity {
             synchronized (lock) {
                 return chunkQueue.pollFirst();
             }
+        }
+
+        @JavascriptInterface
+        public void playTestTone() {
+            new Thread(() -> {
+                AudioTrack track = null;
+                try {
+                    AudioManager audioManager = getAudioManager();
+                    if (audioManager != null) {
+                        int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+                        int max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+                        recordDiagnostic("native_audio_output.volume", "music=" + current + "/" + max + " mode=" + audioManager.getMode());
+                        if (current == 0 && max > 0) {
+                            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, Math.max(1, max / 4), 0);
+                            recordDiagnostic("native_audio_output.volume_adjusted", "music stream was muted");
+                        }
+                    }
+                    int durationMs = 700;
+                    int samples = OUTPUT_SAMPLE_RATE * durationMs / 1000;
+                    byte[] pcm = new byte[samples * 2];
+                    double frequency = 880.0;
+                    for (int i = 0; i < samples; i++) {
+                        double envelope = Math.min(1.0, Math.min(i / 1200.0, (samples - i) / 1200.0));
+                        short value = (short) Math.round(Math.sin(2.0 * Math.PI * frequency * i / OUTPUT_SAMPLE_RATE) * 12000.0 * envelope);
+                        pcm[i * 2] = (byte) (value & 0xff);
+                        pcm[i * 2 + 1] = (byte) ((value >> 8) & 0xff);
+                    }
+                    int minBuffer = AudioTrack.getMinBufferSize(
+                            OUTPUT_SAMPLE_RATE,
+                            AudioFormat.CHANNEL_OUT_MONO,
+                            AudioFormat.ENCODING_PCM_16BIT);
+                    int bufferSize = Math.max(minBuffer, pcm.length);
+                    track = new AudioTrack(
+                            AudioManager.STREAM_MUSIC,
+                            OUTPUT_SAMPLE_RATE,
+                            AudioFormat.CHANNEL_OUT_MONO,
+                            AudioFormat.ENCODING_PCM_16BIT,
+                            bufferSize,
+                            AudioTrack.MODE_STREAM);
+                    if (track.getState() != AudioTrack.STATE_INITIALIZED) {
+                        throw new IllegalStateException("AudioTrack failed to initialize: state=" + track.getState());
+                    }
+                    recordDiagnostic("native_audio_output.start", "AudioTrack tone sampleRate=" + OUTPUT_SAMPLE_RATE + " bytes=" + pcm.length);
+                    track.play();
+                    int written = track.write(pcm, 0, pcm.length);
+                    recordDiagnostic("native_audio_output.write", "bytes=" + written + " playState=" + track.getPlayState());
+                    Thread.sleep(durationMs + 100L);
+                    recordDiagnostic("native_audio_output.done", "tone complete");
+                } catch (Exception e) {
+                    recordDiagnostic("native_audio_output.error", e.getClass().getSimpleName() + ": " + e.getMessage());
+                    runOnUiThread(() -> statusText.setText("Speaker test failed: " + e.getMessage()));
+                } finally {
+                    if (track != null) {
+                        try {
+                            track.stop();
+                        } catch (Exception ignored) {
+                        }
+                        track.release();
+                    }
+                }
+            }, "openclaw-native-speaker-test").start();
         }
 
         private void readNativeAudioLoop(int samplesPerChunk) {
