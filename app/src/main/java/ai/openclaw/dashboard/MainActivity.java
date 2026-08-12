@@ -90,8 +90,8 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_FILE_CHOOSER = 2004;
     private static final int REQUEST_BLUETOOTH_CONNECT = 2005;
     private static final String TAG = "OpenClawDashboard";
-    private static final int APP_VERSION_CODE = 39;
-    private static final String APP_VERSION_NAME = "1.0.39";
+    private static final int APP_VERSION_CODE = 40;
+    private static final String APP_VERSION_NAME = "1.0.40";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final String NOTIFICATION_CHANNEL_ID = "openclaw_updates";
@@ -130,6 +130,7 @@ public final class MainActivity extends Activity {
     private LinearLayout settingsPanel;
     private LinearLayout appsDrawer;
     private ScrollView controlsScroll;
+    private FrameLayout webContainer;
     private Button openButton;
     private Button reloadButton;
     private Button connectNodeButton;
@@ -138,6 +139,7 @@ public final class MainActivity extends Activity {
     private WebView webView;
     private boolean chromeExpanded = true;
     private boolean appsDrawerVisible = false;
+    private int statusBarTopInset = 0;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -285,10 +287,11 @@ public final class MainActivity extends Activity {
         diagnosticsText.setBackgroundColor(Color.rgb(10, 14, 20));
         controls.addView(diagnosticsText);
 
-        FrameLayout webContainer = new FrameLayout(this);
+        webContainer = new FrameLayout(this);
         LinearLayout.LayoutParams webLp = new LinearLayout.LayoutParams(-1, 0, 1);
         webLp.setMargins(0, dp(4), 0, 0);
         root.addView(webContainer, webLp);
+        applyStatusBarAwareWebMargin(webContainer);
 
         webView = new WebView(this);
         webView.setBackgroundColor(COLOR_APP_CHROME);
@@ -838,6 +841,26 @@ public final class MainActivity extends Activity {
         view.requestApplyInsets();
     }
 
+    private void applyStatusBarAwareWebMargin(View view) {
+        view.setOnApplyWindowInsetsListener((target, insets) -> {
+            Insets statusBars = insets.getInsets(WindowInsets.Type.statusBars());
+            statusBarTopInset = statusBars.top;
+            updateWebContainerTopMargin();
+            return insets;
+        });
+        view.requestApplyInsets();
+    }
+
+    private void updateWebContainerTopMargin() {
+        if (webContainer == null) return;
+        ViewGroup.MarginLayoutParams params = (ViewGroup.MarginLayoutParams) webContainer.getLayoutParams();
+        if (params == null) return;
+        int desiredTopMargin = chromeExpanded ? dp(4) : statusBarTopInset;
+        if (params.topMargin == desiredTopMargin) return;
+        params.topMargin = desiredTopMargin;
+        webContainer.setLayoutParams(params);
+    }
+
     private void loadPrefs() {
         urlInput.setText(prefs.getString("url", ""));
         tokenInput.setText(prefs.getString("token", ""));
@@ -1094,6 +1117,7 @@ public final class MainActivity extends Activity {
                 dp(expanded ? 10 : 2));
         chromeToggleButton.setText(expanded ? "-" : "+");
         chromeToggleButton.setContentDescription(expanded ? "Collapse controls" : "Expand controls");
+        updateWebContainerTopMargin();
         ViewGroup.MarginLayoutParams layoutParams = (ViewGroup.MarginLayoutParams) webView.getLayoutParams();
         if (layoutParams != null) {
             layoutParams.topMargin = expanded ? dp(4) : 0;
