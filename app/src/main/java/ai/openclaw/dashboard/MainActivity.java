@@ -88,6 +88,8 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_CAMERA = 2003;
     private static final int REQUEST_FILE_CHOOSER = 2004;
     private static final String TAG = "OpenClawDashboard";
+    private static final int APP_VERSION_CODE = 30;
+    private static final String APP_VERSION_NAME = "1.0.30";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final String NOTIFICATION_CHANNEL_ID = "openclaw_updates";
@@ -426,7 +428,7 @@ public final class MainActivity extends Activity {
         clearDiagnostics.setOnClickListener(v -> clearDiagnostics());
         probeMic.setOnClickListener(v -> runNativeMicProbe());
         setContentView(shellRoot);
-        recordDiagnostic("app.ready", "Diagnostics bridge initialized");
+        recordDiagnostic("app.ready", "Diagnostics bridge initialized version=" + APP_VERSION_NAME);
     }
 
     private LinearLayout buildAppsDrawer() {
@@ -1193,7 +1195,9 @@ public final class MainActivity extends Activity {
         if (!token.isEmpty()) auth.append(",\"token\":").append(JSONObject.quote(token));
         if (!password.isEmpty()) auth.append(",\"password\":").append(JSONObject.quote(password));
         auth.append("}");
-        return "window.__OPENCLAW_NATIVE_CONTROL_AUTH__=" + auth + ";";
+        return "window.__OPENCLAW_NATIVE_CONTROL_AUTH__=" + auth + ";"
+                + "window.__OPENCLAW_ANDROID_DASHBOARD__={versionName:" + JSONObject.quote(APP_VERSION_NAME)
+                + ",versionCode:" + APP_VERSION_CODE + "};";
     }
 
     private String buildDiagnosticsScript() {
@@ -1238,6 +1242,20 @@ public final class MainActivity extends Activity {
                 + "if(typeof WebSocketCtor!=='function')return;"
                 + "var relayAudioChunks=0;"
                 + "function parse(data){if(typeof data!=='string')return null;try{return JSON.parse(data);}catch(_){return null;}}"
+                + "function cleanGatewayRelayParams(params){"
+                + "params=params&&typeof params==='object'?params:{};"
+                + "var clean={mode:'realtime',transport:'gateway-relay',brain:'agent-consult'};"
+                + "if(typeof params.sessionKey==='string'&&params.sessionKey.trim())clean.sessionKey=params.sessionKey;"
+                + "if(typeof params.provider==='string'&&params.provider.trim())clean.provider=params.provider;"
+                + "if(typeof params.model==='string'&&params.model.trim())clean.model=params.model;"
+                + "if(typeof params.voice==='string'&&params.voice.trim())clean.voice=params.voice;"
+                + "if(typeof params.instructions==='string'&&params.instructions.trim())clean.instructions=params.instructions;"
+                + "if(typeof params.vadThreshold==='number')clean.vadThreshold=params.vadThreshold;"
+                + "if(typeof params.silenceDurationMs==='number')clean.silenceDurationMs=params.silenceDurationMs;"
+                + "if(typeof params.prefixPaddingMs==='number')clean.prefixPaddingMs=params.prefixPaddingMs;"
+                + "if(typeof params.ttlMs==='number')clean.ttlMs=params.ttlMs;"
+                + "return clean;"
+                + "}"
                 + "function handleRelayMessage(data){"
                 + "var message=parse(data);"
                 + "if(!message||message.type!=='event'||message.event!=='talk.event'||!message.payload)return;"
@@ -1258,10 +1276,7 @@ public final class MainActivity extends Activity {
                 + "var message=parse(data);"
                 + "if(message&&message.type==='req'&&message.method==='talk.client.create'){"
                 + "message.method='talk.session.create';"
-                + "message.params=message.params&&typeof message.params==='object'?message.params:{};"
-                + "message.params.mode='realtime';"
-                + "message.params.transport='gateway-relay';"
-                + "if(!message.params.brain)message.params.brain='agent-consult';"
+                + "message.params=cleanGatewayRelayParams(message.params);"
                 + "data=JSON.stringify(message);"
                 + "diag('talk.patch.rewrite',{'method':'talk.session.create','transport':message.params.transport,'brain':message.params.brain});"
                 + "}"
