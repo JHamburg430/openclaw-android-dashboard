@@ -169,7 +169,7 @@ final class OpenClawClient {
         JSONObject client = new JSONObject()
                 .put("id", CLIENT_ID)
                 .put("displayName", config.displayName)
-                .put("version", "1.0.41")
+                .put("version", "1.0.42")
                 .put("platform", platform)
                 .put("deviceFamily", family)
                 .put("mode", "node")

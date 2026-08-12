@@ -25,6 +25,7 @@ import android.media.MediaRecorder;
 import android.media.audiofx.AcousticEchoCanceler;
 import android.media.audiofx.AutomaticGainControl;
 import android.media.audiofx.NoiseSuppressor;
+import android.speech.tts.TextToSpeech;
 import android.net.Uri;
 import android.os.BatteryManager;
 import android.os.Build;
@@ -90,8 +91,8 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_FILE_CHOOSER = 2004;
     private static final int REQUEST_BLUETOOTH_CONNECT = 2005;
     private static final String TAG = "OpenClawDashboard";
-    private static final int APP_VERSION_CODE = 41;
-    private static final String APP_VERSION_NAME = "1.0.41";
+    private static final int APP_VERSION_CODE = 42;
+    private static final String APP_VERSION_NAME = "1.0.42";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final String NOTIFICATION_CHANNEL_ID = "openclaw_updates";
@@ -182,6 +183,7 @@ public final class MainActivity extends Activity {
             nodeClient.disconnect();
             nodeClient = null;
         }
+        nativeAudioBridge.shutdownTextToSpeech();
         super.onDestroy();
     }
 
@@ -1393,7 +1395,7 @@ public final class MainActivity extends Activity {
                 + "diag('talk.relay.audio_missing',{'type':kind,'keys':Object.keys(payload).join(',')});"
                 + "}else{"
                 + "var text=relayText(payload);"
-                + "if(text&&(kind.indexOf('text')>=0||kind.indexOf('transcript')>=0||kind.indexOf('response')>=0)){try{if(nativeAudio&&typeof nativeAudio.showAgentResponseText==='function'){nativeAudio.showAgentResponseText(text);}}catch(error){diag('talk.relay.text_display.error',{'message':String(error)});}}"
+                + "if(text&&(kind.indexOf('text')>=0||kind.indexOf('transcript')>=0||kind.indexOf('response')>=0)){try{if(nativeAudio&&typeof nativeAudio.showAgentResponseText==='function'){nativeAudio.showAgentResponseText(text);}var before=relayAudioChunks;if(typeof window.setTimeout==='function'){window.setTimeout(function(){try{if(relayAudioChunks===before&&nativeAudio&&typeof nativeAudio.speakAgentResponseText==='function'){nativeAudio.speakAgentResponseText(text);diag('talk.relay.tts_fallback',{'reason':'no_audio_chunks_after_text'});}}catch(error){diag('talk.relay.tts_fallback.error',{'message':String(error)});}},900);}}catch(error){diag('talk.relay.text_display.error',{'message':String(error)});}}"
                 + "if(kind){diag('talk.relay.event',{'type':kind});}"
                 + "}"
                 + "}"
@@ -1768,6 +1770,9 @@ public final class MainActivity extends Activity {
         private Integer previousAudioMode;
         private AudioDeviceInfo previousCommunicationDevice;
         private boolean bluetoothRouteActive;
+        private TextToSpeech fallbackTts;
+        private boolean fallbackTtsReady;
+        private String pendingFallbackTtsText;
         private AcousticEchoCanceler acousticEchoCanceler;
         private NoiseSuppressor noiseSuppressor;
         private AutomaticGainControl automaticGainControl;
@@ -1850,6 +1855,69 @@ public final class MainActivity extends Activity {
         @JavascriptInterface
         public void showAgentResponseText(String text) {
             showCollapsedAssistantOutput(text);
+        }
+
+        @JavascriptInterface
+        public void speakAgentResponseText(String text) {
+            speakTextFallback(text);
+        }
+
+        private void speakTextFallback(String text) {
+            if (text == null || text.trim().isEmpty()) return;
+            String normalized = text.trim();
+            recordDiagnostic("native_tts_fallback.request", normalized);
+            runOnUiThread(() -> {
+                ensureFallbackTts();
+                if (fallbackTts == null) {
+                    recordDiagnostic("native_tts_fallback.unavailable", "TextToSpeech init failed");
+                    return;
+                }
+                if (!fallbackTtsReady) {
+                    pendingFallbackTtsText = normalized;
+                    recordDiagnostic("native_tts_fallback.pending", "engine not ready");
+                    return;
+                }
+                speakReadyFallbackText(normalized);
+            });
+        }
+
+        private void ensureFallbackTts() {
+            if (fallbackTts != null) return;
+            fallbackTtsReady = false;
+            fallbackTts = new TextToSpeech(MainActivity.this, status -> {
+                fallbackTtsReady = status == TextToSpeech.SUCCESS;
+                if (fallbackTtsReady) {
+                    fallbackTts.setLanguage(Locale.UK);
+                    fallbackTts.setSpeechRate(0.92f);
+                    recordDiagnostic("native_tts_fallback.ready", "TextToSpeech");
+                    String pending = pendingFallbackTtsText;
+                    pendingFallbackTtsText = null;
+                    if (pending != null && !pending.trim().isEmpty()) {
+                        speakReadyFallbackText(pending);
+                    }
+                } else {
+                    recordDiagnostic("native_tts_fallback.error", "init status=" + status);
+                }
+            });
+        }
+
+        private void speakReadyFallbackText(String text) {
+            if (fallbackTts == null || text == null || text.trim().isEmpty()) return;
+            AudioManager audioManager = getAudioManager();
+            if (audioManager != null) {
+                ensurePlaybackStreamVolume(audioManager);
+            }
+            fallbackTts.speak(text.trim(), TextToSpeech.QUEUE_FLUSH, null, "openclaw-agent-response");
+            recordDiagnostic("native_tts_fallback.speak", "chars=" + text.trim().length());
+        }
+
+        private void shutdownTextToSpeech() {
+            if (fallbackTts == null) return;
+            fallbackTts.stop();
+            fallbackTts.shutdown();
+            fallbackTts = null;
+            fallbackTtsReady = false;
+            pendingFallbackTtsText = null;
         }
 
         private void playPcm16Base64(String base64Pcm16, int sampleRateHz, String routeReason) {
