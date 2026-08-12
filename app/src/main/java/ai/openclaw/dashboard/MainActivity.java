@@ -1145,6 +1145,7 @@ public final class MainActivity extends Activity {
     private String buildInjectedScript() {
         return buildNativeAuthScript()
                 + buildNotificationBridgeScript()
+                + buildTalkGatewayRelayPatchScript()
                 + buildDiagnosticsScript()
                 + buildNativeAudioBridgeScript()
                 + buildViewportTighteningScript();
@@ -1224,6 +1225,61 @@ public final class MainActivity extends Activity {
                 + "}"
                 + "var levels=['debug','log','info','warn','error'];"
                 + "for(var i=0;i<levels.length;i++){(function(level){var original=console[level];if(typeof original!=='function')return;console[level]=function(){var parts=[];for(var j=0;j<arguments.length;j++){var value=arguments[j];if(typeof value==='string'){parts.push(value);}else{try{parts.push(JSON.stringify(value));}catch(_){parts.push(String(value));}}}send('console.'+level,parts.join(' '));return original.apply(console,arguments);};})(levels[i]);}"
+                + "})();";
+    }
+
+    private String buildTalkGatewayRelayPatchScript() {
+        return "(function(){"
+                + "if(window.__OPENCLAW_TALK_GATEWAY_RELAY_PATCHED__)return;"
+                + "window.__OPENCLAW_TALK_GATEWAY_RELAY_PATCHED__=true;"
+                + "var diag=function(kind,payload){try{var d=window.__OPENCLAW_DIAG__;if(d&&typeof d.emit==='function'){d.emit(kind,payload||{});}}catch(_){}};"
+                + "var nativeAudio=window.OpenClawNativeAudio;"
+                + "var WebSocketCtor=window.WebSocket;"
+                + "if(typeof WebSocketCtor!=='function')return;"
+                + "var relayAudioChunks=0;"
+                + "function parse(data){if(typeof data!=='string')return null;try{return JSON.parse(data);}catch(_){return null;}}"
+                + "function handleRelayMessage(data){"
+                + "var message=parse(data);"
+                + "if(!message||message.type!=='event'||message.event!=='talk.event'||!message.payload)return;"
+                + "var payload=message.payload;"
+                + "if(payload.type==='audio'&&payload.audioBase64){"
+                + "relayAudioChunks++;"
+                + "if(relayAudioChunks===1||relayAudioChunks%20===0){diag('talk.relay.audio',{'chunks':relayAudioChunks,'sampleRate':payload.sampleRate||24000,'bytes':String(payload.audioBase64).length});}"
+                + "try{if(nativeAudio&&typeof nativeAudio.playPcm16Base64==='function'){nativeAudio.playPcm16Base64(String(payload.audioBase64),payload.sampleRate||24000);}}catch(error){diag('talk.relay.native_play.error',{'message':String(error)});}"
+                + "}else if(payload.type){"
+                + "diag('talk.relay.event',{'type':String(payload.type)});"
+                + "}"
+                + "}"
+                + "function patchSocket(socket){"
+                + "try{socket.addEventListener('message',function(event){handleRelayMessage(event&&event.data);});}catch(_){ }"
+                + "var originalSend=socket.send;"
+                + "socket.send=function(data){"
+                + "try{"
+                + "var message=parse(data);"
+                + "if(message&&message.type==='req'&&message.method==='talk.client.create'){"
+                + "message.method='talk.session.create';"
+                + "message.params=message.params&&typeof message.params==='object'?message.params:{};"
+                + "message.params.mode='realtime';"
+                + "message.params.transport='gateway-relay';"
+                + "if(!message.params.brain)message.params.brain='agent-consult';"
+                + "data=JSON.stringify(message);"
+                + "diag('talk.patch.rewrite',{'method':'talk.session.create','transport':message.params.transport,'brain':message.params.brain});"
+                + "}"
+                + "}catch(error){diag('talk.patch.send.error',{'message':String(error)});}"
+                + "return originalSend.call(socket,data);"
+                + "};"
+                + "return socket;"
+                + "}"
+                + "function PatchedWebSocket(url,protocols){"
+                + "return patchSocket(arguments.length>1?new WebSocketCtor(url,protocols):new WebSocketCtor(url));"
+                + "}"
+                + "PatchedWebSocket.prototype=WebSocketCtor.prototype;"
+                + "PatchedWebSocket.CONNECTING=WebSocketCtor.CONNECTING;"
+                + "PatchedWebSocket.OPEN=WebSocketCtor.OPEN;"
+                + "PatchedWebSocket.CLOSING=WebSocketCtor.CLOSING;"
+                + "PatchedWebSocket.CLOSED=WebSocketCtor.CLOSED;"
+                + "window.WebSocket=PatchedWebSocket;"
+                + "diag('talk.patch.ready',{'mode':'gateway-relay'});"
                 + "})();";
     }
 
@@ -1543,11 +1599,16 @@ public final class MainActivity extends Activity {
         private static final int NATIVE_SAMPLE_RATE = 16000;
         private static final int OUTPUT_SAMPLE_RATE = 24000;
         private static final int MAX_QUEUED_CHUNKS = 64;
+        private static final int MAX_OUTPUT_QUEUED_CHUNKS = 96;
         private final Object lock = new Object();
+        private final Object outputLock = new Object();
         private final ArrayDeque<String> chunkQueue = new ArrayDeque<>();
+        private final ArrayDeque<byte[]> outputQueue = new ArrayDeque<>();
         private final AtomicBoolean running = new AtomicBoolean(false);
+        private final AtomicBoolean outputRunning = new AtomicBoolean(false);
         private AudioRecord recorder;
         private Thread readerThread;
+        private Thread outputThread;
         private Integer previousAudioMode;
         private AcousticEchoCanceler acousticEchoCanceler;
         private NoiseSuppressor noiseSuppressor;
@@ -1615,6 +1676,31 @@ public final class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void playPcm16Base64(String base64Pcm16, int sampleRateHz) {
+            if (base64Pcm16 == null || base64Pcm16.isEmpty()) return;
+            int outputSampleRate = sampleRateHz > 0 ? sampleRateHz : OUTPUT_SAMPLE_RATE;
+            byte[] pcm;
+            try {
+                pcm = Base64.decode(base64Pcm16, Base64.DEFAULT);
+            } catch (Exception e) {
+                recordDiagnostic("native_audio_output.decode_error", e.getClass().getSimpleName() + ": " + e.getMessage());
+                return;
+            }
+            if (pcm.length == 0) return;
+            synchronized (outputLock) {
+                outputQueue.addLast(pcm);
+                while (outputQueue.size() > MAX_OUTPUT_QUEUED_CHUNKS) {
+                    outputQueue.removeFirst();
+                }
+                outputLock.notifyAll();
+            }
+            if (outputRunning.compareAndSet(false, true)) {
+                outputThread = new Thread(() -> playPcmOutputLoop(outputSampleRate), "openclaw-native-pcm-output");
+                outputThread.start();
+            }
+        }
+
+        @JavascriptInterface
         public void playTestTone() {
             new Thread(() -> {
                 AudioTrack track = null;
@@ -1673,6 +1759,84 @@ public final class MainActivity extends Activity {
                     }
                 }
             }, "openclaw-native-speaker-test").start();
+        }
+
+        private void playPcmOutputLoop(int sampleRateHz) {
+            AudioTrack track = null;
+            try {
+                AudioManager audioManager = getAudioManager();
+                if (audioManager != null) {
+                    int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+                    int max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+                    if (current == 0 && max > 0) {
+                        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, Math.max(1, max / 4), 0);
+                        recordDiagnostic("native_audio_output.volume_adjusted", "music stream was muted");
+                    }
+                }
+                int minBuffer = AudioTrack.getMinBufferSize(
+                        sampleRateHz,
+                        AudioFormat.CHANNEL_OUT_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT);
+                int bufferSize = Math.max(minBuffer, sampleRateHz / 2);
+                track = new AudioTrack(
+                        AudioManager.STREAM_MUSIC,
+                        sampleRateHz,
+                        AudioFormat.CHANNEL_OUT_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                        bufferSize,
+                        AudioTrack.MODE_STREAM);
+                if (track.getState() != AudioTrack.STATE_INITIALIZED) {
+                    throw new IllegalStateException("AudioTrack failed to initialize: state=" + track.getState());
+                }
+                recordDiagnostic("native_audio_output.stream_start", "sampleRate=" + sampleRateHz + " buffer=" + bufferSize);
+                track.play();
+                int chunks = 0;
+                while (true) {
+                    byte[] chunk;
+                    synchronized (outputLock) {
+                        chunk = outputQueue.pollFirst();
+                        if (chunk == null) {
+                            try {
+                                outputLock.wait(500);
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                break;
+                            }
+                            chunk = outputQueue.pollFirst();
+                            if (chunk == null) break;
+                        }
+                    }
+                    int offset = 0;
+                    while (offset < chunk.length) {
+                        int written = track.write(chunk, offset, chunk.length - offset);
+                        if (written <= 0) {
+                            recordDiagnostic("native_audio_output.write_error", "bytes=" + written);
+                            break;
+                        }
+                        offset += written;
+                    }
+                    chunks++;
+                    if (chunks == 1 || chunks % 20 == 0) {
+                        recordDiagnostic("native_audio_output.stream_write", "chunks=" + chunks + " lastBytes=" + chunk.length);
+                    }
+                }
+                recordDiagnostic("native_audio_output.stream_done", "complete");
+            } catch (Exception e) {
+                recordDiagnostic("native_audio_output.stream_error", e.getClass().getSimpleName() + ": " + e.getMessage());
+            } finally {
+                if (track != null) {
+                    try {
+                        track.stop();
+                    } catch (Exception ignored) {
+                    }
+                    track.release();
+                }
+                synchronized (outputLock) {
+                    outputQueue.clear();
+                }
+                outputRunning.set(false);
+                outputThread = null;
+            }
         }
 
         private void readNativeAudioLoop(int samplesPerChunk) {
