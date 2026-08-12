@@ -30,7 +30,7 @@ final class OpenClawClient {
     }
 
     private static final String CLIENT_ID = "openclaw-android-dashboard";
-    private static final String CLIENT_VERSION = "1.0.43";
+    private static final String CLIENT_VERSION = "1.0.44";
     private final OkHttpClient http = new OkHttpClient.Builder()
             .pingInterval(20, TimeUnit.SECONDS)
             .connectTimeout(10, TimeUnit.SECONDS)
