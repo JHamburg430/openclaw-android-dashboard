@@ -1758,7 +1758,8 @@ public final class MainActivity extends Activity {
         private static final int MAX_OUTPUT_QUEUED_CHUNKS = 96;
         private static final double OUTPUT_GAIN = 5.0;
         private static final double TEST_TONE_AMPLITUDE = 30000.0;
-        private static final int OUTPUT_TAIL_WAIT_MS = 600;
+        private static final int OUTPUT_TAIL_WAIT_MS = 1500;
+        private static final int OUTPUT_DRAIN_WAIT_MS = 1200;
         private static final int OUTPUT_BUFFER_SECONDS = 2;
         private static final int OUTPUT_BYTES_PER_SAMPLE = 2;
         private final Object lock = new Object();
@@ -2037,7 +2038,8 @@ public final class MainActivity extends Activity {
                         recordDiagnostic("native_audio_output.stream_write", "chunks=" + chunks + " lastBytes=" + chunk.length);
                     }
                 }
-                recordDiagnostic("native_audio_output.stream_done", "complete");
+                drainPcmOutput(track, sampleRateHz, chunks);
+                recordDiagnostic("native_audio_output.stream_done", "complete chunks=" + chunks);
             } catch (Exception e) {
                 recordDiagnostic("native_audio_output.stream_error", e.getClass().getSimpleName() + ": " + e.getMessage());
             } finally {
@@ -2061,6 +2063,16 @@ public final class MainActivity extends Activity {
             int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
             int max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
             recordDiagnostic("native_audio_output.volume", "music=" + current + "/" + max + " mode=" + audioManager.getMode());
+        }
+
+        private void drainPcmOutput(AudioTrack track, int sampleRateHz, int chunks) {
+            if (track == null || chunks <= 0) return;
+            try {
+                Thread.sleep(OUTPUT_DRAIN_WAIT_MS);
+                recordDiagnostic("native_audio_output.drain", "waitMs=" + OUTPUT_DRAIN_WAIT_MS + " sampleRate=" + sampleRateHz);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
 
         private void prepareSpeakerPlaybackRoute(AudioManager audioManager, String reason) {

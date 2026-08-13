@@ -6,6 +6,7 @@ const source = readFileSync(new URL("../app/src/main/java/ai/openclaw/dashboard/
 assert.equal(source.includes("TextToSpeech"), false, "dashboard must not use Android TextToSpeech fallback for Talk output");
 assert.equal(source.includes("setStreamVolume"), false, "dashboard must not force Android media volume for Talk output");
 assert.equal(source.includes("talk.relay.tts_fallback"), false, "relay patch must not schedule text-to-speech fallback");
+assert.equal(source.includes("OUTPUT_DRAIN_WAIT_MS"), true, "native PCM output must wait for AudioTrack playback to drain");
 
 const methodStart = source.indexOf("private String buildTalkGatewayRelayPatchScript()");
 assert.notEqual(methodStart, -1, "buildTalkGatewayRelayPatchScript not found");
