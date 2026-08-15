@@ -476,11 +476,15 @@ public final class MainActivity extends Activity {
 
         LinearLayout row3 = appButtonRow();
         row3.addView(appButton("Monitor", v -> openLocalApp(8501)), new LinearLayout.LayoutParams(0, dp(46), 1));
-        row3.addView(appButton("Android Native", v -> {
+        row3.addView(appButton("Manuals RAG", v -> openLocalApp(8601)), new LinearLayout.LayoutParams(0, dp(46), 1));
+        drawer.addView(row3);
+
+        LinearLayout row4 = appButtonRow();
+        row4.addView(appButton("Android Native", v -> {
             setAppsDrawerVisible(false);
             openNativeToolsPage();
         }), new LinearLayout.LayoutParams(0, dp(46), 1));
-        drawer.addView(row3);
+        drawer.addView(row4);
 
         Button close = button("Close");
         close.setOnClickListener(v -> setAppsDrawerVisible(false));
