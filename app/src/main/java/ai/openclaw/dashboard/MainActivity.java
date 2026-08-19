@@ -518,6 +518,10 @@ public final class MainActivity extends Activity {
         setAppsDrawerVisible(false);
         try {
             String url = buildSiblingAppUrl(port);
+            if (port == 8601) {
+                webView.clearCache(true);
+                url = url + "?v=" + System.currentTimeMillis();
+            }
             recordDiagnostic("app.open", url);
             webView.stopLoading();
             webView.loadUrl(url);
