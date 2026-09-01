@@ -90,8 +90,8 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_FILE_CHOOSER = 2004;
     private static final int REQUEST_BLUETOOTH_CONNECT = 2005;
     private static final String TAG = "OpenClawDashboard";
-    private static final int APP_VERSION_CODE = 47;
-    private static final String APP_VERSION_NAME = "1.0.47";
+    private static final int APP_VERSION_CODE = 50;
+    private static final String APP_VERSION_NAME = "1.0.50";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final String NOTIFICATION_CHANNEL_ID = "openclaw_updates";
@@ -457,6 +457,12 @@ public final class MainActivity extends Activity {
         TextView title = text("Apps", 15, COLOR_TEXT_PRIMARY, true);
         title.setPadding(0, 0, 0, dp(6));
         drawer.addView(title);
+
+        Button controlsButton = appButton("Controls / Diagnostics", v -> {
+            setAppsDrawerVisible(false);
+            setChromeExpanded(true);
+        });
+        drawer.addView(controlsButton, new LinearLayout.LayoutParams(-1, dp(46)));
 
         LinearLayout row1 = appButtonRow();
         row1.addView(appButton("Control UI", v -> {
@@ -1034,11 +1040,43 @@ public final class MainActivity extends Activity {
             ValueCallback<Uri[]> callback = pendingFilePathCallback;
             pendingFilePathCallback = null;
             if (callback != null) {
-                callback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data));
+                Uri[] selected = collectSelectedFileUris(resultCode, data);
+                recordDiagnostic("file_chooser.result", "count=" + selected.length);
+                callback.onReceiveValue(selected.length == 0 ? null : selected);
             }
             return;
         }
         super.onActivityResult(requestCode, resultCode, data);
+    }
+
+    private Uri[] collectSelectedFileUris(int resultCode, Intent data) {
+        if (resultCode != RESULT_OK || data == null) return new Uri[0];
+        ArrayList<Uri> selected = new ArrayList<>();
+        if (data.getClipData() != null) {
+            for (int i = 0; i < data.getClipData().getItemCount(); i++) {
+                Uri uri = data.getClipData().getItemAt(i).getUri();
+                if (uri != null && !selected.contains(uri)) selected.add(uri);
+            }
+        }
+        Uri single = data.getData();
+        if (single != null && !selected.contains(single)) selected.add(single);
+        if (selected.isEmpty()) {
+            Uri[] parsed = WebChromeClient.FileChooserParams.parseResult(resultCode, data);
+            if (parsed != null) {
+                for (Uri uri : parsed) {
+                    if (uri != null && !selected.contains(uri)) selected.add(uri);
+                }
+            }
+        }
+        int flags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        for (Uri uri : selected) {
+            try {
+                getContentResolver().takePersistableUriPermission(uri, flags & Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            } catch (Exception ignored) {
+                // The temporary activity result grant is sufficient for providers without persistable grants.
+            }
+        }
+        return selected.toArray(new Uri[0]);
     }
 
     private void handleWebPermissionRequest(PermissionRequest request) {
@@ -1452,7 +1490,16 @@ public final class MainActivity extends Activity {
                 + "function decodePcm16(base64){var binary=atob(base64||'');var bytes=binary.length;var samples=new Float32Array(bytes/2);for(var i=0,j=0;i<bytes;i+=2,j++){var value=(binary.charCodeAt(i)&255)|((binary.charCodeAt(i+1)&255)<<8);if(value&32768)value-=65536;samples[j]=Math.max(-1,Math.min(1,value/32768));}return samples;}"
                 + "function resampleLinear(input,fromRate,toRate){if(!input||!input.length||!fromRate||!toRate||fromRate===toRate)return input;var ratio=toRate/fromRate;var outLength=Math.max(1,Math.round(input.length*ratio));var output=new Float32Array(outLength);for(var i=0;i<outLength;i++){var position=i/ratio;var index=Math.floor(position);var next=Math.min(index+1,input.length-1);var weight=position-index;output[i]=input[index]+(input[next]-input[index])*weight;}return output;}"
                 + "var mediaDevices=navigator.mediaDevices||(navigator.mediaDevices={});"
-                + "var nativeStreamFactory=function(){return Promise.resolve({__openclawNativeAudio:true,getAudioTracks:function(){return[{readyState:'live',stop:function(){try{bridge.stopCapture();}catch(_){}}}];},getTracks:function(){return this.getAudioTracks();}});};"
+                + "function makeNativeTrack(){"
+                + "var listeners={};"
+                + "var track={kind:'audio',enabled:true,muted:false,readyState:'live'};"
+                + "track.addEventListener=function(type,listener,options){if(!listener)return;type=String(type||'');var list=listeners[type]||(listeners[type]=[]);list.push(listener);var signal=options&&typeof options==='object'?options.signal:null;if(signal&&typeof signal.addEventListener==='function'){var remove=function(){track.removeEventListener(type,listener);};signal.addEventListener('abort',remove,{once:true});}};"
+                + "track.removeEventListener=function(type,listener){var list=listeners[String(type||'')]||[];var index=list.indexOf(listener);if(index>=0)list.splice(index,1);};"
+                + "track.dispatchEvent=function(event){var type=event&&event.type?String(event.type):'';var list=(listeners[type]||[]).slice();for(var i=0;i<list.length;i++){try{if(typeof list[i]==='function'){list[i].call(track,event);}else if(list[i]&&typeof list[i].handleEvent==='function'){list[i].handleEvent(event);}}catch(error){diag('native_audio.track.listener_error',{'message':String(error)});}}return true;};"
+                + "track.stop=function(){if(track.readyState==='ended')return;track.readyState='ended';try{bridge.stopCapture();}catch(_){}track.dispatchEvent({type:'ended',target:track});};"
+                + "return track;"
+                + "}"
+                + "var nativeStreamFactory=function(){var track=makeNativeTrack();return Promise.resolve({__openclawNativeAudio:true,active:true,getAudioTracks:function(){return[track];},getTracks:function(){return[track];},addEventListener:function(){},removeEventListener:function(){}});};"
                 + "mediaDevices.getUserMedia=function(constraints){diag('native_audio.gum_override',constraints||{});return nativeStreamFactory();};"
                 + "var AudioContextCtor=window.AudioContext||window.webkitAudioContext;"
                 + "if(!AudioContextCtor)return;"
