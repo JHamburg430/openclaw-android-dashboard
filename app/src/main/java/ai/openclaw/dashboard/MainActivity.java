@@ -16,6 +16,7 @@ import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.drawable.GradientDrawable;
+import android.media.AudioAttributes;
 import android.media.AudioManager;
 import android.media.AudioFormat;
 import android.media.AudioDeviceInfo;
@@ -90,8 +91,8 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_FILE_CHOOSER = 2004;
     private static final int REQUEST_BLUETOOTH_CONNECT = 2005;
     private static final String TAG = "OpenClawDashboard";
-    private static final int APP_VERSION_CODE = 51;
-    private static final String APP_VERSION_NAME = "1.0.51";
+    private static final int APP_VERSION_CODE = 52;
+    private static final String APP_VERSION_NAME = "1.0.52";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final String NOTIFICATION_CHANNEL_ID = "openclaw_updates";
@@ -1828,7 +1829,7 @@ public final class MainActivity extends Activity {
         private Thread outputThread;
         private Integer previousAudioMode;
         private AudioDeviceInfo previousCommunicationDevice;
-        private boolean bluetoothRouteActive;
+        private boolean communicationRouteActive;
         private long lastPcmOutputRequestedAtMs;
         private AcousticEchoCanceler acousticEchoCanceler;
         private NoiseSuppressor noiseSuppressor;
@@ -2026,7 +2027,7 @@ public final class MainActivity extends Activity {
                         }
                         track.release();
                     }
-                    restoreBluetoothAudioRouteIfIdle();
+                    restoreCommunicationAudioRouteIfIdle();
                 }
             }, threadName).start();
         }
@@ -2048,13 +2049,7 @@ public final class MainActivity extends Activity {
                         AudioFormat.ENCODING_PCM_16BIT);
                 int targetBuffer = sampleRateHz * OUTPUT_BYTES_PER_SAMPLE * OUTPUT_BUFFER_SECONDS;
                 int bufferSize = Math.max(minBuffer, targetBuffer);
-                track = new AudioTrack(
-                        AudioManager.STREAM_MUSIC,
-                        sampleRateHz,
-                        AudioFormat.CHANNEL_OUT_MONO,
-                        AudioFormat.ENCODING_PCM_16BIT,
-                        bufferSize,
-                        AudioTrack.MODE_STREAM);
+                track = createCommunicationAudioTrack(sampleRateHz, bufferSize);
                 if (track.getState() != AudioTrack.STATE_INITIALIZED) {
                     throw new IllegalStateException("AudioTrack failed to initialize: state=" + track.getState());
                 }
@@ -2110,14 +2105,37 @@ public final class MainActivity extends Activity {
                 }
                 outputRunning.set(false);
                 outputThread = null;
-                restoreBluetoothAudioRouteIfIdle();
+                restoreCommunicationAudioRouteIfIdle();
             }
         }
 
         private void logPlaybackStreamVolume(AudioManager audioManager) {
-            int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
-            int max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
-            recordDiagnostic("native_audio_output.volume", "music=" + current + "/" + max + " mode=" + audioManager.getMode());
+            int musicCurrent = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+            int musicMax = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+            int callCurrent = audioManager.getStreamVolume(AudioManager.STREAM_VOICE_CALL);
+            int callMax = audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL);
+            recordDiagnostic("native_audio_output.volume",
+                    "music=" + musicCurrent + "/" + musicMax
+                            + " call=" + callCurrent + "/" + callMax
+                            + " mode=" + audioManager.getMode());
+        }
+
+        private AudioTrack createCommunicationAudioTrack(int sampleRateHz, int bufferSize) {
+            AudioAttributes attributes = new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build();
+            AudioFormat format = new AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(sampleRateHz)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .build();
+            return new AudioTrack.Builder()
+                    .setAudioAttributes(attributes)
+                    .setAudioFormat(format)
+                    .setBufferSizeInBytes(bufferSize)
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .build();
         }
 
         private void drainPcmOutput(AudioTrack track, int sampleRateHz, int chunks) {
@@ -2133,11 +2151,22 @@ public final class MainActivity extends Activity {
         private void prepareSpeakerPlaybackRoute(AudioManager audioManager, String reason) {
             if (audioManager == null) return;
             try {
-                if (Build.VERSION.SDK_INT >= 31) {
-                    audioManager.clearCommunicationDevice();
+                AudioDeviceInfo speaker = null;
+                for (AudioDeviceInfo device : audioManager.getAvailableCommunicationDevices()) {
+                    if (device.getType() == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER && device.isSink()) {
+                        speaker = device;
+                        break;
+                    }
                 }
-                audioManager.setSpeakerphoneOn(true);
-                recordDiagnostic("native_audio_output.route", "speaker reason=" + reason);
+                if (speaker == null) {
+                    recordDiagnostic("native_audio_output.route_error", "built-in speaker unavailable reason=" + reason);
+                    return;
+                }
+                boolean selected = selectCommunicationDevice(audioManager, speaker);
+                recordDiagnostic("native_audio_output.route",
+                        (selected ? "speaker selected " : "speaker select_failed ")
+                                + describeAudioDevice(speaker)
+                                + " reason=" + reason);
             } catch (Exception e) {
                 recordDiagnostic("native_audio_output.route_error", e.getClass().getSimpleName() + ": " + e.getMessage());
             }
@@ -2212,7 +2241,7 @@ public final class MainActivity extends Activity {
                 readerThread = null;
             }
             restoreAudioMode();
-            restoreBluetoothAudioRouteIfIdle();
+            restoreCommunicationAudioRouteIfIdle();
             recordDiagnostic("native_audio_bridge.stop", "stopped");
         }
 
@@ -2248,11 +2277,7 @@ public final class MainActivity extends Activity {
                     recordDiagnostic("native_audio_route.bluetooth", "none_connected reason=" + reason);
                     return null;
                 }
-                if (previousCommunicationDevice == null) {
-                    previousCommunicationDevice = audioManager.getCommunicationDevice();
-                }
-                boolean selected = audioManager.setCommunicationDevice(preferred);
-                bluetoothRouteActive = selected || bluetoothRouteActive;
+                boolean selected = selectCommunicationDevice(audioManager, preferred);
                 recordDiagnostic("native_audio_route.bluetooth",
                         (selected ? "selected " : "select_failed ")
                                 + describeAudioDevice(preferred)
@@ -2291,6 +2316,15 @@ public final class MainActivity extends Activity {
             return fallback;
         }
 
+        private boolean selectCommunicationDevice(AudioManager audioManager, AudioDeviceInfo device) {
+            if (!communicationRouteActive) {
+                previousCommunicationDevice = audioManager.getCommunicationDevice();
+            }
+            boolean selected = audioManager.setCommunicationDevice(device);
+            communicationRouteActive = selected || communicationRouteActive;
+            return selected;
+        }
+
         private boolean isBluetoothAudioDevice(AudioDeviceInfo device) {
             int type = device.getType();
             return type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
@@ -2307,8 +2341,8 @@ public final class MainActivity extends Activity {
                     + " name=" + name;
         }
 
-        private void restoreBluetoothAudioRouteIfIdle() {
-            if (running.get() || outputRunning.get() || !bluetoothRouteActive) return;
+        private void restoreCommunicationAudioRouteIfIdle() {
+            if (running.get() || outputRunning.get() || !communicationRouteActive) return;
             if (!hasBluetoothConnectPermission()) return;
             AudioManager audioManager = getAudioManager();
             if (audioManager == null) return;
@@ -2324,7 +2358,7 @@ public final class MainActivity extends Activity {
                 recordDiagnostic("native_audio_route.restore", e.getClass().getSimpleName() + ": " + e.getMessage());
             } finally {
                 previousCommunicationDevice = null;
-                bluetoothRouteActive = false;
+                communicationRouteActive = false;
             }
         }
 
@@ -2336,7 +2370,7 @@ public final class MainActivity extends Activity {
                 outputQueue.clear();
                 outputLock.notifyAll();
             }
-            restoreBluetoothAudioRouteIfIdle();
+            restoreCommunicationAudioRouteIfIdle();
         }
 
         private AudioManager getAudioManager() {

@@ -7,6 +7,10 @@ assert.equal(source.includes("TextToSpeech"), false, "dashboard must not use And
 assert.equal(source.includes("setStreamVolume"), false, "dashboard must not force Android media volume for Talk output");
 assert.equal(source.includes("talk.relay.tts_fallback"), false, "relay patch must not schedule text-to-speech fallback");
 assert.equal(source.includes("OUTPUT_DRAIN_WAIT_MS"), true, "native PCM output must wait for AudioTrack playback to drain");
+assert.equal(source.includes("AudioAttributes.USAGE_VOICE_COMMUNICATION"), true, "Talk output must use the Android communication audio route");
+assert.equal(source.includes("AudioAttributes.CONTENT_TYPE_SPEECH"), true, "Talk output must identify conversational speech");
+assert.equal(source.includes("getAvailableCommunicationDevices()"), true, "speaker routing must use Android communication devices");
+assert.equal(source.includes("setCommunicationDevice(device)"), true, "Talk must explicitly select its communication output device");
 
 const methodStart = source.indexOf("private String buildTalkGatewayRelayPatchScript()");
 assert.notEqual(methodStart, -1, "buildTalkGatewayRelayPatchScript not found");
