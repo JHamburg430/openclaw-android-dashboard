@@ -228,22 +228,17 @@ class LiveConversationService:
         return text
 
     async def agent_reply(self, text: str) -> str:
-        prompt = (
-            "Realtime Live Conversation request. Reply in one or two short, natural spoken sentences unless "
-            "the user explicitly asks for detail. Use the normal agent tools and context when needed.\n\nUser: " + text
-        )
         async with self.agent_lock:
             process = await asyncio.create_subprocess_exec(
                 DEFAULT_NODE_COMMAND, DEFAULT_OPENCLAW_MODULE, "agent",
                 "--session-key", self.session_key,
-                "--message", prompt,
-                "--thinking", "minimal",
-                "--timeout", "120",
+                "--message", text,
+                "--timeout", "600",
                 "--json",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=130)
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=610)
         if process.returncode != 0:
             raise RuntimeError(stderr.decode("utf-8", errors="replace").strip() or "Agent request failed")
         payload = json.loads(stdout)

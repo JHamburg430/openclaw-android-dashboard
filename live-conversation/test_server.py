@@ -1,8 +1,9 @@
 import unittest
 from datetime import datetime
+from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
-from server import DEFAULT_NODE_COMMAND, DEFAULT_OPENCLAW_MODULE, extract_agent_text, render_page, route_simple
+from server import DEFAULT_NODE_COMMAND, DEFAULT_OPENCLAW_MODULE, LiveConversationService, extract_agent_text, render_page, route_simple
 
 
 class RoutingTests(unittest.TestCase):
@@ -27,6 +28,24 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(extract_agent_text(payload), "Ready.")
         self.assertTrue(DEFAULT_NODE_COMMAND.endswith("/node"))
         self.assertTrue(DEFAULT_OPENCLAW_MODULE.endswith("/openclaw.mjs"))
+
+    def test_agent_receives_the_unmodified_transcript(self):
+        transcript = "Check the logs, find the bottleneck, and fix it."
+        process = AsyncMock()
+        process.returncode = 0
+        process.communicate.return_value = (b'{"text":"Done."}', b"")
+
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.32)
+            with patch("server.asyncio.create_subprocess_exec", AsyncMock(return_value=process)) as create:
+                self.assertEqual(await service.agent_reply(transcript), "Done.")
+                command = create.await_args.args
+                self.assertEqual(command[command.index("--message") + 1], transcript)
+                self.assertNotIn("--thinking", command)
+                self.assertEqual(command[command.index("--timeout") + 1], "600")
+
+        import asyncio
+        asyncio.run(run_test())
 
     def test_page_uses_native_audio_and_same_origin_websocket(self):
         page = render_page()

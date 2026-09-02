@@ -19,6 +19,11 @@ The direct route is deliberately conservative: if a request might need current
 information, personal context, tools, memory, judgment, or side effects, it is
 escalated to the normal agent.
 
+The bridge forwards escalated transcripts without adding response-length or
+reasoning instructions. Voice response policy belongs to the gateway agent's
+workspace instructions so complex requests can finish normal tool-backed work
+before the final answer is shortened for speech.
+
 ## Install and run
 
 ```bash
