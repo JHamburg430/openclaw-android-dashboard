@@ -64,22 +64,39 @@ assert.equal(typeof track.dispatchEvent, "function");
 
 const liveStream = await navigator.mediaDevices.getUserMedia({ audio: true });
 const context = new FakeAudioContext();
-context.sampleRate = 16000;
+context.sampleRate = 24000;
 const processor = context.createScriptProcessor(4096, 1, 1);
 const frames = [];
-processor.onaudioprocess = (event) => frames.push(event.inputBuffer.getChannelData(0));
+let nowMs = 0;
+let maxPendingRequests = 0;
+let pendingRequestAcks = [];
+processor.onaudioprocess = (event) => {
+  frames.push(event.inputBuffer.getChannelData(0));
+  pendingRequestAcks = pendingRequestAcks.filter((ackAtMs) => ackAtMs > nowMs);
+  pendingRequestAcks.push(nowMs + 811);
+  maxPendingRequests = Math.max(maxPendingRequests, pendingRequestAcks.length);
+};
 context.createMediaStreamSource(liveStream).connect(processor);
 
 const tenMsPcm16 = Buffer.alloc(160 * 2).toString("base64");
-for (let index = 0; index < 25; index += 1) {
+for (let index = 0; index < 34; index += 1) {
   nativeChunks.push(tenMsPcm16);
+  nowMs += 10;
   intervalCallback();
 }
 assert.equal(frames.length, 0, "10 ms chunks must not become individual Talk requests");
 nativeChunks.push(tenMsPcm16);
+nowMs += 10;
 intervalCallback();
 assert.equal(frames.length, 1);
-assert.equal(frames[0].length, 4096);
+assert.equal(frames[0].length, 8192);
+
+for (let index = 0; index < 300; index += 1) {
+  nativeChunks.push(tenMsPcm16);
+  nowMs += 10;
+  intervalCallback();
+}
+assert.ok(maxPendingRequests < 4, `811 ms gateway latency must stay below the four-request guard; saw ${maxPendingRequests}`);
 processor.disconnect();
 
-console.log("native input bridge implements the MediaStreamTrack contract and emits paced 4096-sample Talk frames");
+console.log("native input bridge implements the MediaStreamTrack contract and emits latency-tolerant 8192-sample Talk frames");
