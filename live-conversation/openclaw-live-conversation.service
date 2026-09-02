@@ -1,0 +1,13 @@
+[Unit]
+Description=OpenClaw Pipecat Live Conversation
+After=network-online.target openclaw-gateway.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/john/openclaw-android-dashboard/live-conversation
+ExecStart=/home/john/.openclaw/tools/pipecat-live-conversation/venv/bin/python /home/john/openclaw-android-dashboard/live-conversation/server.py --port 8790
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

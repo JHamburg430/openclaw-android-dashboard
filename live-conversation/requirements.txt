@@ -1,0 +1,1 @@
+pipecat-ai[whisper]==1.8.1

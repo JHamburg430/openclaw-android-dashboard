@@ -91,10 +91,11 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_FILE_CHOOSER = 2004;
     private static final int REQUEST_BLUETOOTH_CONNECT = 2005;
     private static final String TAG = "OpenClawDashboard";
-    private static final int APP_VERSION_CODE = 53;
-    private static final String APP_VERSION_NAME = "1.0.53";
+    private static final int APP_VERSION_CODE = 54;
+    private static final String APP_VERSION_NAME = "1.0.54";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
+    private static final int LIVE_CONVERSATION_PORT = 8790;
     private static final String NOTIFICATION_CHANNEL_ID = "openclaw_updates";
     private static final int NOTIFICATION_ID = 41001;
     private static final String PREF_NOTIFICATION_COUNT = "notification_count";
@@ -541,18 +542,8 @@ public final class MainActivity extends Activity {
     }
 
     private void openLiveConversation() {
-        try {
-            connectDashboardNode();
-            setConnectedUiVisible(true);
-            setChromeExpanded(false);
-            webView.stopLoading();
-            webView.loadDataWithBaseURL(buildNativePageBaseUrl("live-conversation"), buildLiveConversationHtml(), "text/html", "UTF-8", null);
-            statusText.setText("Live Conversation native page loaded.");
-            recordDiagnostic("live_conversation.open", "native_page");
-        } catch (Exception e) {
-            statusText.setText("Live Conversation unavailable: " + e.getMessage());
-            recordDiagnostic("live_conversation.failed", e.getMessage());
-        }
+        recordDiagnostic("live_conversation.open", "pipecat_port=" + LIVE_CONVERSATION_PORT);
+        openLocalApp(LIVE_CONVERSATION_PORT);
     }
 
     private void openNativeToolsPage() {
