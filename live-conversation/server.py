@@ -10,6 +10,7 @@ import base64
 from dataclasses import asdict, dataclass
 from datetime import datetime
 import json
+import logging
 import operator
 import os
 from pathlib import Path
@@ -18,6 +19,8 @@ import struct
 import time
 from typing import Any
 from zoneinfo import ZoneInfo
+
+LOGGER = logging.getLogger("live_conversation")
 
 from aiohttp import WSMsgType, web
 from pipecat.frames.frames import TranscriptionFrame
@@ -278,6 +281,7 @@ class LiveConversationService:
             tts_started = time.perf_counter()
             pcm = await self.tts.synthesize(reply)
             metrics.tts_ms = round((time.perf_counter() - tts_started) * 1000)
+            LOGGER.info("response_ready id=%s route=%s chars=%d pcm_bytes=%d tts_ms=%d", response_id, metrics.route, len(reply), len(pcm), metrics.tts_ms)
             await socket.send_json({"type": "output_audio_buffer.started", "responseId": response_id})
             chunk_bytes = OUTPUT_SAMPLE_RATE * 2 // 10
             for offset in range(0, len(pcm), chunk_bytes):
@@ -304,9 +308,10 @@ html,body{margin:0;min-height:100%;background:#060a10;color:#f4f8fc;font-family:
 const state=document.getElementById('state'),bar=document.getElementById('bar'),user=document.getElementById('user'),assistant=document.getElementById('assistant'),route=document.getElementById('route'),metrics=document.getElementById('metrics');let ws,timer,recording=false,awaitingResponse=false,responseActive=false,speechMs=0,silenceMs=0,candidateSpeechMs=0,pre=[];
 function rms(b64){const s=atob(b64||'');let sum=0,n=0;for(let i=0;i+1<s.length;i+=2){let v=(s.charCodeAt(i)&255)|((s.charCodeAt(i+1)&255)<<8);if(v&32768)v-=65536;const f=v/32768;sum+=f*f;n++}return n?Math.sqrt(sum/n):0}
 function send(x){if(ws&&ws.readyState===1)ws.send(JSON.stringify(x))}
+function report(event,detail){send({type:'client_event',event:event,detail:String(detail||'')})}
 function begin(){if(recording||awaitingResponse)return;recording=true;candidateSpeechMs=0;speechMs=0;silenceMs=0;if(responseActive){responseActive=false;try{OpenClawNativeAudio.interruptAgentResponsePlayback()}catch(e){}send({type:'input_audio_buffer.speech_started'})}send({type:'start'});for(const audioBase64 of pre)send({type:'audio',audioBase64});pre=[];state.textContent='Listening…'}
 function tick(){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>20)pre.shift();if(awaitingResponse){candidateSpeechMs=0;return}candidateSpeechMs=level>=.006?candidateSpeechMs+20:0;if(candidateSpeechMs>=200)begin();return}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=20;silenceMs=0}else silenceMs+=20;if(speechMs>=200&&silenceMs>=600){recording=false;awaitingResponse=true;candidateSpeechMs=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}}
-function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='state')state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.type==='transcript')user.textContent=m.text;if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route}if(m.type==='output_audio_buffer.started'){awaitingResponse=false;responseActive=true;candidateSpeechMs=0;pre=[];OpenClawNativeAudio.prepareAgentResponsePlayback()}if(m.type==='response.output_audio.delta')OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(m.type==='response.output_audio.done'){responseActive=false;candidateSpeechMs=0;pre=[]}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;state.textContent='Error';assistant.textContent=m.message}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
+function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='state')state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.type==='transcript')user.textContent=m.text;if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){awaitingResponse=false;responseActive=true;candidateSpeechMs=0;pre=[];audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){responseActive=false;candidateSpeechMs=0;pre=[];report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
 function stop(){if(timer)clearInterval(timer);timer=null;try{OpenClawNativeAudio.stopCapture()}catch(e){}if(ws)ws.close();ws=null;recording=false;awaitingResponse=false;responseActive=false;candidateSpeechMs=0;bar.style.width='0%';state.textContent='Stopped'}
 document.getElementById('start').onclick=start;document.getElementById('stop').onclick=stop;window.addEventListener('pagehide',stop);
 </script></body></html>"""
@@ -344,6 +349,8 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
             turn = bytes(audio)
             audio.clear()
             active_task = asyncio.create_task(service.process_turn(socket, turn))
+        elif kind == "client_event":
+            LOGGER.info("client_event event=%s detail=%s", payload.get("event", ""), payload.get("detail", ""))
     if active_task and not active_task.done():
         active_task.cancel()
     return socket
@@ -365,6 +372,7 @@ async def build_app(args: argparse.Namespace) -> web.Application:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)

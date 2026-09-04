@@ -66,6 +66,8 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("if(awaitingResponse){candidateSpeechMs=0;return}", page)
         self.assertIn("candidateSpeechMs>=200", page)
         self.assertIn("responseActive=true", page)
+        self.assertIn("first_pcm_enqueued", page)
+        self.assertIn("pcm_delivery_done", page)
 
 if __name__ == "__main__":
     unittest.main()
