@@ -95,7 +95,7 @@ def route_simple(text: str, now: datetime | None = None) -> str | None:
         return "Yes. I can hear you clearly."
     if re.search(r"\b(?:who are you|what are you)\b", normalized):
         return "I'm your OpenClaw voice assistant."
-    if re.search(r"\b(?:what(?:'s| is) the time|what time is it|current time)\b", text.lower()):
+    if re.search(r"\b(?:what(?:'s| is) the time|what time (?:is it|it is)|current time)\b", text.lower()):
         return f"It is {clock.strftime('%-I:%M %p')}."
     if re.search(r"\b(?:what(?:'s| is) the date|what day is it|today(?:'s| is) date|current date)\b", text.lower()):
         return f"Today is {clock.strftime('%A, %B %-d')}."
@@ -124,6 +124,27 @@ def route_simple(text: str, now: datetime | None = None) -> str | None:
         except (ArithmeticError, SyntaxError, ValueError):
             return None
     return None
+
+
+def should_acknowledge(text: str) -> bool:
+    """Return true only when a request clearly implies non-trivial agent work."""
+    lowered = text.lower()
+    action = re.search(
+        r"\b(?:check|inspect|investigate|research|look up|search|analy[sz]e|review|"
+        r"diagnose|debug|fix|update|change|build|create|implement|deploy|publish|"
+        r"install|move|send|remember|compare|summarize|report)\b",
+        lowered,
+    )
+    scope = re.search(
+        r"\b(?:app|project|repository|repo|logs?|calendar|email|messages?|files?|"
+        r"tests?|release|latest|current|progress|status|issue|problem|bottleneck)\b",
+        lowered,
+    )
+    explicit_depth = re.search(
+        r"\b(?:cite sources|step by step|in detail|thoroughly|everything|all of)\b",
+        lowered,
+    )
+    return bool(explicit_depth or (action and scope))
 
 
 def extract_agent_text(payload: Any) -> str:
@@ -305,14 +326,15 @@ class LiveConversationService:
                 metrics.route = "direct"
             else:
                 metrics.route = "agent"
-                acknowledgment_id = f"ack-{time.monotonic_ns()}"
-                await self.send_spoken_response(
-                    socket,
-                    "I'll check and let you know.",
-                    "agent",
-                    acknowledgment_id,
-                    message_type="acknowledgment",
-                )
+                if should_acknowledge(transcript):
+                    acknowledgment_id = f"ack-{time.monotonic_ns()}"
+                    await self.send_spoken_response(
+                        socket,
+                        "I'll check and let you know.",
+                        "agent",
+                        acknowledgment_id,
+                        message_type="acknowledgment",
+                    )
                 await socket.send_json({"type": "state", "state": "thinking", "route": "agent"})
                 agent_started = time.perf_counter()
                 reply = await self.agent_reply(transcript)

@@ -10,6 +10,7 @@ from server import (
     extract_agent_text,
     render_page,
     route_simple,
+    should_acknowledge,
 )
 
 
@@ -23,12 +24,19 @@ class RoutingTests(unittest.TestCase):
 
     def test_direct_time_date_and_arithmetic(self):
         self.assertEqual(route_simple("What time is it?", self.now), "It is 12:34 PM.")
+        self.assertEqual(route_simple("What time it is?", self.now), "It is 12:34 PM.")
         self.assertEqual(route_simple("What is 12 plus 7?", self.now), "The answer is 19.")
 
     def test_complex_requests_escalate(self):
         self.assertIsNone(route_simple("Check my calendar and move tomorrow's meeting.", self.now))
         self.assertIsNone(route_simple("Explain the latest OpenClaw release and cite sources.", self.now))
         self.assertIsNone(route_simple("Remember that I prefer morning meetings.", self.now))
+
+    def test_acknowledgment_is_only_for_nontrivial_work(self):
+        self.assertTrue(should_acknowledge("Check the RAG app and report progress."))
+        self.assertTrue(should_acknowledge("Investigate the logs and fix the problem."))
+        self.assertFalse(should_acknowledge("What time it is?"))
+        self.assertFalse(should_acknowledge("Who wrote The Hobbit?"))
 
     def test_agent_json_extraction(self):
         payload = {"result": {"payloads": [{"text": "Ready."}]}}
