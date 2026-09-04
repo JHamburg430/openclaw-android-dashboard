@@ -102,7 +102,7 @@ class RoutingTests(unittest.TestCase):
         from server import PersistentTtsWorker
 
         default = inspect.signature(PersistentTtsWorker).parameters["speed"].default
-        self.assertEqual(default, 0.72)
+        self.assertEqual(default, 0.85)
 
     def test_long_spoken_text_is_split_on_natural_boundaries(self):
         text = "First sentence. " + ("A longer clause with several words, " * 8) + "finished."

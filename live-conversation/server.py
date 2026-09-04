@@ -135,7 +135,7 @@ def split_spoken_text(text: str, max_chars: int = 180) -> list[str]:
 
 
 class PersistentTtsWorker:
-    def __init__(self, command: str, runtime_dir: str, model_dir: str, speed: float = 0.72):
+    def __init__(self, command: str, runtime_dir: str, model_dir: str, speed: float = 0.85):
         self.command = command
         self.runtime_dir = runtime_dir
         self.model_dir = model_dir
@@ -487,7 +487,7 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--session-key", default=DEFAULT_SESSION_KEY)
-    parser.add_argument("--tts-speed", type=float, default=0.72)
+    parser.add_argument("--tts-speed", type=float, default=0.85)
     args = parser.parse_args()
     web.run_app(build_app(args), host=args.host, port=args.port, print=None)
 
