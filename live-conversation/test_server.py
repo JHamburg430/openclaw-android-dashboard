@@ -118,7 +118,7 @@ class RoutingTests(unittest.TestCase):
         text = "- **294/299** passed — **98.33%**. [Details](https://example.com)"
         self.assertEqual(
             normalize_spoken_text(text),
-            "Next, 294 out of 299 passed. 98.33 percent. Details",
+            "294 out of 299 passed. 98 point 33 percent. Details",
         )
 
     def test_dates_are_spoken_naturally(self):
@@ -129,6 +129,31 @@ class RoutingTests(unittest.TestCase):
 
     def test_invalid_dates_are_left_unchanged(self):
         self.assertEqual(normalize_spoken_text("Build 2026-99-42."), "Build 2026-99-42.")
+
+    def test_dates_with_short_years_and_iso_times_are_spoken_naturally(self):
+        self.assertEqual(
+            normalize_spoken_text("Runs 9/4/26; published 2026-09-04T15:07:09Z."),
+            "Runs September fourth, twenty twenty-six; published September fourth, twenty twenty-six at 3 oh seven P M and nine seconds.",
+        )
+
+    def test_named_dates_and_older_years_are_spoken_naturally(self):
+        self.assertEqual(
+            normalize_spoken_text("Opened Sep. 4, 2026; archived 21 October 1998."),
+            "Opened September fourth, twenty twenty-six; archived October twenty-first, nineteen ninety-eight.",
+        )
+
+    def test_technical_display_text_is_made_speakable(self):
+        text = "## Results\n- v1.0.59: >=250 ms\n- 8/10 passed | 4 GB\nSee https://example.com/raw"
+        self.assertEqual(
+            normalize_spoken_text(text),
+            "Results. version 1 point 0 point 59: at least 250 milliseconds. 8 out of 10 passed. 4 GB See",
+        )
+
+    def test_fenced_code_is_not_read_aloud(self):
+        self.assertEqual(
+            normalize_spoken_text("Use this example:\n```python\nprint('hello')\n```\nThen continue."),
+            "Use this example: Then continue.",
+        )
 
     def test_long_spoken_text_is_split_on_natural_boundaries(self):
         text = "First sentence. " + ("A longer clause with several words, " * 8) + "finished."

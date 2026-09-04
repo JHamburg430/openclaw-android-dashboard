@@ -125,6 +125,18 @@ _ORDINAL_UNDER_20 = (
     "eighth", "ninth", "tenth", "eleventh", "twelfth", "thirteenth", "fourteenth",
     "fifteenth", "sixteenth", "seventeenth", "eighteenth", "nineteenth",
 )
+_MONTHS = {
+    name.lower(): index
+    for index, names in enumerate(
+        (
+            (), ("January", "Jan"), ("February", "Feb"), ("March", "Mar"),
+            ("April", "Apr"), ("May",), ("June", "Jun"), ("July", "Jul"),
+            ("August", "Aug"), ("September", "Sep", "Sept"), ("October", "Oct"),
+            ("November", "Nov"), ("December", "Dec"),
+        )
+    )
+    for name in names
+}
 
 
 def _cardinal_under_100(value: int) -> str:
@@ -148,6 +160,11 @@ def _spoken_year(value: int) -> str:
         return "two thousand" if value == 2000 else f"two thousand {_CARDINAL_UNDER_20[value - 2000]}"
     if 2010 <= value <= 2099:
         return f"twenty {_cardinal_under_100(value - 2000)}"
+    if 1000 <= value <= 1999:
+        century, remainder = divmod(value, 100)
+        if not remainder:
+            return f"{_cardinal_under_100(century)} hundred"
+        return f"{_cardinal_under_100(century)} {_cardinal_under_100(remainder)}"
     return str(value)
 
 
@@ -159,12 +176,30 @@ def _spoken_date(year: int, month: int, day: int) -> str | None:
     return f"{parsed.strftime('%B')} {_ordinal_day(day)}, {_spoken_year(year)}"
 
 
+def _spoken_time(hour: int, minute: int, second: int | None = None) -> str | None:
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59 or (second is not None and not 0 <= second <= 59):
+        return None
+    period = "A M" if hour < 12 else "P M"
+    display_hour = hour % 12 or 12
+    if minute == 0:
+        rendered = f"{display_hour} {period}"
+    elif minute < 10:
+        rendered = f"{display_hour} oh {_CARDINAL_UNDER_20[minute]} {period}"
+    else:
+        rendered = f"{display_hour} {_cardinal_under_100(minute)} {period}"
+    if second:
+        rendered += f" and {_cardinal_under_100(second)} seconds"
+    return rendered
+
+
 def normalize_spoken_text(text: str) -> str:
     """Convert display-oriented Markdown and compact metrics into natural speech."""
     spoken = text
     # Preserve link labels while dropping destinations that are awkward to read aloud.
     spoken = re.sub(r"!?\[([^\]]+)\]\([^\)]+\)", r"\1", spoken)
-    spoken = re.sub(r"```(?:\w+)?\s*|```", " ", spoken)
+    # Source blocks are useful on screen but should not be dictated symbol by symbol.
+    spoken = re.sub(r"```[^\n]*\n.*?```", " ", spoken, flags=re.DOTALL)
+    spoken = re.sub(r"https?://\S+", " ", spoken)
     spoken = re.sub(r"(?<!\w)[*_~`]+|[*_~`]+(?!\w)", "", spoken)
     # Dates should sound like dates, not arithmetic or digit sequences.
     def replace_iso_date(match: re.Match[str]) -> str:
@@ -172,18 +207,73 @@ def normalize_spoken_text(text: str) -> str:
         return rendered or match.group(0)
 
     def replace_us_date(match: re.Match[str]) -> str:
-        rendered = _spoken_date(int(match.group(3)), int(match.group(1)), int(match.group(2)))
+        year = int(match.group(3))
+        if year < 100:
+            year += 2000 if year < 70 else 1900
+        rendered = _spoken_date(year, int(match.group(1)), int(match.group(2)))
+        return rendered or match.group(0)
+
+    def replace_time(match: re.Match[str]) -> str:
+        rendered = _spoken_time(
+            int(match.group(1)), int(match.group(2)), int(match.group(3)) if match.group(3) else None
+        )
+        return rendered or match.group(0)
+
+    def replace_named_date(match: re.Match[str]) -> str:
+        month = _MONTHS[match.group(1).lower()]
+        year = int(match.group(3))
+        rendered = _spoken_date(year, month, int(match.group(2)))
+        return rendered or match.group(0)
+
+    def replace_day_first_date(match: re.Match[str]) -> str:
+        month = _MONTHS[match.group(2).lower()]
+        year = int(match.group(3))
+        rendered = _spoken_date(year, month, int(match.group(1)))
         return rendered or match.group(0)
 
     spoken = re.sub(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)", replace_iso_date, spoken)
-    spoken = re.sub(r"(?<!\d)(\d{1,2})/(\d{1,2})/(\d{4})(?!\d)", replace_us_date, spoken)
+    spoken = re.sub(r"(?<!\d)(\d{1,2})/(\d{1,2})/(\d{2}|\d{4})(?!\d)", replace_us_date, spoken)
+    month_names = "|".join(sorted((re.escape(name) for name in _MONTHS), key=len, reverse=True))
+    spoken = re.sub(
+        rf"\b({month_names})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})\b",
+        replace_named_date,
+        spoken,
+        flags=re.IGNORECASE,
+    )
+    spoken = re.sub(
+        rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({month_names})\.?[,]?\s+(\d{{4}})\b",
+        replace_day_first_date,
+        spoken,
+        flags=re.IGNORECASE,
+    )
+    spoken = re.sub(
+        r"(?:T|\s+at\s+)([01]?\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?(?:Z|[+-]\d{2}:?\d{2})?",
+        lambda match: " at " + replace_time(match),
+        spoken,
+    )
     spoken = re.sub(r"(?<!\w)(\d[\d,]*(?:\.\d+)?)\s*/\s*(\d[\d,]*(?:\.\d+)?)(?!\w)", r"\1 out of \2", spoken)
     spoken = re.sub(r"(\d(?:[\d,]*\d)?(?:\.\d+)?)\s*%", r"\1 percent", spoken)
-    spoken = re.sub(r"(?m)^\s*[-+•]\s+", "Next, ", spoken)
-    spoken = re.sub(r"(?m)^\s*\d+[.)]\s+", "Next, ", spoken)
+    spoken = re.sub(r"\bv(?=\d+(?:\.\d+)+)", "version ", spoken, flags=re.IGNORECASE)
+    spoken = re.sub(r"(?<=\d)\.(?=\d)", " point ", spoken)
+    spoken = re.sub(r"\b(\d[\d,.]*)\s*ms\b", r"\1 milliseconds", spoken, flags=re.IGNORECASE)
+    spoken = re.sub(
+        r"\b(\d[\d,.]*)\s*(kb|mb|gb|tb)\b",
+        lambda match: f"{match.group(1)} {match.group(2).upper()}",
+        spoken,
+        flags=re.IGNORECASE,
+    )
+    spoken = spoken.replace("->", " to ").replace("=>", " results in ")
+    spoken = re.sub(r">=", " at least ", spoken)
+    spoken = re.sub(r"<=", " at most ", spoken)
+    spoken = re.sub(r"(?m)^\s*[-+•]\s+", ". ", spoken)
+    spoken = re.sub(r"(?m)^\s*\d+[.)]\s+", ". ", spoken)
     spoken = re.sub(r"(?m)^\s*#{1,6}\s+", "", spoken)
+    spoken = re.sub(r"\s*\|\s*", ". ", spoken)
     spoken = spoken.replace(" — ", ". ").replace(" – ", ". ")
-    return re.sub(r"\s+", " ", spoken).strip()
+    spoken = re.sub(r"\s+", " ", spoken).strip()
+    spoken = re.sub(r"\s+([,.;:!?])", r"\1", spoken)
+    spoken = re.sub(r"(?:\.\s*){2,}", ". ", spoken)
+    return spoken.removeprefix(". ")
 
 
 def split_spoken_text(text: str, max_chars: int = 180) -> list[str]:
