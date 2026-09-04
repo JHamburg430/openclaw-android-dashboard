@@ -57,7 +57,8 @@ def speech_model_prompt(now: datetime | None = None, agent_pending: bool = False
     if agent_pending:
         return f"""You are the conversational voice supervisor while an OpenClaw agent works in the background.
 Always output {SAY_SENTINEL} followed by one short natural spoken response.
-Keep conversing with the user. If asked for status, truthfully say the agent is still working. Answer unrelated casual or timeless questions yourself. If asked for another task needing tools or private context, explain briefly that the current agent is still busy; do not claim you started another agent.
+Only respond because the user has spoken to you. If asked for status, truthfully say the agent is still working. Answer unrelated casual or timeless questions yourself. If asked for another task needing tools or private context, explain briefly that the current agent is still busy; do not claim you started another agent.
+Never volunteer a timer-based or generic progress message. Agent progress may be relayed only when the agent actually emits it.
 Never fabricate private, project, or agent progress. The current local time is {clock.strftime('%-I:%M %p')} America/Detroit.
 Examples:
 User: Are you still working on it?
@@ -422,25 +423,6 @@ class LiveConversationService:
             await socket.send_json({"type": "error", "message": str(error)})
         return None
 
-    async def agent_progress_reply(self, elapsed_seconds: int) -> str:
-        payload = {
-            "model": SPEECH_MODEL,
-            "stream": False,
-            "think": False,
-            "messages": [
-                {"role": "system", "content": "Write one brief, natural spoken progress update. An OpenClaw agent is still working in the background. Do not claim any specific progress or result you cannot observe."},
-                {"role": "user", "content": f"It has been working for about {elapsed_seconds} seconds."},
-            ],
-            "options": {"temperature": 0.3, "num_predict": 40},
-        }
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(SPEECH_MODEL_URL, json=payload) as response:
-                response.raise_for_status()
-                result = await response.json()
-        return result.get("message", {}).get("content", "").strip()
-
-
 def render_page() -> str:
     return """<!doctype html>
 <html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
@@ -482,17 +464,6 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
         started = time.monotonic()
         try:
             await socket.send_json({"type": "agent_status", "state": "working"})
-            while not work.done():
-                try:
-                    await asyncio.wait_for(asyncio.shield(work), timeout=20)
-                except asyncio.TimeoutError:
-                    try:
-                        update = await service.agent_progress_reply(round(time.monotonic() - started))
-                        if update and not work.done():
-                            await service.send_spoken_response(socket, update, "supervisor", f"progress-{time.monotonic_ns()}")
-                            await socket.send_json({"type": "state", "state": "listening"})
-                    except Exception as error:
-                        LOGGER.warning("agent progress update failed: %s", error)
             reply = await work
             await service.send_spoken_response(socket, reply, "agent", f"agent-{time.monotonic_ns()}")
             await socket.send_json({"type": "agent_status", "state": "complete", "elapsed_ms": round((time.monotonic() - started) * 1000)})

@@ -33,7 +33,16 @@ class RoutingTests(unittest.TestCase):
         prompt = speech_model_prompt(self.now, agent_pending=True)
         self.assertIn("still working", prompt)
         self.assertIn("Tell me a joke", prompt)
+        self.assertIn("Never volunteer a timer-based or generic progress message", prompt)
         self.assertNotIn(AGENT_SENTINEL, prompt)
+
+    def test_server_has_no_synthetic_periodic_agent_updates(self):
+        import inspect
+        import server
+
+        source = inspect.getsource(server.websocket)
+        self.assertNotIn("agent_progress_reply", source)
+        self.assertNotIn("timeout=20", source)
 
     def test_speech_model_output_intercepts_escalation_token(self):
         self.assertEqual(parse_speech_model_output(f"{AGENT_SENTINEL} I’ll check that."), ("agent", "I’ll check that."))
