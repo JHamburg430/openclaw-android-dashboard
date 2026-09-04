@@ -8,16 +8,17 @@ in the Android Dashboard plus menu.
 1. The Android native audio bridge captures 16 kHz PCM in 20 ms frames.
 2. Browser-side VAD commits a turn after 600 ms of silence.
 3. Pipecat's persistent `faster-whisper` `tiny.en` service transcribes locally.
-4. Deterministic, context-free requests (greetings, acknowledgements, identity,
-   time, date, and arithmetic) are answered directly.
-5. Everything else is sent to the normal OpenClaw agent in the dedicated
+4. A fast local speech model returns either a short speakable response or the
+   hidden `[[OPENCLAW_AGENT]]` control token.
+5. The service intercepts that token before display/TTS and sends the original
+   transcript to the normal OpenClaw agent in the dedicated
    `agent:main:live-conversation` session, preserving tools and context.
 6. A persistent local Jarvis TTS worker returns 24 kHz PCM to the Android
    native playback bridge.
 
-The direct route is deliberately conservative: if a request might need current
-information, personal context, tools, memory, judgment, or side effects, it is
-escalated to the normal agent.
+The speech-model prompt keeps the direct route conservative: requests needing
+current information, personal context, tools, memory, judgment, or side effects
+emit the hidden control token and escalate to the normal agent.
 
 The bridge forwards escalated transcripts without adding response-length or
 reasoning instructions. Voice response policy belongs to the gateway agent's

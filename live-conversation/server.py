@@ -4,17 +4,14 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import asyncio
 import base64
 from dataclasses import asdict, dataclass
 from datetime import datetime
 import json
 import logging
-import operator
 import os
 from pathlib import Path
-import re
 import struct
 import time
 from typing import Any
@@ -22,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 LOGGER = logging.getLogger("live_conversation")
 
+import aiohttp
 from aiohttp import WSMsgType, web
 from pipecat.frames.frames import TranscriptionFrame
 from pipecat.services.whisper.stt import WhisperSTTService
@@ -37,6 +35,9 @@ DEFAULT_OPENCLAW_MODULE = "/home/john/nodejs/lib/node_modules/openclaw/openclaw.
 DEFAULT_TTS_WORKER = "/home/john/.openclaw/plugins/local-realtime-voice/bin/openclaw-local-tts-worker"
 DEFAULT_TTS_RUNTIME = "/home/john/.openclaw/tools/sherpa-onnx-tts/runtime"
 DEFAULT_TTS_MODEL_DIR = "/home/john/.openclaw/tools/sherpa-onnx-tts/models/vits-piper-en_GB-jarvis-high"
+SPEECH_MODEL_URL = "http://127.0.0.1:11434/api/chat"
+SPEECH_MODEL = "qwen3.5:0.8b"
+AGENT_SENTINEL = "[[OPENCLAW_AGENT]]"
 
 
 @dataclass
@@ -49,102 +50,29 @@ class TurnMetrics:
     route: str = ""
 
 
-def _safe_arithmetic(expression: str) -> float | int:
-    operations = {
-        ast.Add: operator.add,
-        ast.Sub: operator.sub,
-        ast.Mult: operator.mul,
-        ast.Div: operator.truediv,
-        ast.FloorDiv: operator.floordiv,
-        ast.Mod: operator.mod,
-        ast.Pow: operator.pow,
-        ast.USub: operator.neg,
-        ast.UAdd: operator.pos,
-    }
-
-    def evaluate(node: ast.AST) -> float | int:
-        if isinstance(node, ast.Expression):
-            return evaluate(node.body)
-        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-            return node.value
-        if isinstance(node, ast.UnaryOp) and type(node.op) in operations:
-            return operations[type(node.op)](evaluate(node.operand))
-        if isinstance(node, ast.BinOp) and type(node.op) in operations:
-            left = evaluate(node.left)
-            right = evaluate(node.right)
-            if isinstance(node.op, ast.Pow) and abs(float(right)) > 8:
-                raise ValueError("exponent too large")
-            return operations[type(node.op)](left, right)
-        raise ValueError("unsupported arithmetic")
-
-    if len(expression) > 80:
-        raise ValueError("expression too long")
-    return evaluate(ast.parse(expression, mode="eval"))
-
-
-def route_simple(text: str, now: datetime | None = None) -> str | None:
-    """Answer only deterministic, context-free requests locally."""
-    normalized = re.sub(r"[^a-z0-9+*/().%^-]+", " ", text.lower()).strip()
+def speech_model_prompt(now: datetime | None = None) -> str:
     clock = now or datetime.now(ZoneInfo("America/Detroit"))
-
-    if re.fullmatch(r"(?:hello|hi|hey|good morning|good afternoon|good evening)(?: there)?", normalized):
-        return "Hello. I'm listening."
-    if re.fullmatch(r"(?:thanks|thank you|cheers|okay|ok|got it|sounds good)", normalized):
-        return "You're welcome."
-    if re.search(r"\b(?:can you hear me|are you there|are you listening)\b", normalized):
-        return "Yes. I can hear you clearly."
-    if re.search(r"\b(?:who are you|what are you)\b", normalized):
-        return "I'm your OpenClaw voice assistant."
-    if re.search(r"\b(?:what(?:'s| is) the time|what time (?:is it|it is)|current time)\b", text.lower()):
-        return f"It is {clock.strftime('%-I:%M %p')}."
-    if re.search(r"\b(?:what(?:'s| is) the date|what day is it|today(?:'s| is) date|current date)\b", text.lower()):
-        return f"Today is {clock.strftime('%A, %B %-d')}."
-
-    arithmetic = normalized
-    replacements = {
-        "what is ": "",
-        "what s ": "",
-        "calculate ": "",
-        "plus": "+",
-        "minus": "-",
-        "times": "*",
-        "multiplied by": "*",
-        "divided by": "/",
-    }
-    lowered = text.lower().strip().rstrip("?.!")
-    for source, target in replacements.items():
-        lowered = lowered.replace(source, target)
-    candidate = re.sub(r"\s+", "", lowered)
-    if re.fullmatch(r"[0-9+*/().%^-]+", candidate) and re.search(r"[+*/%^]|\d-\d", candidate):
-        try:
-            value = _safe_arithmetic(candidate.replace("^", "**"))
-            if isinstance(value, float) and value.is_integer():
-                value = int(value)
-            return f"The answer is {value}."
-        except (ArithmeticError, SyntaxError, ValueError):
-            return None
-    return None
+    return f"""Classify and answer a voice request. Output exactly one of two forms:
+- If the user asks about their apps, projects, progress, status, files, logs, calendar, messages, memory, current external facts, asks you to use tools, or requests an action: output exactly {AGENT_SENTINEL}.
+- Otherwise, if it is casual conversation or timeless general knowledge answerable confidently without tools: output one short natural spoken sentence.
+The current local date and time is {clock.strftime('%A, %B %-d, %Y, %-I:%M %p')} America/Detroit; time and date questions can be answered directly.
+Never fabricate private or project status. Never describe the routing decision. Never speak the escalation token as words.
+Examples:
+User: How is the RAG app improvement going?
+Assistant: {AGENT_SENTINEL}
+User: Fix the routing bug.
+Assistant: {AGENT_SENTINEL}
+User: Who wrote The Hobbit?
+Assistant: J. R. R. Tolkien wrote The Hobbit.
+User: What time is it?
+Assistant: It is {clock.strftime('%-I:%M %p')}."""
 
 
-def should_acknowledge(text: str) -> bool:
-    """Return true only when a request clearly implies non-trivial agent work."""
-    lowered = text.lower()
-    action = re.search(
-        r"\b(?:check|inspect|investigate|research|look up|search|analy[sz]e|review|"
-        r"diagnose|debug|fix|update|change|build|create|implement|deploy|publish|"
-        r"install|move|send|remember|compare|summarize|report)\b",
-        lowered,
-    )
-    scope = re.search(
-        r"\b(?:app|project|repository|repo|logs?|calendar|email|messages?|files?|"
-        r"tests?|release|latest|current|progress|status|issue|problem|bottleneck)\b",
-        lowered,
-    )
-    explicit_depth = re.search(
-        r"\b(?:cite sources|step by step|in detail|thoroughly|everything|all of)\b",
-        lowered,
-    )
-    return bool(explicit_depth or (action and scope))
+def parse_speech_model_output(text: str) -> str | None:
+    cleaned = text.strip()
+    if AGENT_SENTINEL in cleaned:
+        return None
+    return cleaned or None
 
 
 def extract_agent_text(payload: Any) -> str:
@@ -271,6 +199,28 @@ class LiveConversationService:
             raise RuntimeError("Agent returned no speakable text")
         return reply
 
+    async def speech_reply(self, text: str) -> str | None:
+        payload = {
+            "model": SPEECH_MODEL,
+            "stream": False,
+            "think": False,
+            "messages": [
+                {"role": "system", "content": speech_model_prompt()},
+                {"role": "user", "content": text},
+            ],
+            "options": {"temperature": 0, "num_predict": 80},
+        }
+        timeout = aiohttp.ClientTimeout(total=15)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(SPEECH_MODEL_URL, json=payload) as response:
+                    response.raise_for_status()
+                    result = await response.json()
+            return parse_speech_model_output(result.get("message", {}).get("content", ""))
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+            LOGGER.warning("speech model unavailable; escalating safely: %s", error)
+            return None
+
     async def send_spoken_response(
         self,
         socket: web.WebSocketResponse,
@@ -320,21 +270,12 @@ class LiveConversationService:
             await socket.send_json({"type": "transcript", "text": transcript})
 
             stage = time.perf_counter()
-            reply = route_simple(transcript)
+            reply = await self.speech_reply(transcript)
             metrics.routing_ms = round((time.perf_counter() - stage) * 1000)
             if reply is not None:
                 metrics.route = "direct"
             else:
                 metrics.route = "agent"
-                if should_acknowledge(transcript):
-                    acknowledgment_id = f"ack-{time.monotonic_ns()}"
-                    await self.send_spoken_response(
-                        socket,
-                        "I'll check and let you know.",
-                        "agent",
-                        acknowledgment_id,
-                        message_type="acknowledgment",
-                    )
                 await socket.send_json({"type": "state", "state": "thinking", "route": "agent"})
                 agent_started = time.perf_counter()
                 reply = await self.agent_reply(transcript)

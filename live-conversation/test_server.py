@@ -4,13 +4,14 @@ from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 from server import (
+    AGENT_SENTINEL,
     DEFAULT_NODE_COMMAND,
     DEFAULT_OPENCLAW_MODULE,
     LiveConversationService,
     extract_agent_text,
+    parse_speech_model_output,
     render_page,
-    route_simple,
-    should_acknowledge,
+    speech_model_prompt,
 )
 
 
@@ -18,25 +19,16 @@ class RoutingTests(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 9, 2, 12, 34, tzinfo=ZoneInfo("America/Detroit"))
 
-    def test_direct_conversation_controls(self):
-        self.assertEqual(route_simple("Can you hear me?", self.now), "Yes. I can hear you clearly.")
-        self.assertEqual(route_simple("Thanks", self.now), "You're welcome.")
+    def test_speech_model_prompt_defines_hidden_escalation_contract(self):
+        prompt = speech_model_prompt(self.now)
+        self.assertIn(AGENT_SENTINEL, prompt)
+        self.assertIn("12:34 PM", prompt)
+        self.assertNotIn("I'll check and let you know", prompt)
 
-    def test_direct_time_date_and_arithmetic(self):
-        self.assertEqual(route_simple("What time is it?", self.now), "It is 12:34 PM.")
-        self.assertEqual(route_simple("What time it is?", self.now), "It is 12:34 PM.")
-        self.assertEqual(route_simple("What is 12 plus 7?", self.now), "The answer is 19.")
-
-    def test_complex_requests_escalate(self):
-        self.assertIsNone(route_simple("Check my calendar and move tomorrow's meeting.", self.now))
-        self.assertIsNone(route_simple("Explain the latest OpenClaw release and cite sources.", self.now))
-        self.assertIsNone(route_simple("Remember that I prefer morning meetings.", self.now))
-
-    def test_acknowledgment_is_only_for_nontrivial_work(self):
-        self.assertTrue(should_acknowledge("Check the RAG app and report progress."))
-        self.assertTrue(should_acknowledge("Investigate the logs and fix the problem."))
-        self.assertFalse(should_acknowledge("What time it is?"))
-        self.assertFalse(should_acknowledge("Who wrote The Hobbit?"))
+    def test_speech_model_output_intercepts_escalation_token(self):
+        self.assertIsNone(parse_speech_model_output(AGENT_SENTINEL))
+        self.assertIsNone(parse_speech_model_output(f"  {AGENT_SENTINEL}  "))
+        self.assertEqual(parse_speech_model_output("It is 12:34 PM."), "It is 12:34 PM.")
 
     def test_agent_json_extraction(self):
         payload = {"result": {"payloads": [{"text": "Ready."}]}}
@@ -62,22 +54,21 @@ class RoutingTests(unittest.TestCase):
         import asyncio
         asyncio.run(run_test())
 
-    def test_agent_turn_speaks_acknowledgment_before_work(self):
+    def test_agent_turn_intercepts_sentinel_without_speaking_it(self):
         async def run_test():
             service = LiveConversationService("agent:main:live-conversation", 0.85)
             socket = AsyncMock()
             service.transcribe = AsyncMock(return_value="Check the RAG app and report progress.")
+            service.speech_reply = AsyncMock(return_value=None)
             service.agent_reply = AsyncMock(return_value="The evaluation is complete.")
             service.tts.synthesize = AsyncMock(return_value=b"\0\0" * 2400)
 
             await service.process_turn(socket, b"audio")
 
             messages = [call.args[0] for call in socket.send_json.await_args_list]
-            acknowledgment = next(i for i, message in enumerate(messages) if message["type"] == "acknowledgment")
-            final_reply = next(i for i, message in enumerate(messages) if message["type"] == "reply")
-            self.assertLess(acknowledgment, final_reply)
-            self.assertEqual(messages[acknowledgment]["text"], "I'll check and let you know.")
-            self.assertEqual(service.tts.synthesize.await_args_list[0].args[0], "I'll check and let you know.")
+            self.assertFalse(any(message["type"] == "acknowledgment" for message in messages))
+            self.assertFalse(any(AGENT_SENTINEL in str(message) for message in messages))
+            self.assertEqual(service.tts.synthesize.await_args_list[0].args[0], "The evaluation is complete.")
 
         import asyncio
         asyncio.run(run_test())
