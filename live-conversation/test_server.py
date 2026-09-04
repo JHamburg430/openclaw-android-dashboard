@@ -54,6 +54,26 @@ class RoutingTests(unittest.TestCase):
         import asyncio
         asyncio.run(run_test())
 
+    def test_agent_turn_speaks_acknowledgment_before_work(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 0.85)
+            socket = AsyncMock()
+            service.transcribe = AsyncMock(return_value="Check the RAG app and report progress.")
+            service.agent_reply = AsyncMock(return_value="The evaluation is complete.")
+            service.tts.synthesize = AsyncMock(return_value=b"\0\0" * 2400)
+
+            await service.process_turn(socket, b"audio")
+
+            messages = [call.args[0] for call in socket.send_json.await_args_list]
+            acknowledgment = next(i for i, message in enumerate(messages) if message["type"] == "acknowledgment")
+            final_reply = next(i for i, message in enumerate(messages) if message["type"] == "reply")
+            self.assertLess(acknowledgment, final_reply)
+            self.assertEqual(messages[acknowledgment]["text"], "I'll check and let you know.")
+            self.assertEqual(service.tts.synthesize.await_args_list[0].args[0], "I'll check and let you know.")
+
+        import asyncio
+        asyncio.run(run_test())
+
     def test_page_uses_native_audio_and_same_origin_websocket(self):
         page = render_page()
         self.assertIn("OpenClawNativeAudio.startCapture", page)
@@ -68,6 +88,13 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("responseActive=true", page)
         self.assertIn("first_pcm_enqueued", page)
         self.assertIn("pcm_delivery_done", page)
+
+    def test_default_tts_speed_is_normal(self):
+        import inspect
+        from server import PersistentTtsWorker
+
+        default = inspect.signature(PersistentTtsWorker).parameters["speed"].default
+        self.assertEqual(default, 0.85)
 
 if __name__ == "__main__":
     unittest.main()

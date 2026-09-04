@@ -146,7 +146,7 @@ def extract_agent_text(payload: Any) -> str:
 
 
 class PersistentTtsWorker:
-    def __init__(self, command: str, runtime_dir: str, model_dir: str, speed: float = 1.32):
+    def __init__(self, command: str, runtime_dir: str, model_dir: str, speed: float = 0.85):
         self.command = command
         self.runtime_dir = runtime_dir
         self.model_dir = model_dir
@@ -250,6 +250,41 @@ class LiveConversationService:
             raise RuntimeError("Agent returned no speakable text")
         return reply
 
+    async def send_spoken_response(
+        self,
+        socket: web.WebSocketResponse,
+        text: str,
+        route: str,
+        response_id: str,
+        message_type: str = "reply",
+    ) -> int:
+        """Synthesize and stream one complete spoken response."""
+        await socket.send_json({
+            "type": message_type,
+            "text": text,
+            "route": route,
+            "responseId": response_id,
+        })
+        await socket.send_json({"type": "state", "state": "speaking", "route": route})
+        tts_started = time.perf_counter()
+        pcm = await self.tts.synthesize(text)
+        tts_ms = round((time.perf_counter() - tts_started) * 1000)
+        LOGGER.info(
+            "response_ready id=%s route=%s chars=%d pcm_bytes=%d tts_ms=%d",
+            response_id, route, len(text), len(pcm), tts_ms,
+        )
+        await socket.send_json({"type": "output_audio_buffer.started", "responseId": response_id})
+        chunk_bytes = OUTPUT_SAMPLE_RATE * 2 // 10
+        for offset in range(0, len(pcm), chunk_bytes):
+            await socket.send_json({
+                "type": "response.output_audio.delta",
+                "responseId": response_id,
+                "sampleRate": OUTPUT_SAMPLE_RATE,
+                "audioBase64": base64.b64encode(pcm[offset:offset + chunk_bytes]).decode("ascii"),
+            })
+        await socket.send_json({"type": "response.output_audio.done", "responseId": response_id})
+        return tts_ms
+
     async def process_turn(self, socket: web.WebSocketResponse, audio: bytes) -> None:
         started = time.perf_counter()
         metrics = TurnMetrics()
@@ -270,28 +305,23 @@ class LiveConversationService:
                 metrics.route = "direct"
             else:
                 metrics.route = "agent"
+                acknowledgment_id = f"ack-{time.monotonic_ns()}"
+                await self.send_spoken_response(
+                    socket,
+                    "I'll check and let you know.",
+                    "agent",
+                    acknowledgment_id,
+                    message_type="acknowledgment",
+                )
                 await socket.send_json({"type": "state", "state": "thinking", "route": "agent"})
                 agent_started = time.perf_counter()
                 reply = await self.agent_reply(transcript)
                 metrics.response_ms = round((time.perf_counter() - agent_started) * 1000)
 
             response_id = f"response-{time.monotonic_ns()}"
-            await socket.send_json({"type": "reply", "text": reply, "route": metrics.route, "responseId": response_id})
-            await socket.send_json({"type": "state", "state": "speaking", "route": metrics.route})
-            tts_started = time.perf_counter()
-            pcm = await self.tts.synthesize(reply)
-            metrics.tts_ms = round((time.perf_counter() - tts_started) * 1000)
-            LOGGER.info("response_ready id=%s route=%s chars=%d pcm_bytes=%d tts_ms=%d", response_id, metrics.route, len(reply), len(pcm), metrics.tts_ms)
-            await socket.send_json({"type": "output_audio_buffer.started", "responseId": response_id})
-            chunk_bytes = OUTPUT_SAMPLE_RATE * 2 // 10
-            for offset in range(0, len(pcm), chunk_bytes):
-                await socket.send_json({
-                    "type": "response.output_audio.delta",
-                    "responseId": response_id,
-                    "sampleRate": OUTPUT_SAMPLE_RATE,
-                    "audioBase64": base64.b64encode(pcm[offset:offset + chunk_bytes]).decode("ascii"),
-                })
-            await socket.send_json({"type": "response.output_audio.done", "responseId": response_id})
+            metrics.tts_ms = await self.send_spoken_response(
+                socket, reply, metrics.route, response_id
+            )
             metrics.total_ms = round((time.perf_counter() - started) * 1000)
             await socket.send_json({"type": "metrics", **asdict(metrics)})
             await socket.send_json({"type": "state", "state": "listening"})
@@ -377,7 +407,7 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--session-key", default=DEFAULT_SESSION_KEY)
-    parser.add_argument("--tts-speed", type=float, default=1.32)
+    parser.add_argument("--tts-speed", type=float, default=0.85)
     args = parser.parse_args()
     web.run_app(build_app(args), host=args.host, port=args.port, print=None)
 
