@@ -6,11 +6,8 @@ from zoneinfo import ZoneInfo
 from server import (
     DEFAULT_NODE_COMMAND,
     DEFAULT_OPENCLAW_MODULE,
-    DIRECT_PLAYBACK_PREROLL_MS,
-    OUTPUT_SAMPLE_RATE,
     LiveConversationService,
     extract_agent_text,
-    prepare_playback_pcm,
     render_page,
     route_simple,
 )
@@ -62,15 +59,9 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("OpenClawNativeAudio.startCapture", page)
         self.assertIn("location.host+'/ws'", page)
         self.assertIn("silenceMs>=600", page)
-
-    def test_direct_audio_primes_android_output_route(self):
-        pcm = b"\x01\x02" * 10
-        expected_silence = OUTPUT_SAMPLE_RATE * 2 * DIRECT_PLAYBACK_PREROLL_MS // 1000
-        direct = prepare_playback_pcm(pcm, "direct")
-        self.assertEqual(direct[:expected_silence], bytes(expected_silence))
-        self.assertEqual(direct[expected_silence:], pcm)
-        self.assertIs(prepare_playback_pcm(pcm, "agent"), pcm)
-
+        self.assertIn("OpenClawNativeAudio.prepareAgentResponsePlayback()", page)
+        self.assertIn("OpenClawNativeAudio.interruptAgentResponsePlayback()", page)
+        self.assertIn("response.output_audio.delta", page)
 
 if __name__ == "__main__":
     unittest.main()

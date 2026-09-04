@@ -27,7 +27,6 @@ from pipecat.transcriptions.language import Language
 
 SAMPLE_RATE = 16_000
 OUTPUT_SAMPLE_RATE = 24_000
-DIRECT_PLAYBACK_PREROLL_MS = 400
 DEFAULT_PORT = 8790
 DEFAULT_SESSION_KEY = "agent:main:live-conversation"
 DEFAULT_NODE_COMMAND = "/home/john/nodejs/bin/node"
@@ -45,14 +44,6 @@ class TurnMetrics:
     tts_ms: int = 0
     total_ms: int = 0
     route: str = ""
-
-
-def prepare_playback_pcm(pcm: bytes, route: str) -> bytes:
-    """Give Android's communication route time to become audible for short replies."""
-    if route != "direct" or not pcm:
-        return pcm
-    silence_bytes = OUTPUT_SAMPLE_RATE * 2 * DIRECT_PLAYBACK_PREROLL_MS // 1000
-    return bytes(silence_bytes) + pcm
 
 
 def _safe_arithmetic(expression: str) -> float | int:
@@ -281,19 +272,22 @@ class LiveConversationService:
                 reply = await self.agent_reply(transcript)
                 metrics.response_ms = round((time.perf_counter() - agent_started) * 1000)
 
-            await socket.send_json({"type": "reply", "text": reply, "route": metrics.route})
+            response_id = f"response-{time.monotonic_ns()}"
+            await socket.send_json({"type": "reply", "text": reply, "route": metrics.route, "responseId": response_id})
             await socket.send_json({"type": "state", "state": "speaking", "route": metrics.route})
             tts_started = time.perf_counter()
             pcm = await self.tts.synthesize(reply)
             metrics.tts_ms = round((time.perf_counter() - tts_started) * 1000)
-            pcm = prepare_playback_pcm(pcm, metrics.route)
+            await socket.send_json({"type": "output_audio_buffer.started", "responseId": response_id})
             chunk_bytes = OUTPUT_SAMPLE_RATE * 2 // 10
             for offset in range(0, len(pcm), chunk_bytes):
                 await socket.send_json({
-                    "type": "audio",
+                    "type": "response.output_audio.delta",
+                    "responseId": response_id,
                     "sampleRate": OUTPUT_SAMPLE_RATE,
                     "audioBase64": base64.b64encode(pcm[offset:offset + chunk_bytes]).decode("ascii"),
                 })
+            await socket.send_json({"type": "response.output_audio.done", "responseId": response_id})
             metrics.total_ms = round((time.perf_counter() - started) * 1000)
             await socket.send_json({"type": "metrics", **asdict(metrics)})
             await socket.send_json({"type": "state", "state": "listening"})
@@ -310,9 +304,9 @@ html,body{margin:0;min-height:100%;background:#060a10;color:#f4f8fc;font-family:
 const state=document.getElementById('state'),bar=document.getElementById('bar'),user=document.getElementById('user'),assistant=document.getElementById('assistant'),route=document.getElementById('route'),metrics=document.getElementById('metrics');let ws,timer,recording=false,speechMs=0,silenceMs=0,pre=[];
 function rms(b64){const s=atob(b64||'');let sum=0,n=0;for(let i=0;i+1<s.length;i+=2){let v=(s.charCodeAt(i)&255)|((s.charCodeAt(i+1)&255)<<8);if(v&32768)v-=65536;const f=v/32768;sum+=f*f;n++}return n?Math.sqrt(sum/n):0}
 function send(x){if(ws&&ws.readyState===1)ws.send(JSON.stringify(x))}
-function begin(){if(recording)return;recording=true;speechMs=0;silenceMs=0;send({type:'start'});for(const audioBase64 of pre)send({type:'audio',audioBase64});pre=[];state.textContent='Listening…'}
-function tick(){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>20)pre.shift();if(level>=.006)begin();return}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=20;silenceMs=0}else silenceMs+=20;if(speechMs>=200&&silenceMs>=600){recording=false;send({type:'commit'});state.textContent='Transcribing…'}}
-function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='state')state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.type==='transcript')user.textContent=m.text;if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route}if(m.type==='audio')OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){state.textContent='Error';assistant.textContent=m.message}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
+function begin(){if(recording)return;recording=true;speechMs=0;silenceMs=0;try{OpenClawNativeAudio.interruptAgentResponsePlayback()}catch(e){}send({type:'input_audio_buffer.speech_started'});send({type:'start'});for(const audioBase64 of pre)send({type:'audio',audioBase64});pre=[];state.textContent='Listening…'}
+function tick(){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>20)pre.shift();if(level>=.006)begin();return}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=20;silenceMs=0}else silenceMs+=20;if(speechMs>=200&&silenceMs>=600){recording=false;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}}
+function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='state')state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.type==='transcript')user.textContent=m.text;if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route}if(m.type==='output_audio_buffer.started')OpenClawNativeAudio.prepareAgentResponsePlayback();if(m.type==='response.output_audio.delta')OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){state.textContent='Error';assistant.textContent=m.message}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
 function stop(){if(timer)clearInterval(timer);timer=null;try{OpenClawNativeAudio.stopCapture()}catch(e){}if(ws)ws.close();ws=null;recording=false;bar.style.width='0%';state.textContent='Stopped'}
 document.getElementById('start').onclick=start;document.getElementById('stop').onclick=stop;window.addEventListener('pagehide',stop);
 </script></body></html>"""
@@ -338,7 +332,9 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
             continue
         payload = json.loads(message.data)
         kind = payload.get("type")
-        if kind == "start":
+        if kind == "input_audio_buffer.speech_started":
+            await socket.send_json({"type": "output_audio_buffer.cleared"})
+        elif kind == "start":
             audio.clear()
         elif kind == "audio" and len(audio) < SAMPLE_RATE * 2 * 30:
             audio.extend(base64.b64decode(payload.get("audioBase64", ""), validate=True))

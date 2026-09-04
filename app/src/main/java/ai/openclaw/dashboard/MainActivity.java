@@ -1815,6 +1815,7 @@ public final class MainActivity extends Activity {
         private final ArrayDeque<byte[]> outputQueue = new ArrayDeque<>();
         private final AtomicBoolean running = new AtomicBoolean(false);
         private final AtomicBoolean outputRunning = new AtomicBoolean(false);
+        private final AtomicBoolean outputInterrupted = new AtomicBoolean(false);
         private AudioRecord recorder;
         private Thread readerThread;
         private Thread outputThread;
@@ -1899,6 +1900,31 @@ public final class MainActivity extends Activity {
         @JavascriptInterface
         public void playAgentResponsePcm16Base64(String base64Pcm16, int sampleRateHz) {
             playPcm16Base64(base64Pcm16, sampleRateHz, "agent_response");
+        }
+
+        @JavascriptInterface
+        public void prepareAgentResponsePlayback() {
+            outputInterrupted.set(false);
+            new Thread(() -> {
+                AudioDeviceInfo bluetoothOutput = preferBluetoothAudioRoute(false, "response_prepare");
+                AudioManager audioManager = getAudioManager();
+                if (audioManager != null && bluetoothOutput == null) {
+                    prepareSpeakerPlaybackRoute(audioManager, "response_prepare");
+                }
+                recordDiagnostic("native_audio_output.prepared",
+                        bluetoothOutput == null ? "speaker" : describeAudioDevice(bluetoothOutput));
+            }, "openclaw-native-output-prepare").start();
+        }
+
+        @JavascriptInterface
+        public void interruptAgentResponsePlayback() {
+            outputInterrupted.set(true);
+            synchronized (outputLock) {
+                outputQueue.clear();
+                if (outputThread != null) outputThread.interrupt();
+                outputLock.notifyAll();
+            }
+            recordDiagnostic("native_audio_output.cleared", "speech_started");
         }
 
         @JavascriptInterface
@@ -2055,7 +2081,7 @@ public final class MainActivity extends Activity {
                 recordDiagnostic("native_audio_output.stream_start", "reason=" + routeReason + " sampleRate=" + sampleRateHz + " buffer=" + bufferSize);
                 track.play();
                 int chunks = 0;
-                while (true) {
+                while (!outputInterrupted.get()) {
                     byte[] chunk;
                     synchronized (outputLock) {
                         chunk = outputQueue.pollFirst();
@@ -2084,7 +2110,7 @@ public final class MainActivity extends Activity {
                         recordDiagnostic("native_audio_output.stream_write", "chunks=" + chunks + " lastBytes=" + chunk.length);
                     }
                 }
-                drainPcmOutput(track, sampleRateHz, chunks);
+                if (!outputInterrupted.get()) drainPcmOutput(track, sampleRateHz, chunks);
                 recordDiagnostic("native_audio_output.stream_done", "complete chunks=" + chunks);
             } catch (Exception e) {
                 recordDiagnostic("native_audio_output.stream_error", e.getClass().getSimpleName() + ": " + e.getMessage());
