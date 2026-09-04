@@ -62,6 +62,10 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("OpenClawNativeAudio.prepareAgentResponsePlayback()", page)
         self.assertIn("OpenClawNativeAudio.interruptAgentResponsePlayback()", page)
         self.assertIn("response.output_audio.delta", page)
+        self.assertIn("if(recording||awaitingResponse)return", page)
+        self.assertIn("if(awaitingResponse){candidateSpeechMs=0;return}", page)
+        self.assertIn("candidateSpeechMs>=200", page)
+        self.assertIn("responseActive=true", page)
 
 if __name__ == "__main__":
     unittest.main()
