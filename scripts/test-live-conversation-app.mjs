@@ -11,6 +11,7 @@ assert.ok(method.includes("openLocalApp(LIVE_CONVERSATION_PORT)"));
 assert.equal(method.includes("buildLiveConversationHtml()"), false);
 assert.ok(source.includes("public void prepareAgentResponsePlayback()"));
 assert.ok(source.includes('prepareSpeakerPlaybackRoute(audioManager, "response_prepare")'));
+assert.equal(source.includes('"openclaw-native-output-prepare"'), false);
 assert.ok(source.includes("public void interruptAgentResponsePlayback()"));
 assert.ok(source.includes('recordDiagnostic("native_audio_output.cleared", "speech_started")'));
 

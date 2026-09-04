@@ -1905,15 +1905,13 @@ public final class MainActivity extends Activity {
         @JavascriptInterface
         public void prepareAgentResponsePlayback() {
             outputInterrupted.set(false);
-            new Thread(() -> {
-                AudioDeviceInfo bluetoothOutput = preferBluetoothAudioRoute(false, "response_prepare");
-                AudioManager audioManager = getAudioManager();
-                if (audioManager != null && bluetoothOutput == null) {
-                    prepareSpeakerPlaybackRoute(audioManager, "response_prepare");
-                }
-                recordDiagnostic("native_audio_output.prepared",
-                        bluetoothOutput == null ? "speaker" : describeAudioDevice(bluetoothOutput));
-            }, "openclaw-native-output-prepare").start();
+            AudioDeviceInfo bluetoothOutput = preferBluetoothAudioRoute(false, "response_prepare");
+            AudioManager audioManager = getAudioManager();
+            if (audioManager != null && bluetoothOutput == null) {
+                prepareSpeakerPlaybackRoute(audioManager, "response_prepare");
+            }
+            recordDiagnostic("native_audio_output.prepared",
+                    bluetoothOutput == null ? "speaker" : describeAudioDevice(bluetoothOutput));
         }
 
         @JavascriptInterface
