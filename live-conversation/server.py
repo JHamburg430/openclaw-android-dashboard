@@ -38,6 +38,7 @@ DEFAULT_TTS_MODEL_DIR = "/home/john/.openclaw/tools/sherpa-onnx-tts/models/vits-
 SPEECH_MODEL_URL = "http://127.0.0.1:11434/api/chat"
 SPEECH_MODEL = "qwen3.5:0.8b"
 AGENT_SENTINEL = "[[OPENCLAW_AGENT]]"
+SAY_SENTINEL = "[[SAY]]"
 
 
 @dataclass
@@ -50,29 +51,46 @@ class TurnMetrics:
     route: str = ""
 
 
-def speech_model_prompt(now: datetime | None = None) -> str:
+def speech_model_prompt(now: datetime | None = None, agent_pending: bool = False) -> str:
     clock = now or datetime.now(ZoneInfo("America/Detroit"))
-    return f"""Classify and answer a voice request. Output exactly one of two forms:
-- If the user asks about their apps, projects, progress, status, files, logs, calendar, messages, memory, current external facts, asks you to use tools, or requests an action: output exactly {AGENT_SENTINEL}.
-- Otherwise, if it is casual conversation or timeless general knowledge answerable confidently without tools: output one short natural spoken sentence.
+    if agent_pending:
+        return f"""You are the conversational voice supervisor while an OpenClaw agent works in the background.
+Always output {SAY_SENTINEL} followed by one short natural spoken response.
+Keep conversing with the user. If asked for status, truthfully say the agent is still working. Answer unrelated casual or timeless questions yourself. If asked for another task needing tools or private context, explain briefly that the current agent is still busy; do not claim you started another agent.
+Never fabricate private, project, or agent progress. The current local time is {clock.strftime('%-I:%M %p')} America/Detroit.
+Examples:
+User: Are you still working on it?
+Assistant: {SAY_SENTINEL} Yes, the agent is still working in the background.
+User: Tell me a joke while you work.
+Assistant: {SAY_SENTINEL} Why did the robot take a vacation? It needed to recharge.
+User: Also check my calendar.
+Assistant: {SAY_SENTINEL} The agent is still busy with the first request, so I haven’t started the calendar check."""
+    return f"""You are the conversational voice supervisor. No OpenClaw agent is currently working.
+Output exactly one of these forms:
+- For casual conversation or timeless general knowledge answerable confidently without tools: {SAY_SENTINEL} followed by one short natural spoken response.
+- If no agent is working and the request needs apps, projects, private context, files, logs, calendar, messages, memory, current external facts, tools, judgment, or an action: {AGENT_SENTINEL} followed by a short natural acknowledgment telling the user what you are handing off. Write the acknowledgment yourself for this request.
+- If an agent is already working, keep conversing. For a status question, use {SAY_SENTINEL} and truthfully say the agent is still working. For unrelated simple conversation, answer normally. Do not start a second agent.
 The current local date and time is {clock.strftime('%A, %B %-d, %Y, %-I:%M %p')} America/Detroit; time and date questions can be answered directly.
-Never fabricate private or project status. Never describe the routing decision. Never speak the escalation token as words.
+Never fabricate private, project, or agent progress. The sentinel is machine-readable and must not be spoken.
 Examples:
 User: How is the RAG app improvement going?
-Assistant: {AGENT_SENTINEL}
+Assistant: {AGENT_SENTINEL} I’ll ask the agent to check the RAG app and report back.
 User: Fix the routing bug.
-Assistant: {AGENT_SENTINEL}
+Assistant: {AGENT_SENTINEL} I’ll have the agent inspect and fix the routing bug.
 User: Who wrote The Hobbit?
-Assistant: J. R. R. Tolkien wrote The Hobbit.
+Assistant: {SAY_SENTINEL} J. R. R. Tolkien wrote The Hobbit.
 User: What time is it?
-Assistant: It is {clock.strftime('%-I:%M %p')}."""
+Assistant: {SAY_SENTINEL} It is {clock.strftime('%-I:%M %p')}."""
 
 
-def parse_speech_model_output(text: str) -> str | None:
+def parse_speech_model_output(text: str) -> tuple[str, str]:
     cleaned = text.strip()
     if AGENT_SENTINEL in cleaned:
-        return None
-    return cleaned or None
+        acknowledgment = cleaned.split(AGENT_SENTINEL, 1)[1].strip()
+        return "agent", acknowledgment
+    if SAY_SENTINEL in cleaned:
+        cleaned = cleaned.split(SAY_SENTINEL, 1)[1].strip()
+    return "direct", cleaned
 
 
 def extract_agent_text(payload: Any) -> str:
@@ -157,6 +175,7 @@ class LiveConversationService:
         self.stt: WhisperSTTService | None = None
         self.tts = PersistentTtsWorker(DEFAULT_TTS_WORKER, DEFAULT_TTS_RUNTIME, DEFAULT_TTS_MODEL_DIR, tts_speed)
         self.agent_lock = asyncio.Lock()
+        self.speech_lock = asyncio.Lock()
 
     async def start(self) -> None:
         self.stt = await asyncio.to_thread(
@@ -199,13 +218,13 @@ class LiveConversationService:
             raise RuntimeError("Agent returned no speakable text")
         return reply
 
-    async def speech_reply(self, text: str) -> str | None:
+    async def speech_reply(self, text: str, agent_pending: bool = False) -> tuple[str, str]:
         payload = {
             "model": SPEECH_MODEL,
             "stream": False,
             "think": False,
             "messages": [
-                {"role": "system", "content": speech_model_prompt()},
+                {"role": "system", "content": speech_model_prompt(agent_pending=agent_pending)},
                 {"role": "user", "content": text},
             ],
             "options": {"temperature": 0, "num_predict": 80},
@@ -216,10 +235,14 @@ class LiveConversationService:
                 async with session.post(SPEECH_MODEL_URL, json=payload) as response:
                     response.raise_for_status()
                     result = await response.json()
-            return parse_speech_model_output(result.get("message", {}).get("content", ""))
+            route, reply = parse_speech_model_output(result.get("message", {}).get("content", ""))
+            if agent_pending:
+                route = "direct"
+            if not reply:
+                raise ValueError("speech model returned no speakable text")
+            return route, reply
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
-            LOGGER.warning("speech model unavailable; escalating safely: %s", error)
-            return None
+            raise RuntimeError(f"Speech supervisor unavailable: {error}") from error
 
     async def send_spoken_response(
         self,
@@ -230,33 +253,34 @@ class LiveConversationService:
         message_type: str = "reply",
     ) -> int:
         """Synthesize and stream one complete spoken response."""
-        await socket.send_json({
-            "type": message_type,
-            "text": text,
-            "route": route,
-            "responseId": response_id,
-        })
-        await socket.send_json({"type": "state", "state": "speaking", "route": route})
-        tts_started = time.perf_counter()
-        pcm = await self.tts.synthesize(text)
-        tts_ms = round((time.perf_counter() - tts_started) * 1000)
-        LOGGER.info(
-            "response_ready id=%s route=%s chars=%d pcm_bytes=%d tts_ms=%d",
-            response_id, route, len(text), len(pcm), tts_ms,
-        )
-        await socket.send_json({"type": "output_audio_buffer.started", "responseId": response_id})
-        chunk_bytes = OUTPUT_SAMPLE_RATE * 2 // 10
-        for offset in range(0, len(pcm), chunk_bytes):
+        async with self.speech_lock:
             await socket.send_json({
-                "type": "response.output_audio.delta",
+                "type": message_type,
+                "text": text,
+                "route": route,
                 "responseId": response_id,
-                "sampleRate": OUTPUT_SAMPLE_RATE,
-                "audioBase64": base64.b64encode(pcm[offset:offset + chunk_bytes]).decode("ascii"),
             })
-        await socket.send_json({"type": "response.output_audio.done", "responseId": response_id})
+            await socket.send_json({"type": "state", "state": "speaking", "route": route})
+            tts_started = time.perf_counter()
+            pcm = await self.tts.synthesize(text)
+            tts_ms = round((time.perf_counter() - tts_started) * 1000)
+            LOGGER.info(
+                "response_ready id=%s route=%s chars=%d pcm_bytes=%d tts_ms=%d",
+                response_id, route, len(text), len(pcm), tts_ms,
+            )
+            await socket.send_json({"type": "output_audio_buffer.started", "responseId": response_id})
+            chunk_bytes = OUTPUT_SAMPLE_RATE * 2 // 10
+            for offset in range(0, len(pcm), chunk_bytes):
+                await socket.send_json({
+                    "type": "response.output_audio.delta",
+                    "responseId": response_id,
+                    "sampleRate": OUTPUT_SAMPLE_RATE,
+                    "audioBase64": base64.b64encode(pcm[offset:offset + chunk_bytes]).decode("ascii"),
+                })
+            await socket.send_json({"type": "response.output_audio.done", "responseId": response_id})
         return tts_ms
 
-    async def process_turn(self, socket: web.WebSocketResponse, audio: bytes) -> None:
+    async def process_turn(self, socket: web.WebSocketResponse, audio: bytes, agent_pending: bool = False) -> tuple[str, str] | None:
         started = time.perf_counter()
         metrics = TurnMetrics()
         try:
@@ -270,16 +294,9 @@ class LiveConversationService:
             await socket.send_json({"type": "transcript", "text": transcript})
 
             stage = time.perf_counter()
-            reply = await self.speech_reply(transcript)
+            route, reply = await self.speech_reply(transcript, agent_pending=agent_pending)
             metrics.routing_ms = round((time.perf_counter() - stage) * 1000)
-            if reply is not None:
-                metrics.route = "direct"
-            else:
-                metrics.route = "agent"
-                await socket.send_json({"type": "state", "state": "thinking", "route": "agent"})
-                agent_started = time.perf_counter()
-                reply = await self.agent_reply(transcript)
-                metrics.response_ms = round((time.perf_counter() - agent_started) * 1000)
+            metrics.route = route
 
             response_id = f"response-{time.monotonic_ns()}"
             metrics.tts_ms = await self.send_spoken_response(
@@ -288,8 +305,29 @@ class LiveConversationService:
             metrics.total_ms = round((time.perf_counter() - started) * 1000)
             await socket.send_json({"type": "metrics", **asdict(metrics)})
             await socket.send_json({"type": "state", "state": "listening"})
+            if route == "agent" and not agent_pending:
+                return transcript, reply
         except Exception as error:
             await socket.send_json({"type": "error", "message": str(error)})
+        return None
+
+    async def agent_progress_reply(self, elapsed_seconds: int) -> str:
+        payload = {
+            "model": SPEECH_MODEL,
+            "stream": False,
+            "think": False,
+            "messages": [
+                {"role": "system", "content": "Write one brief, natural spoken progress update. An OpenClaw agent is still working in the background. Do not claim any specific progress or result you cannot observe."},
+                {"role": "user", "content": f"It has been working for about {elapsed_seconds} seconds."},
+            ],
+            "options": {"temperature": 0.3, "num_predict": 40},
+        }
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(SPEECH_MODEL_URL, json=payload) as response:
+                response.raise_for_status()
+                result = await response.json()
+        return result.get("message", {}).get("content", "").strip()
 
 
 def render_page() -> str:
@@ -324,7 +362,45 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
     socket = web.WebSocketResponse(heartbeat=20)
     await socket.prepare(request)
     audio = bytearray()
-    active_task: asyncio.Task[None] | None = None
+    turn_task: asyncio.Task[None] | None = None
+    agent_task: asyncio.Task[None] | None = None
+
+    async def run_agent(transcript: str) -> None:
+        nonlocal agent_task
+        work = asyncio.create_task(service.agent_reply(transcript))
+        started = time.monotonic()
+        try:
+            await socket.send_json({"type": "agent_status", "state": "working"})
+            while not work.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(work), timeout=20)
+                except asyncio.TimeoutError:
+                    try:
+                        update = await service.agent_progress_reply(round(time.monotonic() - started))
+                        if update and not work.done():
+                            await service.send_spoken_response(socket, update, "supervisor", f"progress-{time.monotonic_ns()}")
+                            await socket.send_json({"type": "state", "state": "listening"})
+                    except Exception as error:
+                        LOGGER.warning("agent progress update failed: %s", error)
+            reply = await work
+            await service.send_spoken_response(socket, reply, "agent", f"agent-{time.monotonic_ns()}")
+            await socket.send_json({"type": "agent_status", "state": "complete", "elapsed_ms": round((time.monotonic() - started) * 1000)})
+            await socket.send_json({"type": "state", "state": "listening"})
+        except asyncio.CancelledError:
+            work.cancel()
+            raise
+        except Exception as error:
+            await service.send_spoken_response(socket, f"The agent ran into a problem: {error}", "agent", f"agent-error-{time.monotonic_ns()}")
+            await socket.send_json({"type": "agent_status", "state": "error"})
+        finally:
+            agent_task = None
+
+    async def run_turn(turn: bytes) -> None:
+        nonlocal agent_task
+        handoff = await service.process_turn(socket, turn, agent_pending=agent_task is not None)
+        if handoff and agent_task is None:
+            transcript, _ = handoff
+            agent_task = asyncio.create_task(run_agent(transcript))
     async for message in socket:
         if message.type != WSMsgType.TEXT:
             continue
@@ -337,15 +413,17 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
         elif kind == "audio" and len(audio) < SAMPLE_RATE * 2 * 30:
             audio.extend(base64.b64decode(payload.get("audioBase64", ""), validate=True))
         elif kind == "commit" and audio:
-            if active_task and not active_task.done():
-                active_task.cancel()
+            if turn_task and not turn_task.done():
+                turn_task.cancel()
             turn = bytes(audio)
             audio.clear()
-            active_task = asyncio.create_task(service.process_turn(socket, turn))
+            turn_task = asyncio.create_task(run_turn(turn))
         elif kind == "client_event":
             LOGGER.info("client_event event=%s detail=%s", payload.get("event", ""), payload.get("detail", ""))
-    if active_task and not active_task.done():
-        active_task.cancel()
+    if turn_task and not turn_task.done():
+        turn_task.cancel()
+    if agent_task and not agent_task.done():
+        agent_task.cancel()
     return socket
 
 

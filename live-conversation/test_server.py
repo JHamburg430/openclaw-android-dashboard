@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 from server import (
     AGENT_SENTINEL,
+    SAY_SENTINEL,
     DEFAULT_NODE_COMMAND,
     DEFAULT_OPENCLAW_MODULE,
     LiveConversationService,
@@ -22,13 +23,20 @@ class RoutingTests(unittest.TestCase):
     def test_speech_model_prompt_defines_hidden_escalation_contract(self):
         prompt = speech_model_prompt(self.now)
         self.assertIn(AGENT_SENTINEL, prompt)
+        self.assertIn(SAY_SENTINEL, prompt)
         self.assertIn("12:34 PM", prompt)
         self.assertNotIn("I'll check and let you know", prompt)
 
+    def test_pending_agent_prompt_keeps_the_supervisor_conversational(self):
+        prompt = speech_model_prompt(self.now, agent_pending=True)
+        self.assertIn("still working", prompt)
+        self.assertIn("Tell me a joke", prompt)
+        self.assertNotIn(AGENT_SENTINEL, prompt)
+
     def test_speech_model_output_intercepts_escalation_token(self):
-        self.assertIsNone(parse_speech_model_output(AGENT_SENTINEL))
-        self.assertIsNone(parse_speech_model_output(f"  {AGENT_SENTINEL}  "))
-        self.assertEqual(parse_speech_model_output("It is 12:34 PM."), "It is 12:34 PM.")
+        self.assertEqual(parse_speech_model_output(f"{AGENT_SENTINEL} I’ll check that."), ("agent", "I’ll check that."))
+        self.assertEqual(parse_speech_model_output(f"{SAY_SENTINEL} It is 12:34 PM."), ("direct", "It is 12:34 PM."))
+        self.assertEqual(parse_speech_model_output("It is 12:34 PM."), ("direct", "It is 12:34 PM."))
 
     def test_agent_json_extraction(self):
         payload = {"result": {"payloads": [{"text": "Ready."}]}}
@@ -59,16 +67,16 @@ class RoutingTests(unittest.TestCase):
             service = LiveConversationService("agent:main:live-conversation", 0.85)
             socket = AsyncMock()
             service.transcribe = AsyncMock(return_value="Check the RAG app and report progress.")
-            service.speech_reply = AsyncMock(return_value=None)
-            service.agent_reply = AsyncMock(return_value="The evaluation is complete.")
+            service.speech_reply = AsyncMock(return_value=("agent", "I’ll ask the agent to check that."))
             service.tts.synthesize = AsyncMock(return_value=b"\0\0" * 2400)
 
-            await service.process_turn(socket, b"audio")
+            handoff = await service.process_turn(socket, b"audio")
 
             messages = [call.args[0] for call in socket.send_json.await_args_list]
             self.assertFalse(any(message["type"] == "acknowledgment" for message in messages))
             self.assertFalse(any(AGENT_SENTINEL in str(message) for message in messages))
-            self.assertEqual(service.tts.synthesize.await_args_list[0].args[0], "The evaluation is complete.")
+            self.assertEqual(service.tts.synthesize.await_args_list[0].args[0], "I’ll ask the agent to check that.")
+            self.assertEqual(handoff[0], "Check the RAG app and report progress.")
 
         import asyncio
         asyncio.run(run_test())
