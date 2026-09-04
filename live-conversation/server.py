@@ -113,6 +113,51 @@ def extract_agent_text(payload: Any) -> str:
     return ""
 
 
+_CARDINAL_UNDER_20 = (
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+    "seventeen", "eighteen", "nineteen",
+)
+_TENS = ("", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety")
+_ORDINAL_UNDER_20 = (
+    "zeroth", "first", "second", "third", "fourth", "fifth", "sixth", "seventh",
+    "eighth", "ninth", "tenth", "eleventh", "twelfth", "thirteenth", "fourteenth",
+    "fifteenth", "sixteenth", "seventeenth", "eighteenth", "nineteenth",
+)
+
+
+def _cardinal_under_100(value: int) -> str:
+    if value < 20:
+        return _CARDINAL_UNDER_20[value]
+    tens, ones = divmod(value, 10)
+    return _TENS[tens] if not ones else f"{_TENS[tens]}-{_CARDINAL_UNDER_20[ones]}"
+
+
+def _ordinal_day(value: int) -> str:
+    if value < 20:
+        return _ORDINAL_UNDER_20[value]
+    tens, ones = divmod(value, 10)
+    if not ones:
+        return {2: "twentieth", 3: "thirtieth"}[tens]
+    return f"{_TENS[tens]}-{_ORDINAL_UNDER_20[ones]}"
+
+
+def _spoken_year(value: int) -> str:
+    if 2000 <= value <= 2009:
+        return "two thousand" if value == 2000 else f"two thousand {_CARDINAL_UNDER_20[value - 2000]}"
+    if 2010 <= value <= 2099:
+        return f"twenty {_cardinal_under_100(value - 2000)}"
+    return str(value)
+
+
+def _spoken_date(year: int, month: int, day: int) -> str | None:
+    try:
+        parsed = datetime(year, month, day)
+    except ValueError:
+        return None
+    return f"{parsed.strftime('%B')} {_ordinal_day(day)}, {_spoken_year(year)}"
+
+
 def normalize_spoken_text(text: str) -> str:
     """Convert display-oriented Markdown and compact metrics into natural speech."""
     spoken = text
@@ -120,10 +165,23 @@ def normalize_spoken_text(text: str) -> str:
     spoken = re.sub(r"!?\[([^\]]+)\]\([^\)]+\)", r"\1", spoken)
     spoken = re.sub(r"```(?:\w+)?\s*|```", " ", spoken)
     spoken = re.sub(r"(?<!\w)[*_~`]+|[*_~`]+(?!\w)", "", spoken)
+    # Dates should sound like dates, not arithmetic or digit sequences.
+    def replace_iso_date(match: re.Match[str]) -> str:
+        rendered = _spoken_date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        return rendered or match.group(0)
+
+    def replace_us_date(match: re.Match[str]) -> str:
+        rendered = _spoken_date(int(match.group(3)), int(match.group(1)), int(match.group(2)))
+        return rendered or match.group(0)
+
+    spoken = re.sub(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)", replace_iso_date, spoken)
+    spoken = re.sub(r"(?<!\d)(\d{1,2})/(\d{1,2})/(\d{4})(?!\d)", replace_us_date, spoken)
     spoken = re.sub(r"(?<!\w)(\d[\d,]*(?:\.\d+)?)\s*/\s*(\d[\d,]*(?:\.\d+)?)(?!\w)", r"\1 out of \2", spoken)
     spoken = re.sub(r"(\d(?:[\d,]*\d)?(?:\.\d+)?)\s*%", r"\1 percent", spoken)
-    spoken = re.sub(r"(?m)^\s*[-+•]\s+", "", spoken)
+    spoken = re.sub(r"(?m)^\s*[-+•]\s+", "Next, ", spoken)
+    spoken = re.sub(r"(?m)^\s*\d+[.)]\s+", "Next, ", spoken)
     spoken = re.sub(r"(?m)^\s*#{1,6}\s+", "", spoken)
+    spoken = spoken.replace(" — ", ". ").replace(" – ", ". ")
     return re.sub(r"\s+", " ", spoken).strip()
 
 

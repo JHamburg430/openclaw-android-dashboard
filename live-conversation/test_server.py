@@ -109,8 +109,17 @@ class RoutingTests(unittest.TestCase):
         text = "- **294/299** passed — **98.33%**. [Details](https://example.com)"
         self.assertEqual(
             normalize_spoken_text(text),
-            "294 out of 299 passed — 98.33 percent. Details",
+            "Next, 294 out of 299 passed. 98.33 percent. Details",
         )
+
+    def test_dates_are_spoken_naturally(self):
+        self.assertEqual(
+            normalize_spoken_text("Updated 2026-09-04 and due 10/21/2026."),
+            "Updated September fourth, twenty twenty-six and due October twenty-first, twenty twenty-six.",
+        )
+
+    def test_invalid_dates_are_left_unchanged(self):
+        self.assertEqual(normalize_spoken_text("Build 2026-99-42."), "Build 2026-99-42.")
 
     def test_long_spoken_text_is_split_on_natural_boundaries(self):
         text = "First sentence. " + ("A longer clause with several words, " * 8) + "finished."
