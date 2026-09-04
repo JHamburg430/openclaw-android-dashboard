@@ -1941,11 +1941,16 @@ public final class MainActivity extends Activity {
                     outputQueue.removeFirst();
                 }
                 outputLock.notifyAll();
+                startPcmOutputThreadLocked(outputSampleRate, routeReason);
             }
-            if (outputRunning.compareAndSet(false, true)) {
-                outputThread = new Thread(() -> playPcmOutputLoop(outputSampleRate, routeReason), "openclaw-native-pcm-output");
-                outputThread.start();
-            }
+        }
+
+        private void startPcmOutputThreadLocked(int sampleRateHz, String routeReason) {
+            if (!outputRunning.compareAndSet(false, true)) return;
+            outputThread = new Thread(
+                    () -> playPcmOutputLoop(sampleRateHz, routeReason),
+                    "openclaw-native-pcm-output");
+            outputThread.start();
         }
 
         @JavascriptInterface
@@ -2092,10 +2097,13 @@ public final class MainActivity extends Activity {
                     track.release();
                 }
                 synchronized (outputLock) {
-                    outputQueue.clear();
+                    outputRunning.set(false);
+                    outputThread = null;
+                    if (!outputQueue.isEmpty()) {
+                        recordDiagnostic("native_audio_output.restart", "queuedChunks=" + outputQueue.size());
+                        startPcmOutputThreadLocked(sampleRateHz, "queued_response");
+                    }
                 }
-                outputRunning.set(false);
-                outputThread = null;
                 restoreCommunicationAudioRouteIfIdle();
             }
         }
