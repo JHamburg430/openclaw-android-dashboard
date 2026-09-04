@@ -12,6 +12,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import struct
 import time
 from typing import Any
@@ -112,8 +113,29 @@ def extract_agent_text(payload: Any) -> str:
     return ""
 
 
+def split_spoken_text(text: str, max_chars: int = 180) -> list[str]:
+    """Split long replies into natural TTS units so playback can begin promptly."""
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return [""]
+    sentences = re.split(r"(?<=[.!?])\s+", normalized)
+    parts: list[str] = []
+    for sentence in sentences:
+        while len(sentence) > max_chars:
+            split_at = max(sentence.rfind(mark, 0, max_chars + 1) for mark in (", ", "; ", ": ", " "))
+            if split_at <= 0:
+                split_at = max_chars
+            else:
+                split_at += 1
+            parts.append(sentence[:split_at].strip())
+            sentence = sentence[split_at:].strip()
+        if sentence:
+            parts.append(sentence)
+    return parts or [normalized]
+
+
 class PersistentTtsWorker:
-    def __init__(self, command: str, runtime_dir: str, model_dir: str, speed: float = 0.85):
+    def __init__(self, command: str, runtime_dir: str, model_dir: str, speed: float = 0.72):
         self.command = command
         self.runtime_dir = runtime_dir
         self.model_dir = model_dir
@@ -261,23 +283,40 @@ class LiveConversationService:
                 "responseId": response_id,
             })
             await socket.send_json({"type": "state", "state": "speaking", "route": route})
+            speech_parts = split_spoken_text(text)
             tts_started = time.perf_counter()
-            pcm = await self.tts.synthesize(text)
+            pcm = await self.tts.synthesize(speech_parts[0])
             tts_ms = round((time.perf_counter() - tts_started) * 1000)
             LOGGER.info(
-                "response_ready id=%s route=%s chars=%d pcm_bytes=%d tts_ms=%d",
-                response_id, route, len(text), len(pcm), tts_ms,
+                "response_stream_start id=%s route=%s chars=%d parts=%d first_pcm_bytes=%d first_tts_ms=%d",
+                response_id, route, len(text), len(speech_parts), len(pcm), tts_ms,
             )
             await socket.send_json({"type": "output_audio_buffer.started", "responseId": response_id})
             chunk_bytes = OUTPUT_SAMPLE_RATE * 2 // 10
-            for offset in range(0, len(pcm), chunk_bytes):
-                await socket.send_json({
-                    "type": "response.output_audio.delta",
-                    "responseId": response_id,
-                    "sampleRate": OUTPUT_SAMPLE_RATE,
-                    "audioBase64": base64.b64encode(pcm[offset:offset + chunk_bytes]).decode("ascii"),
-                })
+            total_pcm_bytes = 0
+            for index, _ in enumerate(speech_parts):
+                next_synthesis: asyncio.Task[bytes] | None = None
+                if index + 1 < len(speech_parts):
+                    next_synthesis = asyncio.create_task(self.tts.synthesize(speech_parts[index + 1]))
+                for offset in range(0, len(pcm), chunk_bytes):
+                    chunk = pcm[offset:offset + chunk_bytes]
+                    await socket.send_json({
+                        "type": "response.output_audio.delta",
+                        "responseId": response_id,
+                        "sampleRate": OUTPUT_SAMPLE_RATE,
+                        "audioBase64": base64.b64encode(chunk).decode("ascii"),
+                    })
+                    total_pcm_bytes += len(chunk)
+                    await asyncio.sleep(len(chunk) / (OUTPUT_SAMPLE_RATE * 2))
+                if next_synthesis is not None:
+                    wait_started = time.perf_counter()
+                    pcm = await next_synthesis
+                    tts_ms += round((time.perf_counter() - wait_started) * 1000)
             await socket.send_json({"type": "response.output_audio.done", "responseId": response_id})
+            LOGGER.info(
+                "response_stream_done id=%s route=%s pcm_bytes=%d tts_wait_ms=%d",
+                response_id, route, total_pcm_bytes, tts_ms,
+            )
         return tts_ms
 
     async def process_turn(self, socket: web.WebSocketResponse, audio: bytes, agent_pending: bool = False) -> tuple[str, str] | None:
@@ -448,7 +487,7 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--session-key", default=DEFAULT_SESSION_KEY)
-    parser.add_argument("--tts-speed", type=float, default=0.85)
+    parser.add_argument("--tts-speed", type=float, default=0.72)
     args = parser.parse_args()
     web.run_app(build_app(args), host=args.host, port=args.port, print=None)
 

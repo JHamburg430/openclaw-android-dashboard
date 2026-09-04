@@ -12,6 +12,7 @@ from server import (
     extract_agent_text,
     parse_speech_model_output,
     render_page,
+    split_spoken_text,
     speech_model_prompt,
 )
 
@@ -101,7 +102,27 @@ class RoutingTests(unittest.TestCase):
         from server import PersistentTtsWorker
 
         default = inspect.signature(PersistentTtsWorker).parameters["speed"].default
-        self.assertEqual(default, 0.85)
+        self.assertEqual(default, 0.72)
+
+    def test_long_spoken_text_is_split_on_natural_boundaries(self):
+        text = "First sentence. " + ("A longer clause with several words, " * 8) + "finished."
+        parts = split_spoken_text(text, max_chars=80)
+        self.assertGreater(len(parts), 2)
+        self.assertEqual(" ".join(parts), text)
+        self.assertTrue(all(len(part) <= 80 for part in parts))
+
+    def test_spoken_audio_is_paced_in_realtime(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 0.72)
+            socket = AsyncMock()
+            service.tts.synthesize = AsyncMock(return_value=b"\0" * 9600)
+            with patch("server.asyncio.sleep", AsyncMock()) as sleep:
+                await service.send_spoken_response(socket, "A short response.", "agent", "response-1")
+            self.assertEqual(sleep.await_count, 2)
+            self.assertEqual(sleep.await_args_list[0].args[0], 0.1)
+
+        import asyncio
+        asyncio.run(run_test())
 
 if __name__ == "__main__":
     unittest.main()
