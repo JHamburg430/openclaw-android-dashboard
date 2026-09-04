@@ -1807,7 +1807,8 @@ public final class MainActivity extends Activity {
         private static final double TEST_TONE_AMPLITUDE = 30000.0;
         private static final int OUTPUT_TAIL_WAIT_MS = 1500;
         private static final int OUTPUT_DRAIN_WAIT_MS = 1200;
-        private static final int OUTPUT_BUFFER_SECONDS = 2;
+        private static final int OUTPUT_BUFFER_MS = 250;
+        private static final int OUTPUT_START_THRESHOLD_MS = 100;
         private static final int OUTPUT_BYTES_PER_SAMPLE = 2;
         private final Object lock = new Object();
         private final Object outputLock = new Object();
@@ -2070,16 +2071,27 @@ public final class MainActivity extends Activity {
                         sampleRateHz,
                         AudioFormat.CHANNEL_OUT_MONO,
                         AudioFormat.ENCODING_PCM_16BIT);
-                int targetBuffer = sampleRateHz * OUTPUT_BYTES_PER_SAMPLE * OUTPUT_BUFFER_SECONDS;
+                // AudioTrack's default streaming start threshold may equal its entire
+                // buffer. A two-second buffer therefore never started for short direct
+                // replies, even though every write succeeded. Keep a small jitter
+                // buffer and explicitly start after the first 100 ms PCM delta.
+                int targetBuffer = sampleRateHz * OUTPUT_BYTES_PER_SAMPLE * OUTPUT_BUFFER_MS / 1000;
                 int bufferSize = Math.max(minBuffer, targetBuffer);
                 track = createCommunicationAudioTrack(sampleRateHz, bufferSize);
                 if (track.getState() != AudioTrack.STATE_INITIALIZED) {
                     throw new IllegalStateException("AudioTrack failed to initialize: state=" + track.getState());
                 }
+                int requestedStartFrames = Math.max(1, sampleRateHz * OUTPUT_START_THRESHOLD_MS / 1000);
+                int startThresholdFrames = Math.min(requestedStartFrames, track.getBufferCapacityInFrames());
+                int appliedStartFrames = track.setStartThresholdInFrames(startThresholdFrames);
                 if (bluetoothOutput != null && track.setPreferredDevice(bluetoothOutput)) {
                     recordDiagnostic("native_audio_output.route", describeAudioDevice(bluetoothOutput));
                 }
-                recordDiagnostic("native_audio_output.stream_start", "reason=" + routeReason + " sampleRate=" + sampleRateHz + " buffer=" + bufferSize);
+                recordDiagnostic("native_audio_output.stream_start",
+                        "reason=" + routeReason
+                                + " sampleRate=" + sampleRateHz
+                                + " buffer=" + bufferSize
+                                + " startFrames=" + appliedStartFrames);
                 track.play();
                 int chunks = 0;
                 while (!outputInterrupted.get()) {
