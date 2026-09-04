@@ -37,7 +37,10 @@ DEFAULT_TTS_WORKER = "/home/john/.openclaw/plugins/local-realtime-voice/bin/open
 DEFAULT_TTS_RUNTIME = "/home/john/.openclaw/tools/sherpa-onnx-tts/runtime"
 DEFAULT_TTS_MODEL_DIR = "/home/john/.openclaw/tools/sherpa-onnx-tts/models/vits-piper-en_GB-jarvis-high"
 SPEECH_MODEL_URL = "http://127.0.0.1:11434/api/chat"
-SPEECH_MODEL = "qwen3.5:0.8b"
+# Large enough for materially better natural-language supervision while staying
+# within the sub-second warm-response budget on the local Ollama GPUs.
+SPEECH_MODEL = "qwen3.5:4b"
+SPEECH_MODEL_KEEP_ALIVE = "30m"
 AGENT_SENTINEL = "[[OPENCLAW_AGENT]]"
 SAY_SENTINEL = "[[SAY]]"
 
@@ -57,7 +60,7 @@ def speech_model_prompt(now: datetime | None = None, agent_pending: bool = False
     if agent_pending:
         return f"""You are the conversational voice supervisor while an OpenClaw agent works in the background.
 Always output {SAY_SENTINEL} followed by one short natural spoken response.
-Only respond because the user has spoken to you. If asked for status, truthfully say the agent is still working. Answer unrelated casual or timeless questions yourself. If asked for another task needing tools or private context, explain briefly that the current agent is still busy; do not claim you started another agent.
+Only respond because the user has spoken to you. If asked for status, truthfully say the agent is still working; never claim it has finished because this supervisor does not receive completion state. Answer unrelated casual or timeless questions yourself. If asked for another task needing tools or private context, explain briefly that the current agent is still busy; do not claim you started another agent.
 Never volunteer a timer-based or generic progress message. Agent progress may be relayed only when the agent actually emits it.
 Never fabricate private, project, or agent progress. The current local time is {clock.strftime('%-I:%M %p')} America/Detroit.
 Examples:
@@ -406,6 +409,7 @@ class LiveConversationService:
     async def speech_reply(self, text: str, agent_pending: bool = False) -> tuple[str, str]:
         payload = {
             "model": SPEECH_MODEL,
+            "keep_alive": SPEECH_MODEL_KEEP_ALIVE,
             "stream": False,
             "think": False,
             "messages": [

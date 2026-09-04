@@ -6,6 +6,8 @@ from zoneinfo import ZoneInfo
 from server import (
     AGENT_SENTINEL,
     SAY_SENTINEL,
+    SPEECH_MODEL,
+    SPEECH_MODEL_KEEP_ALIVE,
     DEFAULT_NODE_COMMAND,
     DEFAULT_OPENCLAW_MODULE,
     LiveConversationService,
@@ -29,11 +31,16 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("12:34 PM", prompt)
         self.assertNotIn("I'll check and let you know", prompt)
 
+    def test_speech_supervisor_uses_higher_quality_local_model(self):
+        self.assertEqual(SPEECH_MODEL, "qwen3.5:4b")
+        self.assertEqual(SPEECH_MODEL_KEEP_ALIVE, "30m")
+
     def test_pending_agent_prompt_keeps_the_supervisor_conversational(self):
         prompt = speech_model_prompt(self.now, agent_pending=True)
         self.assertIn("still working", prompt)
         self.assertIn("Tell me a joke", prompt)
         self.assertIn("Never volunteer a timer-based or generic progress message", prompt)
+        self.assertIn("never claim it has finished", prompt)
         self.assertNotIn(AGENT_SENTINEL, prompt)
 
     def test_server_has_no_synthetic_periodic_agent_updates(self):

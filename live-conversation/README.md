@@ -8,8 +8,12 @@ in the Android Dashboard plus menu.
 1. The Android native audio bridge captures 16 kHz PCM in 20 ms frames.
 2. Browser-side VAD commits a turn after 600 ms of silence.
 3. Pipecat's persistent `faster-whisper` `tiny.en` service transcribes locally.
-4. A fast local speech model returns either a short speakable response or the
-   hidden `[[OPENCLAW_AGENT]]` control token.
+4. The local `qwen3.5:4b` speech supervisor returns either a short speakable
+   response or the hidden `[[OPENCLAW_AGENT]]` control token. This model is the
+   local latency/quality balance: materially stronger than the former 0.8B
+   supervisor while remaining sub-second once warm on the installed GPUs. The
+   Ollama request keeps it warm for 30 minutes to avoid repeated cold starts
+   during a conversation.
 5. The service intercepts that token before display/TTS and sends the original
    transcript to the normal OpenClaw agent in the dedicated
    `agent:main:live-conversation` session, preserving tools and context.
