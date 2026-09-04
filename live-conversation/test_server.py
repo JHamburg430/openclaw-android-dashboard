@@ -11,6 +11,7 @@ from server import (
     LiveConversationService,
     extract_agent_text,
     parse_speech_model_output,
+    normalize_spoken_text,
     render_page,
     split_spoken_text,
     speech_model_prompt,
@@ -102,7 +103,14 @@ class RoutingTests(unittest.TestCase):
         from server import PersistentTtsWorker
 
         default = inspect.signature(PersistentTtsWorker).parameters["speed"].default
-        self.assertEqual(default, 0.85)
+        self.assertEqual(default, 1.0)
+
+    def test_display_metrics_are_normalized_for_speech(self):
+        text = "- **294/299** passed — **98.33%**. [Details](https://example.com)"
+        self.assertEqual(
+            normalize_spoken_text(text),
+            "294 out of 299 passed — 98.33 percent. Details",
+        )
 
     def test_long_spoken_text_is_split_on_natural_boundaries(self):
         text = "First sentence. " + ("A longer clause with several words, " * 8) + "finished."

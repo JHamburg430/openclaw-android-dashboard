@@ -113,9 +113,23 @@ def extract_agent_text(payload: Any) -> str:
     return ""
 
 
+def normalize_spoken_text(text: str) -> str:
+    """Convert display-oriented Markdown and compact metrics into natural speech."""
+    spoken = text
+    # Preserve link labels while dropping destinations that are awkward to read aloud.
+    spoken = re.sub(r"!?\[([^\]]+)\]\([^\)]+\)", r"\1", spoken)
+    spoken = re.sub(r"```(?:\w+)?\s*|```", " ", spoken)
+    spoken = re.sub(r"(?<!\w)[*_~`]+|[*_~`]+(?!\w)", "", spoken)
+    spoken = re.sub(r"(?<!\w)(\d[\d,]*(?:\.\d+)?)\s*/\s*(\d[\d,]*(?:\.\d+)?)(?!\w)", r"\1 out of \2", spoken)
+    spoken = re.sub(r"(\d(?:[\d,]*\d)?(?:\.\d+)?)\s*%", r"\1 percent", spoken)
+    spoken = re.sub(r"(?m)^\s*[-+•]\s+", "", spoken)
+    spoken = re.sub(r"(?m)^\s*#{1,6}\s+", "", spoken)
+    return re.sub(r"\s+", " ", spoken).strip()
+
+
 def split_spoken_text(text: str, max_chars: int = 180) -> list[str]:
     """Split long replies into natural TTS units so playback can begin promptly."""
-    normalized = re.sub(r"\s+", " ", text).strip()
+    normalized = normalize_spoken_text(text)
     if not normalized:
         return [""]
     sentences = re.split(r"(?<=[.!?])\s+", normalized)
@@ -135,7 +149,7 @@ def split_spoken_text(text: str, max_chars: int = 180) -> list[str]:
 
 
 class PersistentTtsWorker:
-    def __init__(self, command: str, runtime_dir: str, model_dir: str, speed: float = 0.85):
+    def __init__(self, command: str, runtime_dir: str, model_dir: str, speed: float = 1.0):
         self.command = command
         self.runtime_dir = runtime_dir
         self.model_dir = model_dir
@@ -487,7 +501,7 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--session-key", default=DEFAULT_SESSION_KEY)
-    parser.add_argument("--tts-speed", type=float, default=0.85)
+    parser.add_argument("--tts-speed", type=float, default=1.0)
     args = parser.parse_args()
     web.run_app(build_app(args), host=args.host, port=args.port, print=None)
 
