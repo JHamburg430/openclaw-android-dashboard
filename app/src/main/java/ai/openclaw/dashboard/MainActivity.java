@@ -1910,6 +1910,9 @@ public final class MainActivity extends Activity {
             if (audioManager != null && bluetoothOutput == null) {
                 prepareSpeakerPlaybackRoute(audioManager, "response_prepare");
             }
+            synchronized (outputLock) {
+                startPcmOutputThreadLocked(OUTPUT_SAMPLE_RATE, "response_prepare");
+            }
             recordDiagnostic("native_audio_output.prepared",
                     bluetoothOutput == null ? "speaker" : describeAudioDevice(bluetoothOutput));
         }
