@@ -27,6 +27,7 @@ from pipecat.transcriptions.language import Language
 
 SAMPLE_RATE = 16_000
 OUTPUT_SAMPLE_RATE = 24_000
+DIRECT_PLAYBACK_PREROLL_MS = 400
 DEFAULT_PORT = 8790
 DEFAULT_SESSION_KEY = "agent:main:live-conversation"
 DEFAULT_NODE_COMMAND = "/home/john/nodejs/bin/node"
@@ -44,6 +45,14 @@ class TurnMetrics:
     tts_ms: int = 0
     total_ms: int = 0
     route: str = ""
+
+
+def prepare_playback_pcm(pcm: bytes, route: str) -> bytes:
+    """Give Android's communication route time to become audible for short replies."""
+    if route != "direct" or not pcm:
+        return pcm
+    silence_bytes = OUTPUT_SAMPLE_RATE * 2 * DIRECT_PLAYBACK_PREROLL_MS // 1000
+    return bytes(silence_bytes) + pcm
 
 
 def _safe_arithmetic(expression: str) -> float | int:
@@ -277,6 +286,7 @@ class LiveConversationService:
             tts_started = time.perf_counter()
             pcm = await self.tts.synthesize(reply)
             metrics.tts_ms = round((time.perf_counter() - tts_started) * 1000)
+            pcm = prepare_playback_pcm(pcm, metrics.route)
             chunk_bytes = OUTPUT_SAMPLE_RATE * 2 // 10
             for offset in range(0, len(pcm), chunk_bytes):
                 await socket.send_json({
