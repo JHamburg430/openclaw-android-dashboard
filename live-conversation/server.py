@@ -33,9 +33,10 @@ DEFAULT_PORT = 8790
 DEFAULT_SESSION_KEY = "agent:main:live-conversation"
 DEFAULT_NODE_COMMAND = "/home/john/nodejs/bin/node"
 DEFAULT_OPENCLAW_MODULE = "/home/john/nodejs/lib/node_modules/openclaw/openclaw.mjs"
-DEFAULT_TTS_WORKER = "/home/john/.openclaw/plugins/local-realtime-voice/bin/openclaw-local-tts-worker"
+DEFAULT_TTS_WORKER = str(Path(__file__).with_name("openclaw-kokoro-tts-worker"))
 DEFAULT_TTS_RUNTIME = "/home/john/.openclaw/tools/sherpa-onnx-tts/runtime"
-DEFAULT_TTS_MODEL_DIR = "/home/john/.openclaw/tools/sherpa-onnx-tts/models/vits-piper-en_GB-jarvis-high"
+DEFAULT_TTS_MODEL_DIR = "/home/john/.openclaw/tools/sherpa-onnx-tts/models/kokoro-en-v0_19"
+DEFAULT_TTS_SPEAKER_ID = 9  # bm_george, a British male voice
 SPEECH_MODEL_URL = "http://127.0.0.1:11434/api/chat"
 # Large enough for materially better natural-language supervision while staying
 # within the sub-second warm-response budget on the local Ollama GPUs.
@@ -323,7 +324,9 @@ class PersistentTtsWorker:
             "--model", str(models[0]),
             "--tokens", str(Path(self.model_dir) / "tokens.txt"),
             "--data-dir", str(Path(self.model_dir) / "espeak-ng-data"),
-            "--threads", "4",
+            "--voices", str(Path(self.model_dir) / "voices.bin"),
+            "--sid", str(DEFAULT_TTS_SPEAKER_ID),
+            "--threads", "8",
             "--speed", str(self.speed),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,

@@ -6,3 +6,4 @@ build/
 local.properties
 __pycache__/
 *.py[cod]
+live-conversation/openclaw-kokoro-tts-worker

@@ -34,6 +34,12 @@ before the final answer is shortened for speech.
 ```bash
 python3.13 -m venv ~/.openclaw/tools/pipecat-live-conversation/venv
 ~/.openclaw/tools/pipecat-live-conversation/venv/bin/pip install -r live-conversation/requirements.txt
+curl -fL -o /tmp/kokoro-en-v0_19.tar.bz2 \
+  https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-en-v0_19.tar.bz2
+tar -xjf /tmp/kokoro-en-v0_19.tar.bz2 \
+  -C ~/.openclaw/tools/sherpa-onnx-tts/models
+chmod +x live-conversation/build-tts-worker.sh
+live-conversation/build-tts-worker.sh
 mkdir -p ~/.config/systemd/user
 cp live-conversation/openclaw-live-conversation.service ~/.config/systemd/user/
 systemctl --user daemon-reload

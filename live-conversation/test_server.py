@@ -10,6 +10,8 @@ from server import (
     SPEECH_MODEL_KEEP_ALIVE,
     DEFAULT_NODE_COMMAND,
     DEFAULT_OPENCLAW_MODULE,
+    DEFAULT_TTS_MODEL_DIR,
+    DEFAULT_TTS_SPEAKER_ID,
     LiveConversationService,
     extract_agent_text,
     parse_speech_model_output,
@@ -120,6 +122,10 @@ class RoutingTests(unittest.TestCase):
 
         default = inspect.signature(PersistentTtsWorker).parameters["speed"].default
         self.assertEqual(default, 1.0)
+
+    def test_higher_quality_kokoro_british_voice_is_selected(self):
+        self.assertTrue(DEFAULT_TTS_MODEL_DIR.endswith("/kokoro-en-v0_19"))
+        self.assertEqual(DEFAULT_TTS_SPEAKER_ID, 9)
 
     def test_display_metrics_are_normalized_for_speech(self):
         text = "- **294/299** passed — **98.33%**. [Details](https://example.com)"
