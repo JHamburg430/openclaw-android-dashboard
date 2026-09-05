@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 from server import (
     AGENT_SENTINEL,
+    IGNORE_SENTINEL,
     SAY_SENTINEL,
     SPEECH_MODEL,
     SPEECH_MODEL_KEEP_ALIVE,
@@ -32,6 +33,16 @@ class RoutingTests(unittest.TestCase):
         self.assertIn(SAY_SENTINEL, prompt)
         self.assertIn("12:34 PM", prompt)
         self.assertNotIn("I'll check and let you know", prompt)
+
+    def test_prompt_ignores_background_speech_and_exposes_capabilities(self):
+        prompt = speech_model_prompt(self.now, capabilities="agent research: Research\nskill weather: Forecasts")
+        self.assertIn(IGNORE_SENTINEL, prompt)
+        self.assertIn("likely background conversation", prompt)
+        self.assertIn("agent research: Research", prompt)
+        self.assertIn("answer capability questions quickly", prompt)
+
+    def test_ignore_token_produces_no_spoken_text(self):
+        self.assertEqual(parse_speech_model_output(IGNORE_SENTINEL), ("ignore", ""))
 
     def test_speech_supervisor_uses_higher_quality_local_model(self):
         self.assertEqual(SPEECH_MODEL, "qwen3.5:4b")
@@ -82,6 +93,36 @@ class RoutingTests(unittest.TestCase):
         import asyncio
         asyncio.run(run_test())
 
+    def test_agent_retries_transient_gateway_restart(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.openclaw_json = AsyncMock(side_effect=[RuntimeError("gateway connection closed"), {"text": "Done."}])
+            with patch("server.asyncio.sleep", AsyncMock()) as sleep:
+                self.assertEqual(await service.agent_reply("Do the work."), "Done.")
+            self.assertEqual(service.openclaw_json.await_count, 2)
+            sleep.assert_awaited_once_with(1)
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_capability_catalog_lists_only_available_model_visible_skills(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.openclaw_json = AsyncMock(side_effect=[
+                [{"id": "main", "name": "Main"}, {"id": "research", "name": "Research"}],
+                {"skills": [
+                    {"name": "weather", "description": "Forecasts", "eligible": True, "modelVisible": True},
+                    {"name": "missing", "description": "Unavailable", "eligible": False, "modelVisible": True},
+                ]},
+            ])
+            catalog = await service.refresh_capabilities()
+            self.assertIn("agent research: Research", catalog)
+            self.assertIn("skill weather: Forecasts", catalog)
+            self.assertNotIn("missing", catalog)
+
+        import asyncio
+        asyncio.run(run_test())
+
     def test_agent_turn_intercepts_sentinel_without_speaking_it(self):
         async def run_test():
             service = LiveConversationService("agent:main:live-conversation", 0.85)
@@ -116,12 +157,12 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("first_pcm_enqueued", page)
         self.assertIn("pcm_delivery_done", page)
 
-    def test_default_tts_speed_is_normal(self):
+    def test_default_tts_speed_is_faster(self):
         import inspect
         from server import PersistentTtsWorker
 
         default = inspect.signature(PersistentTtsWorker).parameters["speed"].default
-        self.assertEqual(default, 1.0)
+        self.assertEqual(default, 1.15)
 
     def test_higher_quality_kokoro_british_voice_is_selected(self):
         self.assertTrue(DEFAULT_TTS_MODEL_DIR.endswith("/kokoro-en-v0_19"))

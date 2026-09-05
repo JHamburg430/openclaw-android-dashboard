@@ -44,6 +44,8 @@ SPEECH_MODEL = "qwen3.5:4b"
 SPEECH_MODEL_KEEP_ALIVE = "30m"
 AGENT_SENTINEL = "[[OPENCLAW_AGENT]]"
 SAY_SENTINEL = "[[SAY]]"
+IGNORE_SENTINEL = "[[IGNORE]]"
+CAPABILITY_CACHE_SECONDS = 60
 
 
 @dataclass
@@ -56,14 +58,14 @@ class TurnMetrics:
     route: str = ""
 
 
-def speech_model_prompt(now: datetime | None = None, agent_pending: bool = False) -> str:
+def speech_model_prompt(now: datetime | None = None, agent_pending: bool = False, capabilities: str = "") -> str:
     clock = now or datetime.now(ZoneInfo("America/Detroit"))
     if agent_pending:
         return f"""You are the conversational voice supervisor while an OpenClaw agent works in the background.
-Always output {SAY_SENTINEL} followed by one short natural spoken response.
+Output {IGNORE_SENTINEL} alone when the transcript is incoherent, fragmentary, accidental, or likely background conversation rather than a request addressed to you. Otherwise output {SAY_SENTINEL} followed by one short natural spoken response.
 Only respond because the user has spoken to you. If asked for status, truthfully say the agent is still working; never claim it has finished because this supervisor does not receive completion state. Answer unrelated casual or timeless questions yourself. If asked for another task needing tools or private context, explain briefly that the current agent is still busy; do not claim you started another agent.
 Never volunteer a timer-based or generic progress message. Agent progress may be relayed only when the agent actually emits it.
-Never fabricate private, project, or agent progress. The current local time is {clock.strftime('%-I:%M %p')} America/Detroit.
+Never fabricate private, project, or agent progress. If the gateway is restarting or temporarily unavailable, say it is reconnecting; do not describe that as the agent running into a problem. The current local time is {clock.strftime('%-I:%M %p')} America/Detroit.
 Examples:
 User: Are you still working on it?
 Assistant: {SAY_SENTINEL} Yes, the agent is still working in the background.
@@ -73,10 +75,14 @@ User: Also check my calendar.
 Assistant: {SAY_SENTINEL} The agent is still busy with the first request, so I haven’t started the calendar check."""
     return f"""You are the conversational voice supervisor. No OpenClaw agent is currently working.
 Output exactly one of these forms:
+- For an incoherent fragment, accidental speech, or likely background conversation that is not a request or question addressed to you: {IGNORE_SENTINEL} alone.
 - For casual conversation or timeless general knowledge answerable confidently without tools: {SAY_SENTINEL} followed by one short natural spoken response.
 - If no agent is working and the request needs apps, projects, private context, files, logs, calendar, messages, memory, current external facts, tools, judgment, or an action: {AGENT_SENTINEL} followed by a short natural acknowledgment telling the user what you are handing off. Write the acknowledgment yourself for this request.
 - If an agent is already working, keep conversing. For a status question, use {SAY_SENTINEL} and truthfully say the agent is still working. For unrelated simple conversation, answer normally. Do not start a second agent.
 The current local date and time is {clock.strftime('%A, %B %-d, %Y, %-I:%M %p')} America/Detroit; time and date questions can be answered directly.
+Available OpenClaw capabilities (cached and refreshed automatically):
+{capabilities or 'Capability catalog is temporarily unavailable; delegate capability questions to the agent.'}
+Use this catalog to answer capability questions quickly. If the user asks to use, configure, expand, or change a capability, acknowledge and delegate with {AGENT_SENTINEL}. Do not claim an unavailable capability exists. Newly added agents and skills appear after the catalog refreshes.
 Never fabricate private, project, or agent progress. The sentinel is machine-readable and must not be spoken.
 Examples:
 User: How is the RAG app improvement going?
@@ -91,6 +97,8 @@ Assistant: {SAY_SENTINEL} It is {clock.strftime('%-I:%M %p')}."""
 
 def parse_speech_model_output(text: str) -> tuple[str, str]:
     cleaned = text.strip()
+    if IGNORE_SENTINEL in cleaned:
+        return "ignore", ""
     if AGENT_SENTINEL in cleaned:
         acknowledgment = cleaned.split(AGENT_SENTINEL, 1)[1].strip()
         return "agent", acknowledgment
@@ -302,7 +310,7 @@ def split_spoken_text(text: str, max_chars: int = 180) -> list[str]:
 
 
 class PersistentTtsWorker:
-    def __init__(self, command: str, runtime_dir: str, model_dir: str, speed: float = 1.0):
+    def __init__(self, command: str, runtime_dir: str, model_dir: str, speed: float = 1.15):
         self.command = command
         self.runtime_dir = runtime_dir
         self.model_dir = model_dir
@@ -367,6 +375,9 @@ class LiveConversationService:
         self.tts = PersistentTtsWorker(DEFAULT_TTS_WORKER, DEFAULT_TTS_RUNTIME, DEFAULT_TTS_MODEL_DIR, tts_speed)
         self.agent_lock = asyncio.Lock()
         self.speech_lock = asyncio.Lock()
+        self.capabilities = ""
+        self.capabilities_updated_at = 0.0
+        self.capability_refresh_task: asyncio.Task[str] | None = None
 
     async def start(self) -> None:
         self.stt = await asyncio.to_thread(
@@ -376,8 +387,11 @@ class LiveConversationService:
             compute_type="int8",
         )
         await self.tts.start()
+        await self.refresh_capabilities()
 
     async def stop(self) -> None:
+        if self.capability_refresh_task and not self.capability_refresh_task.done():
+            self.capability_refresh_task.cancel()
         await self.tts.stop()
 
     async def transcribe(self, audio: bytes) -> str:
@@ -389,34 +403,76 @@ class LiveConversationService:
                 text = frame.text.strip()
         return text
 
+    async def openclaw_json(self, *arguments: str, timeout: int = 30) -> Any:
+        process = await asyncio.create_subprocess_exec(
+            DEFAULT_NODE_COMMAND, DEFAULT_OPENCLAW_MODULE, *arguments,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        if process.returncode != 0:
+            raise RuntimeError(stderr.decode("utf-8", errors="replace").strip() or "OpenClaw command failed")
+        return json.loads(stdout)
+
+    async def refresh_capabilities(self) -> str:
+        if self.capabilities and time.monotonic() - self.capabilities_updated_at < CAPABILITY_CACHE_SECONDS:
+            return self.capabilities
+        try:
+            agents, skills = await asyncio.gather(
+                self.openclaw_json("agents", "list", "--json"),
+                self.openclaw_json("skills", "list", "--json"),
+            )
+            agent_lines = [f"agent {item['id']}: {item.get('name', item['id'])}" for item in agents]
+            skill_lines = [
+                f"skill {item['name']}: {item.get('description', '')}"
+                for item in skills.get("skills", [])
+                if item.get("eligible") and item.get("modelVisible")
+            ]
+            self.capabilities = "\n".join(agent_lines + skill_lines)
+            self.capabilities_updated_at = time.monotonic()
+        except Exception as error:
+            LOGGER.warning("capability_refresh_failed error=%s", error)
+        return self.capabilities
+
+    @staticmethod
+    def gateway_is_transient(error: Exception) -> bool:
+        message = str(error).lower()
+        return any(marker in message for marker in (
+            "connection refused", "connection closed", "socket closed", "websocket",
+            "gateway", "econnrefused", "econnreset", "didn't receive pong",
+        ))
+
     async def agent_reply(self, text: str) -> str:
         async with self.agent_lock:
-            process = await asyncio.create_subprocess_exec(
-                DEFAULT_NODE_COMMAND, DEFAULT_OPENCLAW_MODULE, "agent",
-                "--session-key", self.session_key,
-                "--message", text,
-                "--timeout", "600",
-                "--json",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=610)
-        if process.returncode != 0:
-            raise RuntimeError(stderr.decode("utf-8", errors="replace").strip() or "Agent request failed")
-        payload = json.loads(stdout)
+            for attempt, delay in enumerate((1, 2, 4, 8), start=1):
+                try:
+                    payload = await self.openclaw_json(
+                        "agent", "--session-key", self.session_key, "--message", text,
+                        "--timeout", "600", "--json", timeout=610,
+                    )
+                    break
+                except Exception as error:
+                    if attempt == 4 or not self.gateway_is_transient(error):
+                        raise
+                    LOGGER.info("gateway_reconnecting attempt=%d error=%s", attempt, error)
+                    await asyncio.sleep(delay)
         reply = extract_agent_text(payload)
         if not reply:
             raise RuntimeError("Agent returned no speakable text")
         return reply
 
     async def speech_reply(self, text: str, agent_pending: bool = False) -> tuple[str, str]:
+        if time.monotonic() - self.capabilities_updated_at >= CAPABILITY_CACHE_SECONDS:
+            if not self.capability_refresh_task or self.capability_refresh_task.done():
+                self.capability_refresh_task = asyncio.create_task(self.refresh_capabilities())
+        capabilities = self.capabilities
         payload = {
             "model": SPEECH_MODEL,
             "keep_alive": SPEECH_MODEL_KEEP_ALIVE,
             "stream": False,
             "think": False,
             "messages": [
-                {"role": "system", "content": speech_model_prompt(agent_pending=agent_pending)},
+                {"role": "system", "content": speech_model_prompt(agent_pending=agent_pending, capabilities=capabilities)},
                 {"role": "user", "content": text},
             ],
             "options": {"temperature": 0, "num_predict": 80},
@@ -430,7 +486,7 @@ class LiveConversationService:
             route, reply = parse_speech_model_output(result.get("message", {}).get("content", ""))
             if agent_pending:
                 route = "direct"
-            if not reply:
+            if route != "ignore" and not reply:
                 raise ValueError("speech model returned no speakable text")
             return route, reply
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
@@ -507,6 +563,10 @@ class LiveConversationService:
             metrics.routing_ms = round((time.perf_counter() - stage) * 1000)
             metrics.route = route
 
+            if route == "ignore":
+                await socket.send_json({"type": "state", "state": "listening", "detail": "Ignored likely background speech."})
+                return None
+
             response_id = f"response-{time.monotonic_ns()}"
             metrics.tts_ms = await self.send_spoken_response(
                 socket, reply, metrics.route, response_id
@@ -569,7 +629,12 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
             work.cancel()
             raise
         except Exception as error:
-            await service.send_spoken_response(socket, f"The agent ran into a problem: {error}", "agent", f"agent-error-{time.monotonic_ns()}")
+            if service.gateway_is_transient(error):
+                message = "The gateway is still reconnecting. Please ask me to retry when it is back."
+            else:
+                message = "I couldn't complete that agent request."
+                LOGGER.exception("agent_request_failed error=%s", error)
+            await service.send_spoken_response(socket, message, "agent", f"agent-error-{time.monotonic_ns()}")
             await socket.send_json({"type": "agent_status", "state": "error"})
         finally:
             agent_task = None
@@ -627,7 +692,7 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--session-key", default=DEFAULT_SESSION_KEY)
-    parser.add_argument("--tts-speed", type=float, default=1.0)
+    parser.add_argument("--tts-speed", type=float, default=1.15)
     args = parser.parse_args()
     web.run_app(build_app(args), host=args.host, port=args.port, print=None)
 
