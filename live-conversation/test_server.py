@@ -1,6 +1,9 @@
 import unittest
 from datetime import datetime
-from unittest.mock import AsyncMock, patch
+import json
+from pathlib import Path
+import tempfile
+from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from server import (
@@ -92,6 +95,52 @@ class RoutingTests(unittest.TestCase):
 
         import asyncio
         asyncio.run(run_test())
+
+    def test_speech_supervisor_receives_prior_conversation_history(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.remember("user", "My robot is named Atlas.")
+            service.remember("assistant", "I’ll remember that.")
+            response = AsyncMock()
+            response.raise_for_status = lambda: None
+            response.json = AsyncMock(return_value={
+                "message": {"content": f"{SAY_SENTINEL} Atlas is your robot."}
+            })
+            context = MagicMock()
+            context.__aenter__.return_value = response
+            session = MagicMock()
+            session.post.return_value = context
+            session_context = MagicMock()
+            session_context.__aenter__.return_value = session
+            with patch("server.aiohttp.ClientSession", return_value=session_context):
+                self.assertEqual(
+                    await service.speech_reply("What is my robot’s name?"),
+                    ("direct", "Atlas is your robot."),
+                )
+            messages = session.post.call_args.kwargs["json"]["messages"]
+            self.assertEqual(messages[-3], {"role": "user", "content": "My robot is named Atlas."})
+            self.assertEqual(messages[-2], {"role": "assistant", "content": "I’ll remember that."})
+            self.assertEqual(messages[-1], {"role": "user", "content": "What is my robot’s name?"})
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_conversation_history_persists_across_service_restarts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.json"
+            first = LiveConversationService("agent:main:live-conversation", 1.15, str(path))
+            first.remember("user", "Call the robot Atlas.")
+            first.remember("assistant", "All right, Atlas it is.")
+
+            second = LiveConversationService("agent:main:live-conversation", 1.15, str(path))
+            self.assertEqual(second.recent_history(), [
+                {"role": "user", "content": "Call the robot Atlas."},
+                {"role": "assistant", "content": "All right, Atlas it is."},
+            ])
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8"))["messages"],
+                second.recent_history(),
+            )
 
     def test_agent_retries_transient_gateway_restart(self):
         async def run_test():

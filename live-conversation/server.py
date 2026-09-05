@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime
 import json
@@ -46,6 +47,9 @@ AGENT_SENTINEL = "[[OPENCLAW_AGENT]]"
 SAY_SENTINEL = "[[SAY]]"
 IGNORE_SENTINEL = "[[IGNORE]]"
 CAPABILITY_CACHE_SECONDS = 60
+DEFAULT_HISTORY_PATH = "/home/john/.openclaw/state/live-conversation-history.json"
+MAX_HISTORY_MESSAGES = 24
+MAX_HISTORY_CHARS = 12_000
 
 
 @dataclass
@@ -369,7 +373,7 @@ class PersistentTtsWorker:
 
 
 class LiveConversationService:
-    def __init__(self, session_key: str, tts_speed: float):
+    def __init__(self, session_key: str, tts_speed: float, history_path: str | None = None):
         self.session_key = session_key
         self.stt: WhisperSTTService | None = None
         self.tts = PersistentTtsWorker(DEFAULT_TTS_WORKER, DEFAULT_TTS_RUNTIME, DEFAULT_TTS_MODEL_DIR, tts_speed)
@@ -378,6 +382,49 @@ class LiveConversationService:
         self.capabilities = ""
         self.capabilities_updated_at = 0.0
         self.capability_refresh_task: asyncio.Task[str] | None = None
+        self.history_path = Path(history_path) if history_path else None
+        self.history: deque[dict[str, str]] = deque(maxlen=MAX_HISTORY_MESSAGES)
+        self._load_history()
+
+    def _load_history(self) -> None:
+        if not self.history_path or not self.history_path.exists():
+            return
+        try:
+            payload = json.loads(self.history_path.read_text(encoding="utf-8"))
+            messages = payload.get("messages", []) if isinstance(payload, dict) else []
+            for message in messages[-MAX_HISTORY_MESSAGES:]:
+                role = message.get("role")
+                content = message.get("content")
+                if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+                    self.history.append({"role": role, "content": content.strip()})
+        except (OSError, ValueError, TypeError) as error:
+            LOGGER.warning("conversation_history_load_failed error=%s", error)
+
+    def _save_history(self) -> None:
+        if not self.history_path:
+            return
+        try:
+            self.history_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.history_path.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps({"messages": list(self.history)}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(self.history_path)
+        except OSError as error:
+            LOGGER.warning("conversation_history_save_failed error=%s", error)
+
+    def remember(self, role: str, content: str) -> None:
+        content = content.strip()
+        if role not in ("user", "assistant") or not content:
+            return
+        self.history.append({"role": role, "content": content})
+        while sum(len(item["content"]) for item in self.history) > MAX_HISTORY_CHARS:
+            self.history.popleft()
+        self._save_history()
+
+    def recent_history(self) -> list[dict[str, str]]:
+        return [dict(message) for message in self.history]
 
     async def start(self) -> None:
         self.stt = await asyncio.to_thread(
@@ -473,6 +520,7 @@ class LiveConversationService:
             "think": False,
             "messages": [
                 {"role": "system", "content": speech_model_prompt(agent_pending=agent_pending, capabilities=capabilities)},
+                *self.recent_history(),
                 {"role": "user", "content": text},
             ],
             "options": {"temperature": 0, "num_predict": 80},
@@ -567,6 +615,9 @@ class LiveConversationService:
                 await socket.send_json({"type": "state", "state": "listening", "detail": "Ignored likely background speech."})
                 return None
 
+            self.remember("user", transcript)
+            self.remember("assistant", reply)
+
             response_id = f"response-{time.monotonic_ns()}"
             metrics.tts_ms = await self.send_spoken_response(
                 socket, reply, metrics.route, response_id
@@ -604,7 +655,12 @@ async def index(_: web.Request) -> web.Response:
 
 async def health(request: web.Request) -> web.Response:
     service: LiveConversationService = request.app["service"]
-    return web.json_response({"ok": service.stt is not None, "pipecat": "1.8.1", "stt": "faster-whisper tiny.en cpu-int8"})
+    return web.json_response({
+        "ok": service.stt is not None,
+        "pipecat": "1.8.1",
+        "stt": "faster-whisper tiny.en cpu-int8",
+        "history_messages": len(service.history),
+    })
 
 
 async def websocket(request: web.Request) -> web.WebSocketResponse:
@@ -622,6 +678,7 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
         try:
             await socket.send_json({"type": "agent_status", "state": "working"})
             reply = await work
+            service.remember("assistant", reply)
             await service.send_spoken_response(socket, reply, "agent", f"agent-{time.monotonic_ns()}")
             await socket.send_json({"type": "agent_status", "state": "complete", "elapsed_ms": round((time.monotonic() - started) * 1000)})
             await socket.send_json({"type": "state", "state": "listening"})
@@ -672,7 +729,7 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
 
 
 async def build_app(args: argparse.Namespace) -> web.Application:
-    service = LiveConversationService(args.session_key, args.tts_speed)
+    service = LiveConversationService(args.session_key, args.tts_speed, args.history_path)
     await service.start()
     app = web.Application()
     app["service"] = service
@@ -692,6 +749,7 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--session-key", default=DEFAULT_SESSION_KEY)
+    parser.add_argument("--history-path", default=DEFAULT_HISTORY_PATH)
     parser.add_argument("--tts-speed", type=float, default=1.15)
     args = parser.parse_args()
     web.run_app(build_app(args), host=args.host, port=args.port, print=None)

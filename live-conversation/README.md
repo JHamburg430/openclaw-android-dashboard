@@ -14,10 +14,15 @@ in the Android Dashboard plus menu.
    supervisor while remaining sub-second once warm on the installed GPUs. The
    Ollama request keeps it warm for 30 minutes to avoid repeated cold starts
    during a conversation.
-5. The service intercepts that token before display/TTS and sends the original
+5. A bounded conversation history supplies the previous user and assistant
+   turns to the speech supervisor. It is persisted at
+   `~/.openclaw/state/live-conversation-history.json`, so context survives a
+   WebView reconnect or service restart.
+6. The service intercepts that token before display/TTS and sends the original
    transcript to the normal OpenClaw agent in the dedicated
    `agent:main:live-conversation` session, preserving tools and context.
-6. A persistent local Jarvis TTS worker returns 24 kHz PCM to the Android
+7. A persistent local Kokoro TTS worker using the British male George voice
+   returns 24 kHz PCM to the Android
    native playback bridge.
 
 The speech-model prompt keeps the direct route conservative: requests needing
