@@ -96,8 +96,8 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_ASSISTANT_ROLE = 2006;
     public static final String ACTION_JARVIS_WAKE = "ai.openclaw.dashboard.action.JARVIS_WAKE";
     private static final String TAG = "OpenClawDashboard";
-    private static final int APP_VERSION_CODE = 61;
-    private static final String APP_VERSION_NAME = "1.0.61";
+    private static final int APP_VERSION_CODE = 62;
+    private static final String APP_VERSION_NAME = "1.0.62";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final int LIVE_CONVERSATION_PORT = 8790;
@@ -168,10 +168,12 @@ public final class MainActivity extends Activity {
         nodeClient = new OpenClawClient(new IdentityStore(this), new DashboardNodeListener(), this::handleNativeNodeCommand);
         ensureNotificationPermission();
         registerScreenOffReceiver();
-        if (!restoreWebViewState(savedInstanceState)) {
-            maybeAutoOpenDashboard();
+        boolean jarvisLaunch = getIntent() != null && ACTION_JARVIS_WAKE.equals(getIntent().getAction());
+        if (jarvisLaunch) {
+            handleLaunchIntent(getIntent());
+        } else {
+            if (!restoreWebViewState(savedInstanceState)) maybeAutoOpenDashboard();
         }
-        handleLaunchIntent(getIntent());
     }
 
     @Override

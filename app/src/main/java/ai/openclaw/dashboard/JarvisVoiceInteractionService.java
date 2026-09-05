@@ -106,6 +106,7 @@ public final class JarvisVoiceInteractionService extends VoiceInteractionService
 
     private void activateConversation() {
         setStatus("Jarvis detected");
+        paused = true;
         stopListening();
         Intent activity = new Intent(this, MainActivity.class)
                 .setAction(MainActivity.ACTION_JARVIS_WAKE)
