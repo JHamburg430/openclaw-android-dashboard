@@ -7,6 +7,8 @@ import android.content.pm.PackageManager;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
+import android.os.Handler;
+import android.os.Looper;
 import android.service.voice.VoiceInteractionService;
 import android.util.Log;
 
@@ -29,19 +31,22 @@ public final class JarvisVoiceInteractionService extends VoiceInteractionService
     private static final String TAG = "JarvisWake";
     private static final String PREFS = "openclaw_dashboard";
     private final AtomicBoolean listening = new AtomicBoolean(false);
+    private final Handler handler = new Handler(Looper.getMainLooper());
     private final OkHttpClient client = new OkHttpClient.Builder().pingInterval(15, TimeUnit.SECONDS).build();
     private AudioRecord recorder;
     private WebSocket socket;
     private Thread captureThread;
+    private volatile boolean paused;
 
     @Override public void onReady() {
         super.onReady();
+        paused = false;
         if (getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean("jarvis_wake_enabled", false)) startListening();
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent != null && ACTION_PAUSE.equals(intent.getAction())) stopListening();
-        else if (intent != null && ACTION_START.equals(intent.getAction())) startListening();
+        if (intent != null && ACTION_PAUSE.equals(intent.getAction())) { paused = true; stopListening(); }
+        else if (intent != null && ACTION_START.equals(intent.getAction())) { paused = false; startListening(); }
         return START_STICKY;
     }
 
@@ -55,6 +60,9 @@ public final class JarvisVoiceInteractionService extends VoiceInteractionService
                 AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, Math.max(minimum * 2, 32000));
         if (recorder.getState() != AudioRecord.STATE_INITIALIZED) { recorder.release(); recorder = null; return; }
         socket = client.newWebSocket(new Request.Builder().url(wakeUrl).build(), new WebSocketListener() {
+            @Override public void onOpen(WebSocket webSocket, Response response) {
+                setStatus("Listening for Jarvis");
+            }
             @Override public void onMessage(WebSocket webSocket, String text) {
                 try {
                     if ("wake".equals(new JSONObject(text).optString("type"))) activateConversation();
@@ -63,6 +71,10 @@ public final class JarvisVoiceInteractionService extends VoiceInteractionService
             @Override public void onFailure(WebSocket webSocket, Throwable error, Response response) {
                 Log.w(TAG, "Wake socket failed", error);
                 stopListening();
+                if (!paused && getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean("jarvis_wake_enabled", false)) {
+                    setStatus("Wake connection interrupted; retrying");
+                    handler.postDelayed(JarvisVoiceInteractionService.this::startListening, 3000);
+                }
             }
         });
         recorder.startRecording();
@@ -84,9 +96,8 @@ public final class JarvisVoiceInteractionService extends VoiceInteractionService
         String configured = prefs.getString("url", "");
         try {
             URI source = URI.create(configured);
-            String scheme = "https".equalsIgnoreCase(source.getScheme()) ? "wss" : "ws";
             if (source.getHost() == null) return null;
-            return new URI(scheme, null, source.getHost(), 8790, "/wake", null, null).toString();
+            return new URI("ws", null, source.getHost(), 8790, "/wake", null, null).toString();
         } catch (Exception error) {
             Log.w(TAG, "Invalid gateway URL for Jarvis", error);
             return null;
@@ -94,11 +105,16 @@ public final class JarvisVoiceInteractionService extends VoiceInteractionService
     }
 
     private void activateConversation() {
+        setStatus("Jarvis detected");
         stopListening();
         Intent activity = new Intent(this, MainActivity.class)
                 .setAction(MainActivity.ACTION_JARVIS_WAKE)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
         startActivity(activity);
+    }
+
+    private void setStatus(String status) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString("jarvis_wake_status", status).apply();
     }
 
     private synchronized void stopListening() {

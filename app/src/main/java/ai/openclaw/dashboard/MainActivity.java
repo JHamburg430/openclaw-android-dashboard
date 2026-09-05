@@ -96,8 +96,8 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_ASSISTANT_ROLE = 2006;
     public static final String ACTION_JARVIS_WAKE = "ai.openclaw.dashboard.action.JARVIS_WAKE";
     private static final String TAG = "OpenClawDashboard";
-    private static final int APP_VERSION_CODE = 60;
-    private static final String APP_VERSION_NAME = "1.0.60";
+    private static final int APP_VERSION_CODE = 61;
+    private static final String APP_VERSION_NAME = "1.0.61";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final int LIVE_CONVERSATION_PORT = 8790;
@@ -145,6 +145,7 @@ public final class MainActivity extends Activity {
     private Button overlayToggleButton;
     private Button jarvisWakeButton;
     private TextView collapsedOutputText;
+    private TextView jarvisWakeStatusText;
     private WebView webView;
     private boolean chromeExpanded = true;
     private boolean appsDrawerVisible = false;
@@ -300,6 +301,9 @@ public final class MainActivity extends Activity {
         jarvisWakeButton = button("Enable Jarvis wake word");
         jarvisWakeButton.setContentDescription("Enable Jarvis wake word from the regular and lock screens");
         controls.addView(jarvisWakeButton, new LinearLayout.LayoutParams(-1, dp(44)));
+        jarvisWakeStatusText = text("Jarvis wake word is disabled.", 12, COLOR_TEXT_MUTED, false);
+        jarvisWakeStatusText.setPadding(dp(8), dp(4), dp(8), dp(8));
+        controls.addView(jarvisWakeStatusText);
 
         controls.addView(label("Diagnostics"));
         LinearLayout diagnosticsActions = new LinearLayout(this);
@@ -628,7 +632,8 @@ public final class MainActivity extends Activity {
     private void toggleJarvisWakeWord() {
         boolean enabled = prefs.getBoolean("jarvis_wake_enabled", false);
         if (enabled) {
-            prefs.edit().putBoolean("jarvis_wake_enabled", false).apply();
+            prefs.edit().putBoolean("jarvis_wake_enabled", false)
+                    .putString("jarvis_wake_status", "Jarvis wake word is disabled.").apply();
             pauseJarvisWakeListener();
             updateJarvisWakeButton();
             statusText.setText("Jarvis wake word disabled.");
@@ -653,7 +658,8 @@ public final class MainActivity extends Activity {
     }
 
     private void enableJarvisWakeWord() {
-        prefs.edit().putBoolean("jarvis_wake_enabled", true).apply();
+        prefs.edit().putBoolean("jarvis_wake_enabled", true)
+                .putString("jarvis_wake_status", "Starting Jarvis listener").apply();
         resumeJarvisWakeListener();
         updateJarvisWakeButton();
         statusText.setText("Jarvis wake word enabled for regular and lock screens.");
@@ -674,6 +680,8 @@ public final class MainActivity extends Activity {
         if (jarvisWakeButton == null) return;
         boolean enabled = prefs.getBoolean("jarvis_wake_enabled", false) && holdsAssistantRole();
         jarvisWakeButton.setText(enabled ? "Disable Jarvis wake word" : "Enable Jarvis wake word");
+        String wakeStatus = prefs.getString("jarvis_wake_status", enabled ? "Starting Jarvis listener" : "Jarvis wake word is disabled.");
+        jarvisWakeStatusText.setText(wakeStatus);
     }
 
     private void openNativeToolsPage() {
