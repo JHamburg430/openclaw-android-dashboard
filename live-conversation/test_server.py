@@ -18,6 +18,7 @@ from server import (
     DEFAULT_TTS_SPEAKER_ID,
     LiveConversationService,
     extract_agent_text,
+    is_wake_word,
     parse_speech_model_output,
     normalize_spoken_text,
     render_page,
@@ -52,9 +53,18 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("historyMessages.slice(-24)", page)
         self.assertIn("addHistory('user',pendingTranscript)", page)
         self.assertIn("addHistory('assistant',m.text)", page)
+        self.assertIn("get('autostart')==='1'", page)
+        self.assertIn("liveConversationStopped", page)
 
     def test_ignore_token_produces_no_spoken_text(self):
         self.assertEqual(parse_speech_model_output(IGNORE_SENTINEL), ("ignore", ""))
+
+    def test_jarvis_wake_word_matches_as_a_word(self):
+        self.assertTrue(is_wake_word("Jarvis"))
+        self.assertTrue(is_wake_word("Hey, Jarvis!"))
+        self.assertTrue(is_wake_word("Chavez"))
+        self.assertFalse(is_wake_word("The jar is over there"))
+        self.assertFalse(is_wake_word("JARVISON"))
 
     def test_speech_supervisor_uses_higher_quality_local_model(self):
         self.assertEqual(SPEECH_MODEL, "qwen3.5:4b")

@@ -6,10 +6,13 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.app.role.RoleManager;
+import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ResolveInfo;
 import android.content.pm.PackageManager;
 import android.content.SharedPreferences;
@@ -90,9 +93,11 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_CAMERA = 2003;
     private static final int REQUEST_FILE_CHOOSER = 2004;
     private static final int REQUEST_BLUETOOTH_CONNECT = 2005;
+    private static final int REQUEST_ASSISTANT_ROLE = 2006;
+    public static final String ACTION_JARVIS_WAKE = "ai.openclaw.dashboard.action.JARVIS_WAKE";
     private static final String TAG = "OpenClawDashboard";
-    private static final int APP_VERSION_CODE = 54;
-    private static final String APP_VERSION_NAME = "1.0.54";
+    private static final int APP_VERSION_CODE = 60;
+    private static final String APP_VERSION_NAME = "1.0.60";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final int LIVE_CONVERSATION_PORT = 8790;
@@ -138,11 +143,18 @@ public final class MainActivity extends Activity {
     private Button connectNodeButton;
     private Button chromeToggleButton;
     private Button overlayToggleButton;
+    private Button jarvisWakeButton;
     private TextView collapsedOutputText;
     private WebView webView;
     private boolean chromeExpanded = true;
     private boolean appsDrawerVisible = false;
     private int statusBarTopInset = 0;
+    private boolean screenReceiverRegistered = false;
+    private final BroadcastReceiver screenOffReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            if (Intent.ACTION_SCREEN_OFF.equals(intent.getAction())) stopLiveConversationForLock();
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -154,15 +166,24 @@ public final class MainActivity extends Activity {
         loadPrefs();
         nodeClient = new OpenClawClient(new IdentityStore(this), new DashboardNodeListener(), this::handleNativeNodeCommand);
         ensureNotificationPermission();
+        registerScreenOffReceiver();
         if (!restoreWebViewState(savedInstanceState)) {
             maybeAutoOpenDashboard();
         }
+        handleLaunchIntent(getIntent());
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         clearNativeNotifications();
+        updateJarvisWakeButton();
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleLaunchIntent(intent);
     }
 
     @Override
@@ -175,6 +196,10 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        if (screenReceiverRegistered) {
+            unregisterReceiver(screenOffReceiver);
+            screenReceiverRegistered = false;
+        }
         if (webView != null) {
             webView.destroy();
             webView = null;
@@ -271,6 +296,10 @@ public final class MainActivity extends Activity {
         appActions.addView(appsButton, new LinearLayout.LayoutParams(0, dp(42), 1));
         appActions.addView(liveConversationButton, new LinearLayout.LayoutParams(0, dp(42), 1));
         controls.addView(appActions);
+
+        jarvisWakeButton = button("Enable Jarvis wake word");
+        jarvisWakeButton.setContentDescription("Enable Jarvis wake word from the regular and lock screens");
+        controls.addView(jarvisWakeButton, new LinearLayout.LayoutParams(-1, dp(44)));
 
         controls.addView(label("Diagnostics"));
         LinearLayout diagnosticsActions = new LinearLayout(this);
@@ -443,6 +472,7 @@ public final class MainActivity extends Activity {
         overlayToggleButton.setOnClickListener(v -> setAppsDrawerVisible(!appsDrawerVisible));
         appsButton.setOnClickListener(v -> setAppsDrawerVisible(true));
         liveConversationButton.setOnClickListener(v -> openLiveConversation());
+        jarvisWakeButton.setOnClickListener(v -> toggleJarvisWakeWord());
         copyDiagnostics.setOnClickListener(v -> copyDiagnostics());
         clearDiagnostics.setOnClickListener(v -> clearDiagnostics());
         probeMic.setOnClickListener(v -> runNativeMicProbe());
@@ -542,8 +572,108 @@ public final class MainActivity extends Activity {
     }
 
     private void openLiveConversation() {
+        openLiveConversation(false);
+    }
+
+    private void openLiveConversation(boolean autostart) {
         recordDiagnostic("live_conversation.open", "pipecat_port=" + LIVE_CONVERSATION_PORT);
-        openLocalApp(LIVE_CONVERSATION_PORT);
+        pauseJarvisWakeListener();
+        setAppsDrawerVisible(false);
+        try {
+            String url = buildSiblingAppUrl(LIVE_CONVERSATION_PORT) + (autostart ? "?autostart=1" : "");
+            webView.stopLoading();
+            webView.loadUrl(url);
+            setConnectedUiVisible(true);
+            statusText.setText(autostart ? "Jarvis heard. Starting Live Conversation." : "Opening Live Conversation");
+        } catch (Exception error) {
+            statusText.setText("Could not open Live Conversation: " + error.getMessage());
+            recordDiagnostic("live_conversation.failed", error.getMessage());
+            resumeJarvisWakeListener();
+        }
+    }
+
+    private void registerScreenOffReceiver() {
+        IntentFilter filter = new IntentFilter(Intent.ACTION_SCREEN_OFF);
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(screenOffReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        else registerReceiver(screenOffReceiver, filter);
+        screenReceiverRegistered = true;
+    }
+
+    private boolean isLiveConversationOpen() {
+        return webView != null && webView.getUrl() != null && webView.getUrl().contains(":" + LIVE_CONVERSATION_PORT);
+    }
+
+    private void stopLiveConversationForLock() {
+        if (!isLiveConversationOpen()) return;
+        webView.evaluateJavascript("if(typeof stop==='function')stop()", null);
+        nativeAudioBridge.shutdown();
+        recordDiagnostic("live_conversation.stopped", "screen_off");
+        openDashboard();
+        resumeJarvisWakeListener();
+    }
+
+    private void handleLaunchIntent(Intent intent) {
+        if (intent != null && ACTION_JARVIS_WAKE.equals(intent.getAction())) {
+            intent.setAction(null);
+            openLiveConversation(true);
+        }
+    }
+
+    private boolean holdsAssistantRole() {
+        RoleManager roles = (RoleManager) getSystemService(Context.ROLE_SERVICE);
+        return roles != null && roles.isRoleAvailable(RoleManager.ROLE_ASSISTANT)
+                && roles.isRoleHeld(RoleManager.ROLE_ASSISTANT);
+    }
+
+    private void toggleJarvisWakeWord() {
+        boolean enabled = prefs.getBoolean("jarvis_wake_enabled", false);
+        if (enabled) {
+            prefs.edit().putBoolean("jarvis_wake_enabled", false).apply();
+            pauseJarvisWakeListener();
+            updateJarvisWakeButton();
+            statusText.setText("Jarvis wake word disabled.");
+            return;
+        }
+        if (!hasRecordAudioPermission()) {
+            statusText.setText("Allow microphone access, then enable Jarvis again.");
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD_AUDIO);
+            return;
+        }
+        savePrefs();
+        RoleManager roles = (RoleManager) getSystemService(Context.ROLE_SERVICE);
+        if (roles == null || !roles.isRoleAvailable(RoleManager.ROLE_ASSISTANT)) {
+            statusText.setText("Android does not expose the Assistant role on this device.");
+            return;
+        }
+        if (!roles.isRoleHeld(RoleManager.ROLE_ASSISTANT)) {
+            startActivityForResult(roles.createRequestRoleIntent(RoleManager.ROLE_ASSISTANT), REQUEST_ASSISTANT_ROLE);
+            return;
+        }
+        enableJarvisWakeWord();
+    }
+
+    private void enableJarvisWakeWord() {
+        prefs.edit().putBoolean("jarvis_wake_enabled", true).apply();
+        resumeJarvisWakeListener();
+        updateJarvisWakeButton();
+        statusText.setText("Jarvis wake word enabled for regular and lock screens.");
+    }
+
+    private void pauseJarvisWakeListener() {
+        startService(new Intent(this, JarvisVoiceInteractionService.class)
+                .setAction(JarvisVoiceInteractionService.ACTION_PAUSE));
+    }
+
+    private void resumeJarvisWakeListener() {
+        if (!prefs.getBoolean("jarvis_wake_enabled", false) || !holdsAssistantRole()) return;
+        startService(new Intent(this, JarvisVoiceInteractionService.class)
+                .setAction(JarvisVoiceInteractionService.ACTION_START));
+    }
+
+    private void updateJarvisWakeButton() {
+        if (jarvisWakeButton == null) return;
+        boolean enabled = prefs.getBoolean("jarvis_wake_enabled", false) && holdsAssistantRole();
+        jarvisWakeButton.setText(enabled ? "Disable Jarvis wake word" : "Enable Jarvis wake word");
     }
 
     private void openNativeToolsPage() {
@@ -1028,6 +1158,15 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode == REQUEST_ASSISTANT_ROLE) {
+            if (holdsAssistantRole()) enableJarvisWakeWord();
+            else {
+                prefs.edit().putBoolean("jarvis_wake_enabled", false).apply();
+                updateJarvisWakeButton();
+                statusText.setText("Jarvis needs the Android Assistant role for lock-screen listening.");
+            }
+            return;
+        }
         if (requestCode == REQUEST_FILE_CHOOSER) {
             ValueCallback<Uri[]> callback = pendingFilePathCallback;
             pendingFilePathCallback = null;
@@ -1784,6 +1923,11 @@ public final class MainActivity extends Activity {
         @JavascriptInterface
         public void openLiveConversation() {
             runOnUiThread(MainActivity.this::openLiveConversation);
+        }
+
+        @JavascriptInterface
+        public void liveConversationStopped() {
+            runOnUiThread(MainActivity.this::resumeJarvisWakeListener);
         }
 
         private String errorJson(Exception e) {

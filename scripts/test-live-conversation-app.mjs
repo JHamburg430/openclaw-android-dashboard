@@ -7,7 +7,8 @@ const methodEnd = source.indexOf("private void openNativeToolsPage()", methodSta
 const method = source.slice(methodStart, methodEnd);
 
 assert.ok(source.includes("LIVE_CONVERSATION_PORT = 8790"));
-assert.ok(method.includes("openLocalApp(LIVE_CONVERSATION_PORT)"));
+assert.ok(method.includes("openLiveConversation(false)"));
+assert.ok(source.includes("buildSiblingAppUrl(LIVE_CONVERSATION_PORT)"));
 assert.equal(method.includes("buildLiveConversationHtml()"), false);
 assert.ok(source.includes("public void prepareAgentResponsePlayback()"));
 assert.ok(source.includes('prepareSpeakerPlaybackRoute(audioManager, "response_prepare")'));

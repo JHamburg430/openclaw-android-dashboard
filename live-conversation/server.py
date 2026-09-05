@@ -50,6 +50,15 @@ CAPABILITY_CACHE_SECONDS = 60
 DEFAULT_HISTORY_PATH = "/home/john/.openclaw/state/live-conversation-history.json"
 MAX_HISTORY_MESSAGES = 24
 MAX_HISTORY_CHARS = 12_000
+WAKE_WORD = "jarvis"
+WAKE_WORD_ALIASES = frozenset(("jarvis", "jervis", "chavez"))
+WAKE_WINDOW_SECONDS = 2.5
+WAKE_COOLDOWN_SECONDS = 5.0
+
+
+def is_wake_word(transcript: str) -> bool:
+    normalized = re.sub(r"[^a-z]+", " ", transcript.lower()).strip()
+    return bool(WAKE_WORD_ALIASES.intersection(normalized.split()))
 
 
 @dataclass
@@ -379,6 +388,7 @@ class LiveConversationService:
         self.tts = PersistentTtsWorker(DEFAULT_TTS_WORKER, DEFAULT_TTS_RUNTIME, DEFAULT_TTS_MODEL_DIR, tts_speed)
         self.agent_lock = asyncio.Lock()
         self.speech_lock = asyncio.Lock()
+        self.transcribe_lock = asyncio.Lock()
         self.capabilities = ""
         self.capabilities_updated_at = 0.0
         self.capability_refresh_task: asyncio.Task[str] | None = None
@@ -445,9 +455,10 @@ class LiveConversationService:
         if not self.stt:
             raise RuntimeError("Speech recognizer is not ready")
         text = ""
-        async for frame in self.stt.run_stt(audio):
-            if isinstance(frame, TranscriptionFrame):
-                text = frame.text.strip()
+        async with self.transcribe_lock:
+            async for frame in self.stt.run_stt(audio):
+                if isinstance(frame, TranscriptionFrame):
+                    text = frame.text.strip()
         return text
 
     async def openclaw_json(self, *arguments: str, timeout: int = 30) -> Any:
@@ -647,7 +658,7 @@ function begin(){if(recording||awaitingResponse)return;recording=true;candidateS
 function tick(){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>20)pre.shift();if(awaitingResponse){candidateSpeechMs=0;return}candidateSpeechMs=level>=.006?candidateSpeechMs+20:0;if(candidateSpeechMs>=200)begin();return}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=20;silenceMs=0}else silenceMs+=20;if(speechMs>=200&&silenceMs>=600){recording=false;awaitingResponse=true;candidateSpeechMs=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}}
 function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-24):[];renderHistory()}if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if((m.detail||'').startsWith('Ignored')){pendingTranscript='';awaitingResponse=false}}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;if(pendingTranscript){addHistory('user',pendingTranscript);pendingTranscript=''}addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){awaitingResponse=false;responseActive=true;candidateSpeechMs=0;pre=[];audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){responseActive=false;candidateSpeechMs=0;pre=[];report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
 function stop(){if(timer)clearInterval(timer);timer=null;try{OpenClawNativeAudio.stopCapture()}catch(e){}if(ws)ws.close();ws=null;recording=false;awaitingResponse=false;responseActive=false;candidateSpeechMs=0;bar.style.width='0%';state.textContent='Stopped'}
-document.getElementById('start').onclick=start;document.getElementById('stop').onclick=stop;window.addEventListener('pagehide',stop);
+document.getElementById('start').onclick=start;document.getElementById('stop').onclick=()=>{stop();try{OpenClawNativeApp.liveConversationStopped()}catch(e){}};window.addEventListener('pagehide',stop);if(new URLSearchParams(location.search).get('autostart')==='1')start();
 </script></body></html>"""
 
 
@@ -663,6 +674,32 @@ async def health(request: web.Request) -> web.Response:
         "stt": "faster-whisper tiny.en cpu-int8",
         "history_messages": len(service.history),
     })
+
+
+async def wake_websocket(request: web.Request) -> web.WebSocketResponse:
+    """Detect the configured wake word from rolling raw 16 kHz PCM windows."""
+    service: LiveConversationService = request.app["service"]
+    socket = web.WebSocketResponse(heartbeat=20)
+    await socket.prepare(request)
+    audio = bytearray()
+    window_bytes = round(SAMPLE_RATE * 2 * WAKE_WINDOW_SECONDS)
+    retain_bytes = SAMPLE_RATE * 2
+    last_trigger = 0.0
+    async for message in socket:
+        if message.type != WSMsgType.BINARY:
+            continue
+        audio.extend(message.data)
+        if len(audio) < window_bytes:
+            continue
+        window = bytes(audio[-window_bytes:])
+        audio[:] = audio[-retain_bytes:]
+        transcript = await service.transcribe(window)
+        LOGGER.info("wake_word_probe transcript=%r", transcript)
+        if is_wake_word(transcript) and time.monotonic() - last_trigger >= WAKE_COOLDOWN_SECONDS:
+            last_trigger = time.monotonic()
+            await socket.send_json({"type": "wake", "word": WAKE_WORD})
+            LOGGER.info("wake_word_detected word=%s", WAKE_WORD)
+    return socket
 
 
 async def websocket(request: web.Request) -> web.WebSocketResponse:
@@ -738,6 +775,7 @@ async def build_app(args: argparse.Namespace) -> web.Application:
     app["service"] = service
     app.router.add_get("/", index)
     app.router.add_get("/health", health)
+    app.router.add_get("/wake", wake_websocket)
     app.router.add_get("/ws", websocket)
     async def cleanup(_: web.Application) -> None:
         await service.stop()

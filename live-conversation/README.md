@@ -25,6 +25,11 @@ in the Android Dashboard plus menu.
 7. A persistent local Kokoro TTS worker using the British male George voice
    returns 24 kHz PCM to the Android
    native playback bridge.
+8. When OpenClaw Dashboard holds Android's Assistant role, its lightweight
+   voice service streams rolling microphone windows to `/wake`. Detecting the
+   standalone word “Jarvis” opens and auto-starts Live Conversation over the
+   regular or lock screen. Turning the screen off stops an active conversation
+   and resumes wake listening.
 
 The speech-model prompt keeps the direct route conservative: requests needing
 current information, personal context, tools, memory, judgment, or side effects
@@ -34,6 +39,14 @@ The bridge forwards escalated transcripts without adding response-length or
 reasoning instructions. Voice response policy belongs to the gateway agent's
 workspace instructions so complex requests can finish normal tool-backed work
 before the final answer is shortened for speech.
+
+## Jarvis wake word on Android
+
+Install dashboard version 1.0.60 or newer, open the app while unlocked, and tap
+**Enable Jarvis wake word**. Approve the Android Assistant-role prompt. The app
+must remain the selected Assistant for lock-screen microphone access. Saying
+“Jarvis” opens and starts Live Conversation; pressing the side lock button
+stops an active conversation and returns to wake listening.
 
 ## Install and run
 
