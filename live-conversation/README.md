@@ -17,7 +17,8 @@ in the Android Dashboard plus menu.
 5. A bounded conversation history supplies the previous user and assistant
    turns to the speech supervisor. It is persisted at
    `~/.openclaw/state/live-conversation-history.json`, so context survives a
-   WebView reconnect or service restart.
+   WebView reconnect or service restart. The Live Conversation page displays
+   the same rolling 24-message history as user and assistant bubbles.
 6. The service intercepts that token before display/TTS and sends the original
    transcript to the normal OpenClaw agent in the dedicated
    `agent:main:live-conversation` session, preserving tools and context.

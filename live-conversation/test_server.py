@@ -40,9 +40,18 @@ class RoutingTests(unittest.TestCase):
     def test_prompt_ignores_background_speech_and_exposes_capabilities(self):
         prompt = speech_model_prompt(self.now, capabilities="agent research: Research\nskill weather: Forecasts")
         self.assertIn(IGNORE_SENTINEL, prompt)
-        self.assertIn("likely background conversation", prompt)
+        self.assertIn("clearly not addressed to you", prompt)
+        self.assertIn("grammar is imperfect", prompt)
         self.assertIn("agent research: Research", prompt)
         self.assertIn("answer capability questions quickly", prompt)
+
+    def test_page_displays_and_updates_the_rolling_history(self):
+        page = render_page()
+        self.assertIn("Conversation history · last 24 messages", page)
+        self.assertIn("m.type==='history'", page)
+        self.assertIn("historyMessages.slice(-24)", page)
+        self.assertIn("addHistory('user',pendingTranscript)", page)
+        self.assertIn("addHistory('assistant',m.text)", page)
 
     def test_ignore_token_produces_no_spoken_text(self):
         self.assertEqual(parse_speech_model_output(IGNORE_SENTINEL), ("ignore", ""))
