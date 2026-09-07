@@ -43,11 +43,14 @@ in the Android Dashboard plus menu.
    regular or lock screen. Turning the screen off stops an active conversation
    and resumes wake listening.
 
-The speech-model prompt defines Jarvis's voice-supervisor role, exposes available
-agents and skills, distinguishes direct status answers from actual work, and
-documents the exact contracts for new-agent and existing-session handoffs. It
-also tells the model to resolve likely ASR errors from context while asking for
-clarification when a proper noun remains uncertain.
+The speech-model prompt defines Jarvis as the model operating Live Conversation,
+not as a separate supervisor outside it. Hearing and identity checks have
+deterministic local answers, and stale false-identity replies are excluded from
+the model's prompt history. The prompt also exposes available agents and skills,
+distinguishes direct status answers from actual work, documents the exact
+contracts for new-agent and existing-session handoffs, and resolves likely ASR
+errors from context while asking for clarification when a proper noun remains
+uncertain.
 
 The bridge forwards escalated transcripts without adding response-length or
 reasoning instructions. Voice response policy belongs to the gateway agent's

@@ -75,6 +75,41 @@ def repair_known_transcription_errors(transcript: str) -> str:
     )
 
 
+def direct_voice_surface_reply(transcript: str) -> str | None:
+    """Answer voice-presence and identity checks without model interpretation."""
+    normalized = re.sub(r"[^a-z0-9']+", " ", transcript.lower()).strip()
+    hearing_check = re.search(
+        r"\b(?:can|could|do|did|are) you (?:actually )?(?:able to )?hear(?:ing)? me\b",
+        normalized,
+    )
+    if hearing_check:
+        return "Yes, I can hear you clearly."
+    if normalized in {
+        "who are you",
+        "what are you",
+        "are you jarvis",
+        "are you the live conversation model",
+        "are you the live conversation agent",
+    }:
+        return (
+            "I'm Jarvis, the model operating Live Conversation. "
+            "I answer here directly and use gateway agents when tool-backed work is needed."
+        )
+    return None
+
+
+def has_stale_identity_confusion(text: str) -> bool:
+    """Detect the known false claim that Jarvis and Live Conversation are separate."""
+    normalized = re.sub(r"\s+", " ", text.lower())
+    return bool(
+        re.search(r"\bnot (?:the )?live conversation model\b", normalized)
+        or re.search(
+            r"\blive conversation (?:model|agent) is (?:running|separate|within)",
+            normalized,
+        )
+    )
+
+
 @dataclass
 class TurnMetrics:
     asr_ms: int = 0
@@ -97,11 +132,13 @@ def speech_model_prompt(
         if agent_pending else
         "No agent request launched by this voice connection is currently awaiting a final response. "
     )
-    return f"""You are Jarvis, the always-available conversational voice supervisor for John's OpenClaw system.
+    return f"""You are Jarvis, the model operating John's Live Conversation voice interface right now.
+Jarvis and the Live Conversation model are the same speaker: both refer to you. You receive John's locally transcribed microphone input, choose how each turn is handled, and speak the response. A gateway agent is only a tool-backed work session that you may use; it is not a separate Live Conversation model. Never claim that you are merely a supervisor outside Live Conversation, and never ask an agent to verify whether you can hear John. If a microphone utterance reaches you as a transcript, you heard it.
 You are not a general chatbot pretending to lack system access. You can see the live gateway-session summary and capability catalog below, answer questions about them directly, route a follow-up into an existing session, or launch a separate agent session. {pending_note}
 Output exactly one of these forms:
 - Only for speech that is clearly not addressed to you and has no plausible request, question, or conversational meaning: {IGNORE_SENTINEL} alone. Do not ignore a plausible command or question merely because its grammar is imperfect or speech recognition likely changed a word.
 - For casual conversation or timeless general knowledge answerable confidently without tools: {SAY_SENTINEL} followed by one short natural spoken response.
+- For a hearing check such as “can you hear me?”, answer exactly: {SAY_SENTINEL} Yes, I can hear you clearly. Do not qualify the answer or involve an agent.
 - For a new request needing apps, projects, private context, files, logs, calendar, messages, memory, current external facts, tools, judgment, or an action: {AGENT_SENTINEL} followed by a short natural acknowledgment. The bridge starts an agent and speaks its final response when it returns.
 - If John explicitly asks for another, new, separate, or additional agent, use {NEW_AGENT_SENTINEL} followed by the acknowledgment. Multiple agents may work concurrently.
 - To add instructions or a follow-up to a specific active or recent session listed below, output [[OPENCLAW_SESSION:exact-session-key]] followed by the acknowledgment. Copy the key exactly. Use the most clearly referenced session; never invent a key. The bridge sends the message to that session and speaks its eventual response.
@@ -130,7 +167,11 @@ Assistant: {AGENT_SENTINEL} I’ll have the agent review this conversation and i
 User: Who wrote The Hobbit?
 Assistant: {SAY_SENTINEL} J. R. R. Tolkien wrote The Hobbit.
 User: What time is it?
-Assistant: {SAY_SENTINEL} It is {clock.strftime('%-I:%M %p')}."""
+Assistant: {SAY_SENTINEL} It is {clock.strftime('%-I:%M %p')}.
+User: Are you able to hear me?
+Assistant: {SAY_SENTINEL} Yes, I can hear you clearly.
+User: Are you the Live Conversation model?
+Assistant: {SAY_SENTINEL} Yes. I'm Jarvis, the model operating Live Conversation."""
 
 
 def parse_speech_model_output(text: str) -> tuple[str, str, str | None]:
@@ -495,6 +536,8 @@ class LiveConversationService:
         selected: deque[dict[str, str]] = deque()
         used_chars = 0
         for message in reversed(self.history):
+            if message["role"] == "assistant" and has_stale_identity_confusion(message["content"]):
+                continue
             size = len(message["content"])
             if selected and (
                 len(selected) >= PROMPT_HISTORY_MESSAGES
@@ -660,6 +703,9 @@ class LiveConversationService:
     async def speech_reply(
         self, text: str, agent_pending: bool = False
     ) -> tuple[str, str, str | None]:
+        direct_reply = direct_voice_surface_reply(text)
+        if direct_reply:
+            return "direct", direct_reply, None
         if time.monotonic() - self.capabilities_updated_at >= CAPABILITY_CACHE_SECONDS:
             if not self.capability_refresh_task or self.capability_refresh_task.done():
                 self.capability_refresh_task = asyncio.create_task(self.refresh_capabilities())
@@ -699,6 +745,14 @@ class LiveConversationService:
                 result.get("message", {}).get("content", "")
             )
             reply = repair_known_transcription_errors(reply)
+            if has_stale_identity_confusion(reply):
+                LOGGER.warning("speech_supervisor_repaired_false_identity")
+                route, reply, target_session = (
+                    "direct",
+                    "I'm Jarvis, the model operating Live Conversation. "
+                    "I answer here directly and use gateway agents when tool-backed work is needed.",
+                    None,
+                )
             if route == "session" and target_session not in self.session_keys:
                 LOGGER.warning("speech_supervisor_invalid_session target=%s", target_session)
                 route, target_session = "agent", None

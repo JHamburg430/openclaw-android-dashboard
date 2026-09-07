@@ -21,7 +21,9 @@ from server import (
     LiveConversationService,
     MAX_HISTORY_MESSAGES,
     PROMPT_HISTORY_CHARS,
+    direct_voice_surface_reply,
     extract_agent_text,
+    has_stale_identity_confusion,
     is_wake_word,
     parse_speech_model_output,
     repair_known_transcription_errors,
@@ -42,6 +44,31 @@ class RoutingTests(unittest.TestCase):
         self.assertIn(SAY_SENTINEL, prompt)
         self.assertIn("12:34 PM", prompt)
         self.assertNotIn("I'll check and let you know", prompt)
+        self.assertIn("Jarvis and the Live Conversation model are the same speaker", prompt)
+        self.assertIn("never ask an agent to verify whether you can hear John", prompt)
+
+    def test_hearing_and_identity_checks_are_deterministic(self):
+        self.assertEqual(
+            direct_voice_surface_reply("Are you able to hear me?"),
+            "Yes, I can hear you clearly.",
+        )
+        self.assertEqual(
+            direct_voice_surface_reply("Can you actually hear me now?"),
+            "Yes, I can hear you clearly.",
+        )
+        self.assertIn("model operating Live Conversation", direct_voice_surface_reply("Who are you?"))
+        self.assertIsNone(direct_voice_surface_reply("Can you check the RAG app?"))
+
+    def test_known_false_identity_claim_is_detected(self):
+        self.assertTrue(has_stale_identity_confusion(
+            "I am Jarvis, not the live conversation model itself."
+        ))
+        self.assertTrue(has_stale_identity_confusion(
+            "The live conversation model is running within an active agent session."
+        ))
+        self.assertFalse(has_stale_identity_confusion(
+            "I'm Jarvis, the model operating Live Conversation."
+        ))
 
     def test_prompt_ignores_background_speech_and_exposes_capabilities(self):
         prompt = speech_model_prompt(self.now, capabilities="agent research: Research\nskill weather: Forecasts")
@@ -210,6 +237,35 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(messages[-3], {"role": "user", "content": "My robot is named Atlas."})
             self.assertEqual(messages[-2], {"role": "assistant", "content": "I’ll remember that."})
             self.assertEqual(messages[-1], {"role": "user", "content": "What is my robot’s name?"})
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_false_identity_history_is_not_sent_to_supervisor(self):
+        service = LiveConversationService("agent:main:live-conversation", 1.15)
+        service.remember("user", "Are you able to hear me?")
+        service.remember(
+            "assistant",
+            "I am Jarvis, not the live conversation model itself.",
+        )
+        service.remember("user", "What can you do?")
+        self.assertEqual(
+            service.prompt_history(),
+            [
+                {"role": "user", "content": "Are you able to hear me?"},
+                {"role": "user", "content": "What can you do?"},
+            ],
+        )
+
+    def test_speech_reply_bypasses_model_for_hearing_check(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            with patch("server.aiohttp.ClientSession") as client_session:
+                self.assertEqual(
+                    await service.speech_reply("Are you able to hear me?"),
+                    ("direct", "Yes, I can hear you clearly.", None),
+                )
+                client_session.assert_not_called()
 
         import asyncio
         asyncio.run(run_test())
