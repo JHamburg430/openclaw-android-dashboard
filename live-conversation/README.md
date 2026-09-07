@@ -7,7 +7,9 @@ in the Android Dashboard plus menu.
 
 1. The Android native audio bridge captures 16 kHz PCM in 20 ms frames.
 2. Browser-side VAD commits a turn after 600 ms of silence.
-3. Pipecat's persistent `faster-whisper` `tiny.en` service transcribes locally.
+3. Pipecat's persistent `faster-whisper` `small.en` service transcribes locally
+   with CPU `int8` beam search. The larger cached model improves recognition of
+   terms such as “live agent,” session names, and longer technical requests.
 4. The local `qwen3.5:4b` speech supervisor returns either a short speakable
    response or the hidden `[[OPENCLAW_AGENT]]` control token. This model is the
    local latency/quality balance: materially stronger than the former 0.8B
@@ -17,23 +19,35 @@ in the Android Dashboard plus menu.
 5. A bounded conversation history supplies the previous user and assistant
    turns to the speech supervisor. It is persisted at
    `~/.openclaw/state/live-conversation-history.json`, so context survives a
-   WebView reconnect or service restart. The Live Conversation page displays
-   the same rolling 24-message history as user and assistant bubbles.
-6. The service intercepts that token before display/TTS and sends the original
-   transcript to the normal OpenClaw agent in the dedicated
-   `agent:main:live-conversation` session, preserving tools and context.
-7. A persistent local Kokoro TTS worker using the British male George voice
+   WebView reconnect or service restart. Up to 80 messages and 48,000
+   characters are retained; the newest context that fits the local model's
+   prompt budget is selected dynamically. The page displays the same rolling
+   80-message history as user and assistant bubbles.
+6. The supervisor receives a compact, automatically refreshed summary of the
+   last seven days of gateway sessions, including the exact session key,
+   title, latest message, and authoritative `hasActiveRun` state. It can answer
+   status questions directly without launching an agent.
+7. The service intercepts control tokens before display/TTS. Ordinary tool work
+   continues in `agent:main:live-conversation`; explicit requests for another
+   agent get an independent session; and follow-ups can be sent to an exact
+   active or recent gateway session. Concurrent agents are supported, and each
+   final CLI result is returned to the bridge and spoken when it completes. If
+   the WebView disconnects while an agent works, the task continues and its
+   final reply is queued for speech on the next Live Conversation connection.
+8. A persistent local Kokoro TTS worker using the British male George voice
    returns 24 kHz PCM to the Android
    native playback bridge.
-8. When OpenClaw Dashboard holds Android's Assistant role, its lightweight
+9. When OpenClaw Dashboard holds Android's Assistant role, its lightweight
    voice service streams rolling microphone windows to `/wake`. Detecting the
    standalone word “Jarvis” opens and auto-starts Live Conversation over the
    regular or lock screen. Turning the screen off stops an active conversation
    and resumes wake listening.
 
-The speech-model prompt keeps the direct route conservative: requests needing
-current information, personal context, tools, memory, judgment, or side effects
-emit the hidden control token and escalate to the normal agent.
+The speech-model prompt defines Jarvis's voice-supervisor role, exposes available
+agents and skills, distinguishes direct status answers from actual work, and
+documents the exact contracts for new-agent and existing-session handoffs. It
+also tells the model to resolve likely ASR errors from context while asking for
+clarification when a proper noun remains uncertain.
 
 The bridge forwards escalated transcripts without adding response-length or
 reasoning instructions. Voice response policy belongs to the gateway agent's

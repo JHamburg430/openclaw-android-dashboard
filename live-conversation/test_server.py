@@ -3,11 +3,13 @@ from datetime import datetime
 import json
 from pathlib import Path
 import tempfile
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from server import (
     AGENT_SENTINEL,
+    NEW_AGENT_SENTINEL,
     IGNORE_SENTINEL,
     SAY_SENTINEL,
     SPEECH_MODEL,
@@ -17,9 +19,12 @@ from server import (
     DEFAULT_TTS_MODEL_DIR,
     DEFAULT_TTS_SPEAKER_ID,
     LiveConversationService,
+    MAX_HISTORY_MESSAGES,
+    PROMPT_HISTORY_CHARS,
     extract_agent_text,
     is_wake_word,
     parse_speech_model_output,
+    repair_known_transcription_errors,
     normalize_spoken_text,
     render_page,
     split_spoken_text,
@@ -48,16 +53,16 @@ class RoutingTests(unittest.TestCase):
 
     def test_page_displays_and_updates_the_rolling_history(self):
         page = render_page()
-        self.assertIn("Conversation history · last 24 messages", page)
+        self.assertIn("Conversation history · last 80 messages", page)
         self.assertIn("m.type==='history'", page)
-        self.assertIn("historyMessages.slice(-24)", page)
+        self.assertIn("historyMessages.slice(-80)", page)
         self.assertIn("addHistory('user',pendingTranscript)", page)
         self.assertIn("addHistory('assistant',m.text)", page)
         self.assertIn("get('autostart')==='1'", page)
         self.assertIn("liveConversationStopped", page)
 
     def test_ignore_token_produces_no_spoken_text(self):
-        self.assertEqual(parse_speech_model_output(IGNORE_SENTINEL), ("ignore", ""))
+        self.assertEqual(parse_speech_model_output(IGNORE_SENTINEL), ("ignore", "", None))
 
     def test_jarvis_wake_word_matches_as_a_word(self):
         self.assertTrue(is_wake_word("Jarvis"))
@@ -66,17 +71,51 @@ class RoutingTests(unittest.TestCase):
         self.assertFalse(is_wake_word("The jar is over there"))
         self.assertFalse(is_wake_word("JARVISON"))
 
+    def test_known_live_agent_transcription_error_is_repaired_for_handoff(self):
+        self.assertEqual(
+            repair_known_transcription_errors("Make the five agent more capable."),
+            "Make the live agent more capable.",
+        )
+        self.assertEqual(
+            repair_known_transcription_errors("Improve the five conversation model."),
+            "Improve the live conversation model.",
+        )
+        self.assertEqual(
+            repair_known_transcription_errors("There are five agents running."),
+            "There are five agents running.",
+        )
+
+    def test_continuation_joins_the_previous_unfinished_agent_request(self):
+        service = LiveConversationService("agent:main:live-conversation", 1.15)
+        service.remember("user", "Start another agent that...")
+        service.remember("assistant", "Go on. What should the agent do?")
+        self.assertEqual(
+            service.contextualize_agent_request(
+                "reviews this conversation and improves the live model."
+            ),
+            "Start another agent that reviews this conversation and improves the live model.",
+        )
+        service = LiveConversationService("agent:main:live-conversation", 1.15)
+        service.remember("user", "Please check the current agents.")
+        self.assertEqual(
+            service.contextualize_agent_request("Now tell me a joke."),
+            "Now tell me a joke.",
+        )
+
     def test_speech_supervisor_uses_higher_quality_local_model(self):
         self.assertEqual(SPEECH_MODEL, "qwen3.5:4b")
         self.assertEqual(SPEECH_MODEL_KEEP_ALIVE, "30m")
 
     def test_pending_agent_prompt_keeps_the_supervisor_conversational(self):
-        prompt = speech_model_prompt(self.now, agent_pending=True)
-        self.assertIn("still working", prompt)
-        self.assertIn("Tell me a joke", prompt)
-        self.assertIn("Never volunteer a timer-based or generic progress message", prompt)
-        self.assertIn("never claim it has finished", prompt)
-        self.assertNotIn(AGENT_SENTINEL, prompt)
+        prompt = speech_model_prompt(
+            self.now,
+            agent_pending=True,
+            sessions="key=agent:main:job | title=Audio repair | hasActiveRun=yes",
+        )
+        self.assertIn("still awaiting a final response", prompt)
+        self.assertIn("Multiple agents may work concurrently", prompt)
+        self.assertIn("hasActiveRun=yes", prompt)
+        self.assertIn(NEW_AGENT_SENTINEL, prompt)
 
     def test_server_has_no_synthetic_periodic_agent_updates(self):
         import inspect
@@ -87,9 +126,28 @@ class RoutingTests(unittest.TestCase):
         self.assertNotIn("timeout=20", source)
 
     def test_speech_model_output_intercepts_escalation_token(self):
-        self.assertEqual(parse_speech_model_output(f"{AGENT_SENTINEL} I’ll check that."), ("agent", "I’ll check that."))
-        self.assertEqual(parse_speech_model_output(f"{SAY_SENTINEL} It is 12:34 PM."), ("direct", "It is 12:34 PM."))
-        self.assertEqual(parse_speech_model_output("It is 12:34 PM."), ("direct", "It is 12:34 PM."))
+        self.assertEqual(
+            parse_speech_model_output(f"{AGENT_SENTINEL} I’ll check that."),
+            ("agent", "I’ll check that.", None),
+        )
+        self.assertEqual(
+            parse_speech_model_output(f"{NEW_AGENT_SENTINEL} I’ll start another."),
+            ("new_agent", "I’ll start another.", None),
+        )
+        self.assertEqual(
+            parse_speech_model_output(
+                "[[OPENCLAW_SESSION:agent:main:dashboard:abc]] I’ll add that."
+            ),
+            ("session", "I’ll add that.", "agent:main:dashboard:abc"),
+        )
+        self.assertEqual(
+            parse_speech_model_output(f"{SAY_SENTINEL} It is 12:34 PM."),
+            ("direct", "It is 12:34 PM.", None),
+        )
+        self.assertEqual(
+            parse_speech_model_output("It is 12:34 PM."),
+            ("direct", "It is 12:34 PM.", None),
+        )
 
     def test_agent_json_extraction(self):
         payload = {"result": {"payloads": [{"text": "Ready."}]}}
@@ -115,6 +173,18 @@ class RoutingTests(unittest.TestCase):
         import asyncio
         asyncio.run(run_test())
 
+    def test_agent_can_target_an_exact_existing_session(self):
+        async def run_test():
+            target = "agent:main:dashboard:abc"
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.openclaw_json = AsyncMock(return_value={"text": "Added."})
+            self.assertEqual(await service.agent_reply("Also check audio.", target), "Added.")
+            arguments = service.openclaw_json.await_args.args
+            self.assertEqual(arguments[arguments.index("--session-key") + 1], target)
+
+        import asyncio
+        asyncio.run(run_test())
+
     def test_speech_supervisor_receives_prior_conversation_history(self):
         async def run_test():
             service = LiveConversationService("agent:main:live-conversation", 1.15)
@@ -134,7 +204,7 @@ class RoutingTests(unittest.TestCase):
             with patch("server.aiohttp.ClientSession", return_value=session_context):
                 self.assertEqual(
                     await service.speech_reply("What is my robot’s name?"),
-                    ("direct", "Atlas is your robot."),
+                    ("direct", "Atlas is your robot.", None),
                 )
             messages = session.post.call_args.kwargs["json"]["messages"]
             self.assertEqual(messages[-3], {"role": "user", "content": "My robot is named Atlas."})
@@ -160,6 +230,29 @@ class RoutingTests(unittest.TestCase):
                 json.loads(path.read_text(encoding="utf-8"))["messages"],
                 second.recent_history(),
             )
+
+    def test_long_history_is_retained_but_prompt_selection_is_budgeted(self):
+        service = LiveConversationService("agent:main:live-conversation", 1.15)
+        for index in range(MAX_HISTORY_MESSAGES):
+            service.remember("user", f"turn {index} " + ("x" * 700))
+        prompt_history = service.prompt_history()
+        self.assertGreater(len(service.recent_history()), 24)
+        self.assertLessEqual(sum(len(item["content"]) for item in prompt_history), PROMPT_HISTORY_CHARS)
+        self.assertEqual(prompt_history[-1]["content"], service.recent_history()[-1]["content"])
+
+    def test_completed_agent_reply_can_be_spoken_after_reconnect(self):
+        service = LiveConversationService("agent:main:live-conversation", 1.15)
+        service.queue_pending_reply("The background repair is complete.")
+        self.assertEqual(
+            list(service.pending_spoken_replies),
+            ["The background repair is complete."],
+        )
+
+        import inspect
+        import server
+        source = inspect.getsource(server.websocket)
+        self.assertIn("Agent tasks deliberately survive a WebView disconnect", source)
+        self.assertIn("agent-reconnect-", source)
 
     def test_agent_retries_transient_gateway_restart(self):
         async def run_test():
@@ -191,12 +284,72 @@ class RoutingTests(unittest.TestCase):
         import asyncio
         asyncio.run(run_test())
 
+    def test_live_session_catalog_exposes_authoritative_status_and_keys(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.openclaw_json = AsyncMock(return_value={"sessions": [{
+                "key": "agent:main:dashboard:abc",
+                "displayName": "Audio repair",
+                "hasActiveRun": True,
+                "updatedAt": 1788819000000,
+                "lastMessagePreview": "Inspecting the playback queue.",
+            }]})
+            catalog = await service.refresh_sessions()
+            self.assertIn("key=agent:main:dashboard:abc", catalog)
+            self.assertIn("hasActiveRun=yes", catalog)
+            self.assertIn("Inspecting the playback queue", catalog)
+            self.assertIn("agent:main:dashboard:abc", service.session_keys)
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_speech_reply_accepts_only_real_session_keys(self):
+        async def decide(model_text):
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.sessions = "key=agent:main:dashboard:abc | hasActiveRun=yes"
+            service.session_keys = {"agent:main:dashboard:abc"}
+            service.sessions_updated_at = time.monotonic()
+            service.capabilities_updated_at = time.monotonic()
+            response = AsyncMock()
+            response.raise_for_status = lambda: None
+            response.json = AsyncMock(return_value={"message": {"content": model_text}})
+            context = MagicMock()
+            context.__aenter__.return_value = response
+            session = MagicMock()
+            session.post.return_value = context
+            session_context = MagicMock()
+            session_context.__aenter__.return_value = session
+            with patch("server.aiohttp.ClientSession", return_value=session_context):
+                return await service.speech_reply("Add the reconnect check.")
+
+        import asyncio
+        self.assertEqual(
+            asyncio.run(decide(
+                "[[OPENCLAW_SESSION:agent:main:dashboard:abc]] I’ll add that."
+            )),
+            ("session", "I’ll add that.", "agent:main:dashboard:abc"),
+        )
+        self.assertEqual(
+            asyncio.run(decide(
+                "[[OPENCLAW_SESSION:agent:main:invented]] I’ll add that."
+            )),
+            ("agent", "I’ll add that.", None),
+        )
+
+    def test_start_uses_the_more_accurate_cached_whisper_model(self):
+        import inspect
+        source = inspect.getsource(LiveConversationService.start)
+        self.assertIn('model="small.en"', source)
+        self.assertNotIn('model="tiny.en"', source)
+
     def test_agent_turn_intercepts_sentinel_without_speaking_it(self):
         async def run_test():
             service = LiveConversationService("agent:main:live-conversation", 0.85)
             socket = AsyncMock()
             service.transcribe = AsyncMock(return_value="Check the RAG app and report progress.")
-            service.speech_reply = AsyncMock(return_value=("agent", "I’ll ask the agent to check that."))
+            service.speech_reply = AsyncMock(
+                return_value=("agent", "I’ll ask the agent to check that.", None)
+            )
             service.tts.synthesize = AsyncMock(return_value=b"\0\0" * 2400)
 
             handoff = await service.process_turn(socket, b"audio")
@@ -205,7 +358,14 @@ class RoutingTests(unittest.TestCase):
             self.assertFalse(any(message["type"] == "acknowledgment" for message in messages))
             self.assertFalse(any(AGENT_SENTINEL in str(message) for message in messages))
             self.assertEqual(service.tts.synthesize.await_args_list[0].args[0], "I’ll ask the agent to check that.")
-            self.assertEqual(handoff[0], "Check the RAG app and report progress.")
+            self.assertEqual(
+                handoff,
+                (
+                    "Check the RAG app and report progress.",
+                    "I’ll ask the agent to check that.",
+                    "agent:main:live-conversation",
+                ),
+            )
 
         import asyncio
         asyncio.run(run_test())

@@ -44,12 +44,16 @@ SPEECH_MODEL_URL = "http://127.0.0.1:11434/api/chat"
 SPEECH_MODEL = "qwen3.5:4b"
 SPEECH_MODEL_KEEP_ALIVE = "30m"
 AGENT_SENTINEL = "[[OPENCLAW_AGENT]]"
+NEW_AGENT_SENTINEL = "[[OPENCLAW_NEW]]"
 SAY_SENTINEL = "[[SAY]]"
 IGNORE_SENTINEL = "[[IGNORE]]"
 CAPABILITY_CACHE_SECONDS = 60
+SESSION_CACHE_SECONDS = 3
 DEFAULT_HISTORY_PATH = "/home/john/.openclaw/state/live-conversation-history.json"
-MAX_HISTORY_MESSAGES = 24
-MAX_HISTORY_CHARS = 12_000
+MAX_HISTORY_MESSAGES = 80
+MAX_HISTORY_CHARS = 48_000
+PROMPT_HISTORY_MESSAGES = 60
+PROMPT_HISTORY_CHARS = 28_000
 WAKE_WORD = "jarvis"
 WAKE_WORD_ALIASES = frozenset(("jarvis", "jervis", "chavez"))
 WAKE_WINDOW_SECONDS = 2.5
@@ -59,6 +63,16 @@ WAKE_COOLDOWN_SECONDS = 5.0
 def is_wake_word(transcript: str) -> bool:
     normalized = re.sub(r"[^a-z]+", " ", transcript.lower()).strip()
     return bool(WAKE_WORD_ALIASES.intersection(normalized.split()))
+
+
+def repair_known_transcription_errors(transcript: str) -> str:
+    """Repair recurring, context-specific ASR substitutions before agent handoff."""
+    return re.sub(
+        r"\bfive\s+(agent|conversation\s+model)\b",
+        lambda match: "live " + match.group(1),
+        transcript,
+        flags=re.IGNORECASE,
+    )
 
 
 @dataclass
@@ -71,53 +85,72 @@ class TurnMetrics:
     route: str = ""
 
 
-def speech_model_prompt(now: datetime | None = None, agent_pending: bool = False, capabilities: str = "") -> str:
+def speech_model_prompt(
+    now: datetime | None = None,
+    agent_pending: bool = False,
+    capabilities: str = "",
+    sessions: str = "",
+) -> str:
     clock = now or datetime.now(ZoneInfo("America/Detroit"))
-    if agent_pending:
-        return f"""You are the conversational voice supervisor while an OpenClaw agent works in the background.
-Output {IGNORE_SENTINEL} alone only when the transcript is clearly not addressed to you and has no plausible request, question, or conversational meaning. Treat imperfect grammar and likely speech-recognition errors as user speech when a reasonable intent can still be inferred. Otherwise output {SAY_SENTINEL} followed by one short natural spoken response.
-Only respond because the user has spoken to you. If asked for status, truthfully say the agent is still working; never claim it has finished because this supervisor does not receive completion state. Answer unrelated casual or timeless questions yourself. If asked for another task needing tools or private context, explain briefly that the current agent is still busy; do not claim you started another agent.
-Never volunteer a timer-based or generic progress message. Agent progress may be relayed only when the agent actually emits it.
-Never fabricate private, project, or agent progress. If the gateway is restarting or temporarily unavailable, say it is reconnecting; do not describe that as the agent running into a problem. The current local time is {clock.strftime('%-I:%M %p')} America/Detroit.
-Examples:
-User: Are you still working on it?
-Assistant: {SAY_SENTINEL} Yes, the agent is still working in the background.
-User: Tell me a joke while you work.
-Assistant: {SAY_SENTINEL} Why did the robot take a vacation? It needed to recharge.
-User: Also check my calendar.
-Assistant: {SAY_SENTINEL} The agent is still busy with the first request, so I haven’t started the calendar check."""
-    return f"""You are the conversational voice supervisor. No OpenClaw agent is currently working.
+    pending_note = (
+        "One or more agent requests launched by this voice connection are still awaiting a final response. "
+        if agent_pending else
+        "No agent request launched by this voice connection is currently awaiting a final response. "
+    )
+    return f"""You are Jarvis, the always-available conversational voice supervisor for John's OpenClaw system.
+You are not a general chatbot pretending to lack system access. You can see the live gateway-session summary and capability catalog below, answer questions about them directly, route a follow-up into an existing session, or launch a separate agent session. {pending_note}
 Output exactly one of these forms:
 - Only for speech that is clearly not addressed to you and has no plausible request, question, or conversational meaning: {IGNORE_SENTINEL} alone. Do not ignore a plausible command or question merely because its grammar is imperfect or speech recognition likely changed a word.
 - For casual conversation or timeless general knowledge answerable confidently without tools: {SAY_SENTINEL} followed by one short natural spoken response.
-- If no agent is working and the request needs apps, projects, private context, files, logs, calendar, messages, memory, current external facts, tools, judgment, or an action: {AGENT_SENTINEL} followed by a short natural acknowledgment telling the user what you are handing off. Write the acknowledgment yourself for this request.
-- If an agent is already working, keep conversing. For a status question, use {SAY_SENTINEL} and truthfully say the agent is still working. For unrelated simple conversation, answer normally. Do not start a second agent.
+- For a new request needing apps, projects, private context, files, logs, calendar, messages, memory, current external facts, tools, judgment, or an action: {AGENT_SENTINEL} followed by a short natural acknowledgment. The bridge starts an agent and speaks its final response when it returns.
+- If John explicitly asks for another, new, separate, or additional agent, use {NEW_AGENT_SENTINEL} followed by the acknowledgment. Multiple agents may work concurrently.
+- To add instructions or a follow-up to a specific active or recent session listed below, output [[OPENCLAW_SESSION:exact-session-key]] followed by the acknowledgment. Copy the key exactly. Use the most clearly referenced session; never invent a key. The bridge sends the message to that session and speaks its eventual response.
+- For a question asking for status, progress, active agents, recent sessions, or what is currently running, answer directly from the live session summary with {SAY_SENTINEL}. Do not ask an agent merely to read information already present below. Say none are active when none have hasActiveRun=yes.
+- If a transcript is visibly unfinished, such as “start another agent that...”, do not launch it yet. Use {SAY_SENTINEL} to ask John to finish the instruction. If the next transcript continues that thought, use both turns to infer the complete request and select the proper agent route.
 The current local date and time is {clock.strftime('%A, %B %-d, %Y, %-I:%M %p')} America/Detroit; time and date questions can be answered directly.
 Available OpenClaw capabilities (cached and refreshed automatically):
 {capabilities or 'Capability catalog is temporarily unavailable; delegate capability questions to the agent.'}
+Live and recent gateway sessions (refreshed automatically; hasActiveRun is authoritative):
+{sessions or 'No active or recent gateway sessions were returned.'}
 Use this catalog to answer capability questions quickly. If the user asks to use, configure, expand, or change a capability, acknowledge and delegate with {AGENT_SENTINEL}. Do not claim an unavailable capability exists. Newly added agents and skills appear after the catalog refreshes.
-Never fabricate private, project, or agent progress. The sentinel is machine-readable and must not be spoken.
+Interpret likely recognition mistakes using the conversation and session context. In this voice app, “five agent” or “five conversation model” means “live agent” or “live conversation model” unless John explicitly discusses the number five or five distinct agents; correct that known ASR error without asking and use the corrected word “live” in the acknowledgment. Do not silently replace any other uncertain proper noun; ask a short clarification instead.
+When John asks to make the live agent or Live Conversation model more capable, that is a complete actionable request: delegate it with {AGENT_SENTINEL} so the agent can review the conversation and current implementation. Do not ask which capabilities he means unless he explicitly presents alternatives requiring a choice.
+Never fabricate private, project, or agent progress. Control sentinels and session keys are machine-readable and must not be spoken.
 Examples:
 User: How is the RAG app improvement going?
-Assistant: {AGENT_SENTINEL} I’ll ask the agent to check the RAG app and report back.
+Assistant: {SAY_SENTINEL} The Manuals RAG session is still active and working on retrieval accuracy.
 User: Fix the routing bug.
 Assistant: {AGENT_SENTINEL} I’ll have the agent inspect and fix the routing bug.
+User: Also tell that active routing agent to check the reconnect path.
+Assistant: [[OPENCLAW_SESSION:agent:main:dashboard:example]] I’ll add the reconnect check to that session.
+User: Start another agent to inspect the audio cutoff.
+Assistant: {NEW_AGENT_SENTINEL} I’ll start a separate agent to inspect the audio cutoff.
+User: Make the five agent more capable.
+Assistant: {AGENT_SENTINEL} I’ll have the agent review this conversation and improve the live agent’s capabilities.
 User: Who wrote The Hobbit?
 Assistant: {SAY_SENTINEL} J. R. R. Tolkien wrote The Hobbit.
 User: What time is it?
 Assistant: {SAY_SENTINEL} It is {clock.strftime('%-I:%M %p')}."""
 
 
-def parse_speech_model_output(text: str) -> tuple[str, str]:
+def parse_speech_model_output(text: str) -> tuple[str, str, str | None]:
     cleaned = text.strip()
     if IGNORE_SENTINEL in cleaned:
-        return "ignore", ""
+        return "ignore", "", None
+    session_match = re.search(r"\[\[OPENCLAW_SESSION:([^\]]+)\]\]", cleaned)
+    if session_match:
+        session_key = session_match.group(1).strip()
+        acknowledgment = cleaned[session_match.end():].strip()
+        return "session", acknowledgment, session_key
+    if NEW_AGENT_SENTINEL in cleaned:
+        acknowledgment = cleaned.split(NEW_AGENT_SENTINEL, 1)[1].strip()
+        return "new_agent", acknowledgment, None
     if AGENT_SENTINEL in cleaned:
         acknowledgment = cleaned.split(AGENT_SENTINEL, 1)[1].strip()
-        return "agent", acknowledgment
+        return "agent", acknowledgment, None
     if SAY_SENTINEL in cleaned:
         cleaned = cleaned.split(SAY_SENTINEL, 1)[1].strip()
-    return "direct", cleaned
+    return "direct", cleaned, None
 
 
 def extract_agent_text(payload: Any) -> str:
@@ -400,12 +433,16 @@ class LiveConversationService:
         self.session_key = session_key
         self.stt: WhisperSTTService | None = None
         self.tts = PersistentTtsWorker(DEFAULT_TTS_WORKER, DEFAULT_TTS_RUNTIME, DEFAULT_TTS_MODEL_DIR, tts_speed)
-        self.agent_lock = asyncio.Lock()
         self.speech_lock = asyncio.Lock()
         self.transcribe_lock = asyncio.Lock()
         self.capabilities = ""
         self.capabilities_updated_at = 0.0
         self.capability_refresh_task: asyncio.Task[str] | None = None
+        self.sessions = ""
+        self.session_keys: set[str] = set()
+        self.sessions_updated_at = 0.0
+        self.session_refresh_task: asyncio.Task[str] | None = None
+        self.pending_spoken_replies: deque[str] = deque(maxlen=10)
         self.history_path = Path(history_path) if history_path else None
         self.history: deque[dict[str, str]] = deque(maxlen=MAX_HISTORY_MESSAGES)
         self._load_history()
@@ -450,19 +487,56 @@ class LiveConversationService:
     def recent_history(self) -> list[dict[str, str]]:
         return [dict(message) for message in self.history]
 
+    def queue_pending_reply(self, reply: str) -> None:
+        if reply.strip():
+            self.pending_spoken_replies.append(reply.strip())
+
+    def prompt_history(self) -> list[dict[str, str]]:
+        selected: deque[dict[str, str]] = deque()
+        used_chars = 0
+        for message in reversed(self.history):
+            size = len(message["content"])
+            if selected and (
+                len(selected) >= PROMPT_HISTORY_MESSAGES
+                or used_chars + size > PROMPT_HISTORY_CHARS
+            ):
+                break
+            selected.appendleft(dict(message))
+            used_chars += size
+        return list(selected)
+
+    def contextualize_agent_request(self, transcript: str) -> str:
+        """Join a continuation to the immediately preceding unfinished agent request."""
+        previous_user = next(
+            (item["content"] for item in reversed(self.history) if item["role"] == "user"),
+            "",
+        )
+        unfinished_agent_request = re.search(
+            r"\b(?:start|have|ask|tell)\b.*\b(?:agent|sub-?agent)\b.*(?:\bthat|\bto|\bfor|\bso|\.{2,})\s*$",
+            previous_user,
+            flags=re.IGNORECASE,
+        )
+        if unfinished_agent_request and len(previous_user) <= 240:
+            return f"{previous_user.rstrip(' .')} {transcript.lstrip()}"
+        return transcript
+
     async def start(self) -> None:
         self.stt = await asyncio.to_thread(
             WhisperSTTService,
-            settings=WhisperSTTService.Settings(model="tiny.en", language=Language.EN),
+            settings=WhisperSTTService.Settings(
+                model="small.en", language=Language.EN, no_speech_prob=0.6
+            ),
             device="cpu",
             compute_type="int8",
         )
         await self.tts.start()
-        await self.refresh_capabilities()
+        await asyncio.gather(self.refresh_capabilities(), self.refresh_sessions())
 
     async def stop(self) -> None:
         if self.capability_refresh_task and not self.capability_refresh_task.done():
             self.capability_refresh_task.cancel()
+        if self.session_refresh_task and not self.session_refresh_task.done():
+            self.session_refresh_task.cancel()
         await self.tts.stop()
 
     async def transcribe(self, audio: bytes) -> str:
@@ -492,7 +566,7 @@ class LiveConversationService:
         try:
             agents, skills = await asyncio.gather(
                 self.openclaw_json("agents", "list", "--json"),
-                self.openclaw_json("skills", "list", "--json"),
+                self.openclaw_json("skills", "list", "--agent", "main", "--json"),
             )
             agent_lines = [f"agent {item['id']}: {item.get('name', item['id'])}" for item in agents]
             skill_lines = [
@@ -506,6 +580,53 @@ class LiveConversationService:
             LOGGER.warning("capability_refresh_failed error=%s", error)
         return self.capabilities
 
+    async def refresh_sessions(self) -> str:
+        if self.sessions and time.monotonic() - self.sessions_updated_at < SESSION_CACHE_SECONDS:
+            return self.sessions
+        try:
+            payload = await self.openclaw_json(
+                "gateway", "call", "sessions.list", "--json", "--params",
+                json.dumps({
+                    "limit": 20,
+                    "activeMinutes": 10_080,
+                    "includeLastMessage": True,
+                    "includeDerivedTitles": True,
+                }),
+            )
+            items = payload.get("sessions", []) if isinstance(payload, dict) else []
+            lines: list[str] = []
+            keys: set[str] = set()
+            for item in items:
+                key = item.get("key")
+                if not isinstance(key, str) or not key:
+                    continue
+                keys.add(key)
+                title = (
+                    item.get("displayName") or item.get("derivedTitle")
+                    or item.get("label") or "Untitled"
+                )
+                active = "yes" if item.get("hasActiveRun") else "no"
+                updated = item.get("updatedAt")
+                if isinstance(updated, (int, float)):
+                    updated_text = datetime.fromtimestamp(
+                        updated / 1000, ZoneInfo("America/Detroit")
+                    ).strftime("%b %-d %-I:%M %p")
+                else:
+                    updated_text = "unknown"
+                preview = re.sub(
+                    r"\s+", " ", str(item.get("lastMessagePreview") or "")
+                ).strip()[:180]
+                lines.append(
+                    f"key={key} | title={title} | hasActiveRun={active} | updated={updated_text}"
+                    + (f" | latest={preview}" if preview else "")
+                )
+            self.session_keys = keys
+            self.sessions = "\n".join(lines) or "No active or recent gateway sessions were returned."
+            self.sessions_updated_at = time.monotonic()
+        except Exception as error:
+            LOGGER.warning("session_refresh_failed error=%s", error)
+        return self.sessions
+
     @staticmethod
     def gateway_is_transient(error: Exception) -> bool:
         message = str(error).lower()
@@ -514,29 +635,43 @@ class LiveConversationService:
             "gateway", "econnrefused", "econnreset", "didn't receive pong",
         ))
 
-    async def agent_reply(self, text: str) -> str:
-        async with self.agent_lock:
-            for attempt, delay in enumerate((1, 2, 4, 8), start=1):
-                try:
-                    payload = await self.openclaw_json(
-                        "agent", "--session-key", self.session_key, "--message", text,
-                        "--timeout", "600", "--json", timeout=610,
-                    )
-                    break
-                except Exception as error:
-                    if attempt == 4 or not self.gateway_is_transient(error):
-                        raise
-                    LOGGER.info("gateway_reconnecting attempt=%d error=%s", attempt, error)
-                    await asyncio.sleep(delay)
+    async def agent_reply(self, text: str, session_key: str | None = None) -> str:
+        target_key = session_key or self.session_key
+        for attempt, delay in enumerate((1, 2, 4, 8), start=1):
+            try:
+                payload = await self.openclaw_json(
+                    "agent", "--session-key", target_key, "--message", text,
+                    "--timeout", "600", "--json", timeout=610,
+                )
+                break
+            except Exception as error:
+                if attempt == 4 or not self.gateway_is_transient(error):
+                    raise
+                LOGGER.info(
+                    "gateway_reconnecting attempt=%d target=%s error=%s",
+                    attempt, target_key, error,
+                )
+                await asyncio.sleep(delay)
         reply = extract_agent_text(payload)
         if not reply:
             raise RuntimeError("Agent returned no speakable text")
         return reply
 
-    async def speech_reply(self, text: str, agent_pending: bool = False) -> tuple[str, str]:
+    async def speech_reply(
+        self, text: str, agent_pending: bool = False
+    ) -> tuple[str, str, str | None]:
         if time.monotonic() - self.capabilities_updated_at >= CAPABILITY_CACHE_SECONDS:
             if not self.capability_refresh_task or self.capability_refresh_task.done():
                 self.capability_refresh_task = asyncio.create_task(self.refresh_capabilities())
+        if time.monotonic() - self.sessions_updated_at >= SESSION_CACHE_SECONDS:
+            if not self.session_refresh_task or self.session_refresh_task.done():
+                self.session_refresh_task = asyncio.create_task(self.refresh_sessions())
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(self.session_refresh_task), timeout=2.5
+                    )
+                except asyncio.TimeoutError:
+                    pass
         capabilities = self.capabilities
         payload = {
             "model": SPEECH_MODEL,
@@ -544,11 +679,15 @@ class LiveConversationService:
             "stream": False,
             "think": False,
             "messages": [
-                {"role": "system", "content": speech_model_prompt(agent_pending=agent_pending, capabilities=capabilities)},
-                *self.recent_history(),
+                {"role": "system", "content": speech_model_prompt(
+                    agent_pending=agent_pending,
+                    capabilities=capabilities,
+                    sessions=self.sessions,
+                )},
+                *self.prompt_history(),
                 {"role": "user", "content": text},
             ],
-            "options": {"temperature": 0, "num_predict": 80},
+            "options": {"temperature": 0, "num_predict": 80, "num_ctx": 16_384},
         }
         timeout = aiohttp.ClientTimeout(total=15)
         try:
@@ -556,12 +695,16 @@ class LiveConversationService:
                 async with session.post(SPEECH_MODEL_URL, json=payload) as response:
                     response.raise_for_status()
                     result = await response.json()
-            route, reply = parse_speech_model_output(result.get("message", {}).get("content", ""))
-            if agent_pending:
-                route = "direct"
+            route, reply, target_session = parse_speech_model_output(
+                result.get("message", {}).get("content", "")
+            )
+            reply = repair_known_transcription_errors(reply)
+            if route == "session" and target_session not in self.session_keys:
+                LOGGER.warning("speech_supervisor_invalid_session target=%s", target_session)
+                route, target_session = "agent", None
             if route != "ignore" and not reply:
                 raise ValueError("speech model returned no speakable text")
-            return route, reply
+            return route, reply, target_session
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
             raise RuntimeError(f"Speech supervisor unavailable: {error}") from error
 
@@ -618,7 +761,9 @@ class LiveConversationService:
             )
         return tts_ms
 
-    async def process_turn(self, socket: web.WebSocketResponse, audio: bytes, agent_pending: bool = False) -> tuple[str, str] | None:
+    async def process_turn(
+        self, socket: web.WebSocketResponse, audio: bytes, agent_pending: bool = False
+    ) -> tuple[str, str, str | None] | None:
         started = time.perf_counter()
         metrics = TurnMetrics()
         try:
@@ -632,7 +777,9 @@ class LiveConversationService:
             await socket.send_json({"type": "transcript", "text": transcript})
 
             stage = time.perf_counter()
-            route, reply = await self.speech_reply(transcript, agent_pending=agent_pending)
+            route, reply, target_session = await self.speech_reply(
+                transcript, agent_pending=agent_pending
+            )
             metrics.routing_ms = round((time.perf_counter() - stage) * 1000)
             metrics.route = route
 
@@ -640,6 +787,7 @@ class LiveConversationService:
                 await socket.send_json({"type": "state", "state": "listening", "detail": "Ignored likely background speech."})
                 return None
 
+            agent_request = self.contextualize_agent_request(transcript)
             self.remember("user", transcript)
             self.remember("assistant", reply)
 
@@ -650,8 +798,16 @@ class LiveConversationService:
             metrics.total_ms = round((time.perf_counter() - started) * 1000)
             await socket.send_json({"type": "metrics", **asdict(metrics)})
             await socket.send_json({"type": "state", "state": "listening"})
-            if route == "agent" and not agent_pending:
-                return transcript, reply
+            if route in ("agent", "new_agent", "session"):
+                if route == "agent":
+                    target_session = self.session_key
+                agent_request = repair_known_transcription_errors(agent_request)
+                if agent_request != transcript:
+                    LOGGER.info(
+                        "transcript_repaired original=%r repaired=%r",
+                        transcript, agent_request,
+                    )
+                return agent_request, reply, target_session
         except Exception as error:
             await socket.send_json({"type": "error", "message": str(error)})
         return None
@@ -661,16 +817,16 @@ def render_page() -> str:
 <html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>Live Conversation</title><style>
 html,body{margin:0;min-height:100%;background:#060a10;color:#f4f8fc;font-family:system-ui,sans-serif}main{padding:18px 14px 28px;max-width:760px;margin:auto}h1{font-size:23px;margin:0 0 5px}.sub{color:#9aa9b8;margin:0 0 16px}.state{font-size:18px;color:#54e0b4;margin:12px 0}.meter{height:14px;background:#101820;border:1px solid #304050;border-radius:8px;overflow:hidden}.meter div{height:100%;width:0;background:#00ab7e;transition:width 60ms}.buttons{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:14px 0}button{min-height:48px;border:1px solid #00ab7e;border-radius:8px;background:#1e2630;color:#fff;font-size:15px}.card{background:#0a0e14;border-radius:8px;padding:12px;margin-top:10px;min-height:48px}.label{color:#8797a8;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.metrics{font-size:12px;color:#aebdca;margin-top:12px}.route{display:inline-block;border:1px solid #36556a;border-radius:10px;padding:2px 7px;font-size:11px;margin-left:6px}.history{margin-top:18px}.history-list{display:flex;flex-direction:column;gap:8px;margin-top:8px}.history-empty{color:#718294;font-size:13px}.message{max-width:88%;padding:9px 11px;border-radius:12px;line-height:1.35;white-space:pre-wrap;overflow-wrap:anywhere}.message.user{align-self:flex-end;background:#0e5948}.message.assistant{align-self:flex-start;background:#182431}.message-role{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:#9db0bf;margin-bottom:3px}
-</style></head><body><main><h1>Live Conversation</h1><p class="sub">Fast local speech recognition. Simple requests answer here; complex work escalates to OpenClaw.</p><div id="state" class="state">Ready</div><div class="meter"><div id="bar"></div></div><div class="buttons"><button id="start">Start conversation</button><button id="stop">Stop</button></div><div class="card"><div class="label">You</div><div id="user">—</div></div><div class="card"><div class="label">Assistant <span id="route" class="route">waiting</span></div><div id="assistant">—</div></div><div id="metrics" class="metrics"></div><section class="history"><div class="label">Conversation history · last 24 messages</div><div id="history" class="history-list"><div class="history-empty">No conversation history yet.</div></div></section></main><script>
+</style></head><body><main><h1>Live Conversation</h1><p class="sub">Accurate local speech recognition. Simple requests answer here; complex work routes to the right OpenClaw session.</p><div id="state" class="state">Ready</div><div class="meter"><div id="bar"></div></div><div class="buttons"><button id="start">Start conversation</button><button id="stop">Stop</button></div><div class="card"><div class="label">You</div><div id="user">—</div></div><div class="card"><div class="label">Assistant <span id="route" class="route">waiting</span></div><div id="assistant">—</div></div><div id="metrics" class="metrics"></div><section class="history"><div class="label">Conversation history · last 80 messages</div><div id="history" class="history-list"><div class="history-empty">No conversation history yet.</div></div></section></main><script>
 const state=document.getElementById('state'),bar=document.getElementById('bar'),user=document.getElementById('user'),assistant=document.getElementById('assistant'),route=document.getElementById('route'),metrics=document.getElementById('metrics'),historyList=document.getElementById('history');let ws,timer,recording=false,awaitingResponse=false,responseActive=false,responseTailTimer=null,speechMs=0,silenceMs=0,candidateSpeechMs=0,pre=[],historyMessages=[],pendingTranscript='';
-function renderHistory(){historyList.replaceChildren();if(!historyMessages.length){const empty=document.createElement('div');empty.className='history-empty';empty.textContent='No conversation history yet.';historyList.appendChild(empty);return}for(const message of historyMessages.slice(-24)){const bubble=document.createElement('div');bubble.className='message '+message.role;const who=document.createElement('div');who.className='message-role';who.textContent=message.role==='user'?'You':'Assistant';const content=document.createElement('div');content.textContent=message.content;bubble.append(who,content);historyList.appendChild(bubble)}historyList.lastElementChild?.scrollIntoView({block:'nearest'})}
-function addHistory(role,content){if(!content)return;historyMessages.push({role,content});historyMessages=historyMessages.slice(-24);renderHistory()}
+function renderHistory(){historyList.replaceChildren();if(!historyMessages.length){const empty=document.createElement('div');empty.className='history-empty';empty.textContent='No conversation history yet.';historyList.appendChild(empty);return}for(const message of historyMessages.slice(-80)){const bubble=document.createElement('div');bubble.className='message '+message.role;const who=document.createElement('div');who.className='message-role';who.textContent=message.role==='user'?'You':'Assistant';const content=document.createElement('div');content.textContent=message.content;bubble.append(who,content);historyList.appendChild(bubble)}historyList.lastElementChild?.scrollIntoView({block:'nearest'})}
+function addHistory(role,content){if(!content)return;historyMessages.push({role,content});historyMessages=historyMessages.slice(-80);renderHistory()}
 function rms(b64){const s=atob(b64||'');let sum=0,n=0;for(let i=0;i+1<s.length;i+=2){let v=(s.charCodeAt(i)&255)|((s.charCodeAt(i+1)&255)<<8);if(v&32768)v-=65536;const f=v/32768;sum+=f*f;n++}return n?Math.sqrt(sum/n):0}
 function send(x){if(ws&&ws.readyState===1)ws.send(JSON.stringify(x))}
 function report(event,detail){send({type:'client_event',event:event,detail:String(detail||'')})}
 function begin(){if(recording||awaitingResponse)return;recording=true;candidateSpeechMs=0;speechMs=0;silenceMs=0;if(responseActive){responseActive=false;if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}try{OpenClawNativeAudio.interruptAgentResponsePlayback()}catch(e){}report('barge_in','confirmed_user_speech');send({type:'input_audio_buffer.speech_started'})}send({type:'start'});for(const audioBase64 of pre)send({type:'audio',audioBase64});pre=[];state.textContent='Listening…'}
 function tick(){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>20)pre.shift();if(awaitingResponse){candidateSpeechMs=0;return}const speechThreshold=responseActive?.025:.006;const speechRequiredMs=responseActive?600:200;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+20:0;if(candidateSpeechMs>=speechRequiredMs)begin();return}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=20;silenceMs=0}else silenceMs+=20;if(speechMs>=200&&silenceMs>=600){recording=false;awaitingResponse=true;candidateSpeechMs=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}}
-function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-24):[];renderHistory()}if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if((m.detail||'').startsWith('Ignored')){pendingTranscript='';awaitingResponse=false}}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;if(pendingTranscript){addHistory('user',pendingTranscript);pendingTranscript=''}addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;candidateSpeechMs=0;pre=[];audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){candidateSpeechMs=0;pre=[];if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
+function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-80):[];renderHistory()}if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if((m.detail||'').startsWith('Ignored')){pendingTranscript='';awaitingResponse=false}}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;if(pendingTranscript){addHistory('user',pendingTranscript);pendingTranscript=''}addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;candidateSpeechMs=0;pre=[];audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){candidateSpeechMs=0;pre=[];if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
 function stop(){if(timer)clearInterval(timer);timer=null;if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=null;try{OpenClawNativeAudio.stopCapture()}catch(e){}if(ws)ws.close();ws=null;recording=false;awaitingResponse=false;responseActive=false;candidateSpeechMs=0;bar.style.width='0%';state.textContent='Stopped'}
 document.getElementById('start').onclick=start;document.getElementById('stop').onclick=()=>{stop();try{OpenClawNativeApp.liveConversationStopped()}catch(e){}};window.addEventListener('pagehide',stop);if(new URLSearchParams(location.search).get('autostart')==='1')start();
 </script></body></html>"""
@@ -685,7 +841,7 @@ async def health(request: web.Request) -> web.Response:
     return web.json_response({
         "ok": service.stt is not None,
         "pipecat": "1.8.1",
-        "stt": "faster-whisper tiny.en cpu-int8",
+        "stt": "faster-whisper small.en cpu-int8 beam-search",
         "history_messages": len(service.history),
     })
 
@@ -721,41 +877,73 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
     socket = web.WebSocketResponse(heartbeat=20)
     await socket.prepare(request)
     await socket.send_json({"type": "history", "messages": service.recent_history()})
+    while service.pending_spoken_replies:
+        reply = service.pending_spoken_replies.popleft()
+        await service.send_spoken_response(
+            socket, reply, "agent", f"agent-reconnect-{time.monotonic_ns()}"
+        )
     audio = bytearray()
     turn_task: asyncio.Task[None] | None = None
-    agent_task: asyncio.Task[None] | None = None
+    agent_tasks: set[asyncio.Task[None]] = set()
 
-    async def run_agent(transcript: str) -> None:
-        nonlocal agent_task
-        work = asyncio.create_task(service.agent_reply(transcript))
+    async def run_agent(transcript: str, target_session: str | None) -> None:
+        if target_session is None:
+            target_session = f"agent:main:live-conversation-{time.monotonic_ns()}"
+        work = asyncio.create_task(service.agent_reply(transcript, target_session))
         started = time.monotonic()
+        reply = ""
         try:
-            await socket.send_json({"type": "agent_status", "state": "working"})
+            if not socket.closed:
+                try:
+                    await socket.send_json({
+                        "type": "agent_status", "state": "working", "sessionKey": target_session
+                    })
+                except (ConnectionError, RuntimeError):
+                    pass
             reply = await work
             service.remember("assistant", reply)
+            if socket.closed:
+                service.queue_pending_reply(reply)
+                return
             await service.send_spoken_response(socket, reply, "agent", f"agent-{time.monotonic_ns()}")
-            await socket.send_json({"type": "agent_status", "state": "complete", "elapsed_ms": round((time.monotonic() - started) * 1000)})
+            await socket.send_json({
+                "type": "agent_status",
+                "state": "complete",
+                "sessionKey": target_session,
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+            })
             await socket.send_json({"type": "state", "state": "listening"})
         except asyncio.CancelledError:
             work.cancel()
             raise
         except Exception as error:
+            if reply:
+                service.queue_pending_reply(reply)
+                return
             if service.gateway_is_transient(error):
                 message = "The gateway is still reconnecting. Please ask me to retry when it is back."
             else:
                 message = "I couldn't complete that agent request."
                 LOGGER.exception("agent_request_failed error=%s", error)
-            await service.send_spoken_response(socket, message, "agent", f"agent-error-{time.monotonic_ns()}")
-            await socket.send_json({"type": "agent_status", "state": "error"})
-        finally:
-            agent_task = None
+            if socket.closed:
+                service.queue_pending_reply(message)
+            else:
+                await service.send_spoken_response(
+                    socket, message, "agent", f"agent-error-{time.monotonic_ns()}"
+                )
+                await socket.send_json({
+                    "type": "agent_status", "state": "error", "sessionKey": target_session
+                })
 
     async def run_turn(turn: bytes) -> None:
-        nonlocal agent_task
-        handoff = await service.process_turn(socket, turn, agent_pending=agent_task is not None)
-        if handoff and agent_task is None:
-            transcript, _ = handoff
-            agent_task = asyncio.create_task(run_agent(transcript))
+        handoff = await service.process_turn(
+            socket, turn, agent_pending=bool(agent_tasks)
+        )
+        if handoff:
+            transcript, _, target_session = handoff
+            task = asyncio.create_task(run_agent(transcript, target_session))
+            agent_tasks.add(task)
+            task.add_done_callback(agent_tasks.discard)
     async for message in socket:
         if message.type != WSMsgType.TEXT:
             continue
@@ -777,8 +965,8 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
             LOGGER.info("client_event event=%s detail=%s", payload.get("event", ""), payload.get("detail", ""))
     if turn_task and not turn_task.done():
         turn_task.cancel()
-    if agent_task and not agent_task.done():
-        agent_task.cancel()
+    # Agent tasks deliberately survive a WebView disconnect. Their final reply
+    # is persisted and queued for speech when Live Conversation reconnects.
     return socket
 
 
