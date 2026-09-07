@@ -5,6 +5,8 @@ After=network-online.target openclaw-gateway.service
 [Service]
 Type=simple
 WorkingDirectory=/home/john/openclaw-android-dashboard/live-conversation
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=LD_LIBRARY_PATH=/home/john/.openclaw/tools/pipecat-live-conversation/venv/lib/python3.13/site-packages/nvidia/cublas/lib:/home/john/.openclaw/tools/pipecat-live-conversation/venv/lib/python3.13/site-packages/nvidia/cudnn/lib:/home/john/.openclaw/tools/pipecat-live-conversation/venv/lib/python3.13/site-packages/nvidia/cuda_nvrtc/lib
 ExecStart=/home/john/.openclaw/tools/pipecat-live-conversation/venv/bin/python /home/john/openclaw-android-dashboard/live-conversation/server.py --port 8790
 Restart=on-failure
 RestartSec=3

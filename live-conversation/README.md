@@ -8,14 +8,20 @@ in the Android Dashboard plus menu.
 1. The Android native audio bridge captures 16 kHz PCM in 20 ms frames.
 2. Browser-side VAD commits a turn after 600 ms of silence.
 3. Pipecat's persistent `faster-whisper` `small.en` service transcribes locally
-   with CPU `int8` beam search. The larger cached model improves recognition of
-   terms such as “live agent,” session names, and longer technical requests.
+   with CUDA `float16` beam search on GPU 0 and falls back to CPU `int8` if CUDA
+   initialization fails. The larger cached model improves recognition of terms
+   such as “live agent,” session names, and longer technical requests. While a
+   user is speaking, the service retranscribes the growing audio buffer about
+   once per second and displays partial text. Final decoding consumes
+   Faster-Whisper's lazy segment generator entirely on a worker thread, so
+   inference cannot wedge the WebSocket event loop. No transcription timeout or
+   fixed turn-length cap truncates a user's input.
 4. The local `qwen3.5:4b` speech supervisor returns either a short speakable
    response or the hidden `[[OPENCLAW_AGENT]]` control token. This model is the
    local latency/quality balance: materially stronger than the former 0.8B
    supervisor while remaining sub-second once warm on the installed GPUs. The
    Ollama request keeps it warm for 30 minutes to avoid repeated cold starts
-   during a conversation.
+   during a conversation. The model is also warmed when the service starts.
 5. A bounded conversation history supplies the previous user and assistant
    turns to the speech supervisor. It is persisted at
    `~/.openclaw/state/live-conversation-history.json`, so context survives a
@@ -58,6 +64,20 @@ The bridge forwards escalated transcripts without adding response-length or
 reasoning instructions. Voice response policy belongs to the gateway agent's
 workspace instructions so complex requests can finish normal tool-backed work
 before the final answer is shortened for speech.
+
+## Incremental speech behavior
+
+Rolling partial transcription makes speech visible before the turn ends and
+keeps capture open for natural-length input. The final transcript is sent to the
+speech supervisor as soon as endpointing detects 600 ms of silence. Partial
+text is deliberately not allowed to launch tools or agents because early
+Whisper hypotheses can change as more words arrive.
+
+Ollama's `/api/chat` request cannot append more text to a user message after
+generation has begun. Safe future overlap is therefore to use stable partial
+prefixes for intent prediction and read-only prefetch, then start the definitive
+response from the final transcript. A true streaming speech-to-speech model or
+an online ASR decoder would be required to revise an already-running model turn.
 
 ## Jarvis wake word on Android
 

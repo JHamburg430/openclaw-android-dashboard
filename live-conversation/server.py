@@ -23,7 +23,7 @@ LOGGER = logging.getLogger("live_conversation")
 
 import aiohttp
 from aiohttp import WSMsgType, web
-from pipecat.frames.frames import TranscriptionFrame
+import numpy as np
 from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transcriptions.language import Language
 
@@ -50,6 +50,7 @@ IGNORE_SENTINEL = "[[IGNORE]]"
 CAPABILITY_CACHE_SECONDS = 60
 SESSION_CACHE_SECONDS = 3
 SESSION_POLL_SECONDS = 10
+PARTIAL_TRANSCRIPT_INTERVAL_SECONDS = 1.0
 DEFAULT_HISTORY_PATH = "/home/john/.openclaw/state/live-conversation-history.json"
 MAX_HISTORY_MESSAGES = 80
 MAX_HISTORY_CHARS = 48_000
@@ -139,6 +140,18 @@ def summarize_gateway_status(sessions: str, agent_pending: bool = False) -> str:
     suffix = f"; plus {remainder} more" if remainder else ""
     noun = "session is" if len(active) == 1 else "sessions are"
     return f"{len(active)} gateway {noun} currently running: {names}{suffix}."
+
+
+def is_explicit_new_agent_request(transcript: str) -> bool:
+    """Recognize complete spoken commands that must create a separate session."""
+    normalized = re.sub(r"[^a-z0-9]+", " ", transcript.lower()).strip()
+    request = re.search(
+        r"\b(?:start|spawn|launch|create)\b.*\b(?:new|another|separate|additional)?\s*"
+        r"(?:sub\s*)?agent\b",
+        normalized,
+    )
+    unfinished = re.search(r"\b(?:that|to|for|so)\s*$", normalized)
+    return bool(request and not unfinished)
 
 
 @dataclass
@@ -495,8 +508,14 @@ class PersistentTtsWorker:
     async def stop(self) -> None:
         if not self.process:
             return
-        self.process.terminate()
-        await self.process.wait()
+        try:
+            self.process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            await self.process.wait()
+        except ProcessLookupError:
+            pass
         self.process = None
 
 
@@ -504,6 +523,7 @@ class LiveConversationService:
     def __init__(self, session_key: str, tts_speed: float, history_path: str | None = None):
         self.session_key = session_key
         self.stt: WhisperSTTService | None = None
+        self.stt_description = "not loaded"
         self.tts = PersistentTtsWorker(DEFAULT_TTS_WORKER, DEFAULT_TTS_RUNTIME, DEFAULT_TTS_MODEL_DIR, tts_speed)
         self.speech_lock = asyncio.Lock()
         self.transcribe_lock = asyncio.Lock()
@@ -597,17 +617,51 @@ class LiveConversationService:
         return transcript
 
     async def start(self) -> None:
-        self.stt = await asyncio.to_thread(
-            WhisperSTTService,
-            settings=WhisperSTTService.Settings(
-                model="small.en", language=Language.EN, no_speech_prob=0.6
-            ),
-            device="cpu",
-            compute_type="int8",
-        )
+        try:
+            self.stt = await asyncio.to_thread(
+                WhisperSTTService,
+                settings=WhisperSTTService.Settings(
+                    model="small.en", language=Language.EN, no_speech_prob=0.6
+                ),
+                device="cuda",
+                compute_type="float16",
+            )
+            self.stt_description = "faster-whisper small.en cuda-float16"
+            await self.transcribe(bytes(SAMPLE_RATE), purpose="warmup")
+        except Exception as error:
+            LOGGER.warning("cuda_stt_unavailable_falling_back_to_cpu error=%s", error)
+            self.stt = await asyncio.to_thread(
+                WhisperSTTService,
+                settings=WhisperSTTService.Settings(
+                    model="small.en", language=Language.EN, no_speech_prob=0.6
+                ),
+                device="cpu",
+                compute_type="int8",
+            )
+            self.stt_description = "faster-whisper small.en cpu-int8 fallback"
         await self.tts.start()
         await asyncio.gather(self.refresh_capabilities(), self.refresh_sessions())
+        await self.warm_speech_model()
         self.session_poll_task = asyncio.create_task(self.poll_sessions())
+
+    async def warm_speech_model(self) -> None:
+        payload = {
+            "model": SPEECH_MODEL,
+            "keep_alive": SPEECH_MODEL_KEEP_ALIVE,
+            "stream": False,
+            "think": False,
+            "messages": [{"role": "user", "content": "Reply only: ready"}],
+            "options": {"temperature": 0, "num_predict": 3, "num_ctx": 512},
+        }
+        try:
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(SPEECH_MODEL_URL, json=payload) as response:
+                    response.raise_for_status()
+                    await response.read()
+            LOGGER.info("speech_model_warm model=%s", SPEECH_MODEL)
+        except Exception as error:
+            LOGGER.warning("speech_model_warm_failed error=%s", error)
 
     async def poll_sessions(self) -> None:
         while True:
@@ -630,15 +684,38 @@ class LiveConversationService:
         """Stop paced delivery promptly when confirmed new speech begins."""
         self.speech_generation += 1
 
-    async def transcribe(self, audio: bytes) -> str:
+    async def transcribe(self, audio: bytes, purpose: str = "final") -> str:
         if not self.stt:
             raise RuntimeError("Speech recognizer is not ready")
-        text = ""
+
+        def run_to_completion() -> str:
+            assert self.stt and self.stt._model
+            audio_float = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
+            segments, _ = self.stt._model.transcribe(
+                audio_float,
+                language="en",
+                beam_size=3,
+                best_of=3,
+                temperature=0.0,
+                condition_on_previous_text=False,
+                without_timestamps=True,
+                no_speech_threshold=0.6,
+                vad_filter=len(audio) > SAMPLE_RATE * 2 * 29,
+            )
+            text = "".join(
+                f"{segment.text} "
+                for segment in segments
+                if segment.no_speech_prob < 0.6
+            ).strip()
+            LOGGER.info(
+                "speech_transcription_complete purpose=%s audio_seconds=%.2f chars=%d",
+                purpose, len(audio) / (SAMPLE_RATE * 2), len(text),
+            )
+            return text
+
         async with self.transcribe_lock:
-            async for frame in self.stt.run_stt(audio):
-                if isinstance(frame, TranscriptionFrame):
-                    text = frame.text.strip()
-        return text
+            decode = asyncio.create_task(asyncio.to_thread(run_to_completion))
+            return await decode
 
     async def openclaw_json(self, *arguments: str, timeout: int = 30) -> Any:
         process = await asyncio.create_subprocess_exec(
@@ -754,6 +831,8 @@ class LiveConversationService:
         direct_reply = direct_voice_surface_reply(text)
         if direct_reply:
             return "direct", direct_reply, None
+        if is_explicit_new_agent_request(text):
+            return "new_agent", "I'll start a separate agent for that.", None
         status_question = is_gateway_status_question(text)
         if time.monotonic() - self.capabilities_updated_at >= CAPABILITY_CACHE_SECONDS:
             if not self.capability_refresh_task or self.capability_refresh_task.done():
@@ -945,7 +1024,7 @@ function send(x){if(ws&&ws.readyState===1)ws.send(JSON.stringify(x))}
 function report(event,detail){send({type:'client_event',event:event,detail:String(detail||'')})}
 function begin(){if(recording||awaitingResponse)return;recording=true;candidateSpeechMs=0;speechMs=0;silenceMs=0;if(responseActive){responseActive=false;if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}try{OpenClawNativeAudio.interruptAgentResponsePlayback()}catch(e){}report('barge_in','confirmed_user_speech')}send({type:'input_audio_buffer.speech_started'});send({type:'start'});for(const audioBase64 of pre)send({type:'audio',audioBase64});pre=[];state.textContent='Listening…'}
 function tick(){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>20)pre.shift();if(awaitingResponse){candidateSpeechMs=0;return}const speechThreshold=responseActive?.025:.006;const speechRequiredMs=responseActive?600:200;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+20:0;if(candidateSpeechMs>=speechRequiredMs)begin();return}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=20;silenceMs=0}else silenceMs+=20;if(speechMs>=200&&silenceMs>=600){recording=false;awaitingResponse=true;candidateSpeechMs=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}}
-function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-80):[];renderHistory()}if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if((m.detail||'').startsWith('Ignored')){pendingTranscript='';awaitingResponse=false}}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;if(pendingTranscript){addHistory('user',pendingTranscript);pendingTranscript=''}addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;candidateSpeechMs=0;pre=[];audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){candidateSpeechMs=0;pre=[];if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
+function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-80):[];renderHistory()}if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.state==='listening'){awaitingResponse=false;recording=false;candidateSpeechMs=0}if((m.detail||'').startsWith('Ignored'))pendingTranscript=''}if(m.type==='partial_transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;if(pendingTranscript){addHistory('user',pendingTranscript);pendingTranscript=''}addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;candidateSpeechMs=0;pre=[];audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){candidateSpeechMs=0;pre=[];if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
 function stop(){if(timer)clearInterval(timer);timer=null;if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=null;try{OpenClawNativeAudio.stopCapture()}catch(e){}if(ws)ws.close();ws=null;recording=false;awaitingResponse=false;responseActive=false;candidateSpeechMs=0;bar.style.width='0%';state.textContent='Stopped'}
 document.getElementById('start').onclick=start;document.getElementById('stop').onclick=()=>{stop();try{OpenClawNativeApp.liveConversationStopped()}catch(e){}};window.addEventListener('pagehide',stop);if(new URLSearchParams(location.search).get('autostart')==='1')start();
 </script></body></html>"""
@@ -960,7 +1039,7 @@ async def health(request: web.Request) -> web.Response:
     return web.json_response({
         "ok": service.stt is not None,
         "pipecat": "1.8.1",
-        "stt": "faster-whisper small.en cpu-int8 beam-search",
+        "stt": service.stt_description,
         "history_messages": len(service.history),
     })
 
@@ -982,7 +1061,7 @@ async def wake_websocket(request: web.Request) -> web.WebSocketResponse:
             continue
         window = bytes(audio[-window_bytes:])
         audio[:] = audio[-retain_bytes:]
-        transcript = await service.transcribe(window)
+        transcript = await service.transcribe(window, purpose="wake")
         LOGGER.info("wake_word_probe transcript=%r", transcript)
         if is_wake_word(transcript) and time.monotonic() - last_trigger >= WAKE_COOLDOWN_SECONDS:
             last_trigger = time.monotonic()
@@ -1003,7 +1082,18 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
         )
     audio = bytearray()
     turn_task: asyncio.Task[None] | None = None
+    partial_task: asyncio.Task[None] | None = None
+    turn_sequence = 0
+    next_partial_bytes = round(SAMPLE_RATE * 2 * PARTIAL_TRANSCRIPT_INTERVAL_SECONDS)
     agent_tasks: set[asyncio.Task[None]] = set()
+
+    async def run_partial(snapshot: bytes, sequence: int) -> None:
+        try:
+            transcript = await service.transcribe(snapshot, purpose="partial")
+            if transcript and sequence == turn_sequence and not socket.closed:
+                await socket.send_json({"type": "partial_transcript", "text": transcript})
+        except Exception as error:
+            LOGGER.warning("partial_transcription_failed error=%s", error)
 
     async def run_agent(transcript: str, target_session: str | None) -> None:
         if target_session is None:
@@ -1072,10 +1162,25 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
             service.interrupt_speech()
             await socket.send_json({"type": "output_audio_buffer.cleared"})
         elif kind == "start":
+            turn_sequence += 1
             audio.clear()
-        elif kind == "audio" and len(audio) < SAMPLE_RATE * 2 * 30:
+            next_partial_bytes = round(
+                SAMPLE_RATE * 2 * PARTIAL_TRANSCRIPT_INTERVAL_SECONDS
+            )
+        elif kind == "audio":
             audio.extend(base64.b64decode(payload.get("audioBase64", ""), validate=True))
+            if (
+                len(audio) >= next_partial_bytes
+                and (not partial_task or partial_task.done())
+            ):
+                snapshot = bytes(audio)
+                sequence = turn_sequence
+                next_partial_bytes = len(snapshot) + round(
+                    SAMPLE_RATE * 2 * PARTIAL_TRANSCRIPT_INTERVAL_SECONDS
+                )
+                partial_task = asyncio.create_task(run_partial(snapshot, sequence))
         elif kind == "commit" and audio:
+            turn_sequence += 1
             if turn_task and not turn_task.done():
                 turn_task.cancel()
             turn = bytes(audio)

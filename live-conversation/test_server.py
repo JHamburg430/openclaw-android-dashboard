@@ -24,6 +24,7 @@ from server import (
     direct_voice_surface_reply,
     extract_agent_text,
     has_stale_identity_confusion,
+    is_explicit_new_agent_request,
     is_gateway_status_question,
     is_wake_word,
     parse_speech_model_output,
@@ -90,6 +91,16 @@ class RoutingTests(unittest.TestCase):
             summarize_gateway_status("No active sessions.", agent_pending=True),
             "One agent request from this Live Conversation is still running.",
         )
+
+    def test_complete_explicit_agent_commands_bypass_model_routing(self):
+        self.assertTrue(is_explicit_new_agent_request(
+            "Spawn another agent to work on the transcription problem."
+        ))
+        self.assertTrue(is_explicit_new_agent_request(
+            "Start an agent to update the Android application."
+        ))
+        self.assertFalse(is_explicit_new_agent_request("Start another agent that..."))
+        self.assertFalse(is_explicit_new_agent_request("What agents are running?"))
 
     def test_prompt_ignores_background_speech_and_exposes_capabilities(self):
         prompt = speech_model_prompt(self.now, capabilities="agent research: Research\nskill weather: Forecasts")
@@ -306,6 +317,19 @@ class RoutingTests(unittest.TestCase):
         import asyncio
         asyncio.run(run_test())
 
+    def test_speech_reply_bypasses_model_for_explicit_new_agent(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            with patch("server.aiohttp.ClientSession") as client_session:
+                self.assertEqual(
+                    await service.speech_reply("Spawn another agent to inspect transcription."),
+                    ("new_agent", "I'll start a separate agent for that.", None),
+                )
+                client_session.assert_not_called()
+
+        import asyncio
+        asyncio.run(run_test())
+
     def test_conversation_history_persists_across_service_restarts(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "history.json"
@@ -432,7 +456,38 @@ class RoutingTests(unittest.TestCase):
         import inspect
         source = inspect.getsource(LiveConversationService.start)
         self.assertIn('model="small.en"', source)
+        self.assertIn('device="cuda"', source)
+        self.assertIn('compute_type="float16"', source)
+        self.assertIn("falling_back_to_cpu", source)
         self.assertNotIn('model="tiny.en"', source)
+
+    def test_lazy_whisper_segments_are_consumed_off_the_event_loop(self):
+        async def run_test():
+            class Segment:
+                text = " heard clearly"
+                no_speech_prob = 0.0
+
+            class Model:
+                def transcribe(self, *_args, **_kwargs):
+                    def lazy_segments():
+                        time.sleep(0.15)
+                        yield Segment()
+
+                    return lazy_segments(), object()
+
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.stt = MagicMock(_model=Model())
+            started = time.perf_counter()
+            transcription = asyncio.create_task(service.transcribe(b"\0\0" * 1600))
+
+            # This timer must fire while lazy segment inference is still running.
+            await asyncio.sleep(0.02)
+            self.assertLess(time.perf_counter() - started, 0.10)
+            self.assertFalse(transcription.done())
+            self.assertEqual(await transcription, "heard clearly")
+
+        import asyncio
+        asyncio.run(run_test())
 
     def test_agent_turn_intercepts_sentinel_without_speaking_it(self):
         async def run_test():
@@ -476,6 +531,17 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("responseActive=true", page)
         self.assertIn("first_pcm_enqueued", page)
         self.assertIn("pcm_delivery_done", page)
+        self.assertIn("if(m.state==='listening'){awaitingResponse=false", page)
+        self.assertIn("m.type==='partial_transcript'", page)
+
+    def test_websocket_generates_incremental_partials_without_a_turn_cap(self):
+        import inspect
+        import server
+
+        source = inspect.getsource(server.websocket)
+        self.assertIn('purpose="partial"', source)
+        self.assertIn('"type": "partial_transcript"', source)
+        self.assertNotIn("len(audio) < SAMPLE_RATE * 2 * 30", source)
 
     def test_default_tts_speed_is_faster(self):
         import inspect
