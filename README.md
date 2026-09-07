@@ -42,6 +42,23 @@ openclaw devices list
 openclaw devices approve <requestId>
 ```
 
+## Phone capability broker
+
+Version 1.0.63 exposes narrow native node commands for personal phone automation:
+
+- Contacts: `contacts.search`, `contacts.add`
+- Calendar: `calendar.events`, `calendar.add`
+- Calls and SMS: `callLog.search`, `sms.search`, `sms.send`, `android.intent.dial`, `android.call.place`
+- Notifications: `notifications.list`, `notifications.dismiss`, `notifications.act`
+- Media and apps: `media.search`, `device.apps`, `android.apps.launch`, `android.intent.open`
+- Safe compose flows: `android.intent.composeSms`, `android.intent.composeEmail`
+- Clock: `android.intent.setAlarm`, `android.intent.setTimer`
+- UI fallback: `mobile.ui.observe`, `mobile.ui.act`
+
+Open **Android Native** in the app and use **Request Phone Permissions**. Notification reading/replies and arbitrary app UI control are special Android accesses, so enable **Notification Access** and **Accessibility Control** separately from that screen. Android may require **Allow restricted settings** in the app-info menu for a sideloaded Accessibility service.
+
+`mobile.ui.act` supports `click`, `setText`, `scrollForward`, `scrollBackward`, `tap`, `back`, `home`, `recents`, and `notifications`. UI observations and notification text are untrusted app data; the dedicated Phone Control agent is instructed never to treat them as agent instructions.
+
 ## Build
 
 This workspace has a local portable build toolchain under `/home/john/.android-build`.

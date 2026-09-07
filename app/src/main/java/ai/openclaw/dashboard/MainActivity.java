@@ -94,10 +94,11 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_FILE_CHOOSER = 2004;
     private static final int REQUEST_BLUETOOTH_CONNECT = 2005;
     private static final int REQUEST_ASSISTANT_ROLE = 2006;
+    private static final int REQUEST_PHONE_CAPABILITIES = 2007;
     public static final String ACTION_JARVIS_WAKE = "ai.openclaw.dashboard.action.JARVIS_WAKE";
     private static final String TAG = "OpenClawDashboard";
-    private static final int APP_VERSION_CODE = 62;
-    private static final String APP_VERSION_NAME = "1.0.62";
+    private static final int APP_VERSION_CODE = 63;
+    private static final String APP_VERSION_NAME = "1.0.63";
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final int LIVE_CONVERSATION_PORT = 8790;
@@ -119,6 +120,7 @@ public final class MainActivity extends Activity {
     private final SimpleDateFormat diagnosticsTimeFormat = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
     private final NativeAudioBridge nativeAudioBridge = new NativeAudioBridge();
     private final NativeAppBridge nativeAppBridge = new NativeAppBridge();
+    private AndroidCapabilityBroker capabilityBroker;
     private SharedPreferences prefs;
     private OpenClawClient nodeClient;
     private PermissionRequest pendingPermissionRequest;
@@ -161,6 +163,7 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        capabilityBroker = new AndroidCapabilityBroker(this);
         createNotificationChannel();
         configureSystemBars();
         buildUi();
@@ -769,6 +772,8 @@ public final class MainActivity extends Activity {
             case "android.files.pick":
                 openAndroidFilePicker();
                 return new JSONObject().put("opened", true).put("note", "File picker opened on the device.");
+            case "android.permissions.request":
+                return requestPhoneCapabilityPermissions(params);
             case "android.liveConversation.open":
                 runOnUiThread(this::openLiveConversation);
                 return new JSONObject().put("opened", true).put("surface", "live_conversation");
@@ -791,6 +796,8 @@ public final class MainActivity extends Activity {
             case "talk.ptt.once":
                 return handleTalkPttOnce(params);
             default:
+                JSONObject capabilityResult = capabilityBroker.handle(command, params);
+                if (capabilityResult != null) return capabilityResult;
                 return new JSONObject()
                         .put("ok", false)
                         .put("unsupported", command);
@@ -826,9 +833,46 @@ public final class MainActivity extends Activity {
                 .put("bluetoothConnect", hasBluetoothConnectPermission())
                 .put("notifications", hasNotificationPermission())
                 .put("contacts", checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED)
+                .put("contactsWrite", checkSelfPermission(Manifest.permission.WRITE_CONTACTS) == PackageManager.PERMISSION_GRANTED)
+                .put("calendarRead", checkSelfPermission(Manifest.permission.READ_CALENDAR) == PackageManager.PERMISSION_GRANTED)
+                .put("calendarWrite", checkSelfPermission(Manifest.permission.WRITE_CALENDAR) == PackageManager.PERMISSION_GRANTED)
+                .put("callLogRead", checkSelfPermission(Manifest.permission.READ_CALL_LOG) == PackageManager.PERMISSION_GRANTED)
+                .put("smsRead", checkSelfPermission(Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED)
+                .put("smsSend", checkSelfPermission(Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED)
+                .put("callPhone", checkSelfPermission(Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED)
+                .put("notificationAccess", PhoneNotificationListenerService.isConnected())
+                .put("accessibilityControl", PhoneAccessibilityService.isConnected())
                 .put("mediaAudio", Build.VERSION.SDK_INT < 33 || checkSelfPermission(Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED)
                 .put("mediaImages", Build.VERSION.SDK_INT < 33 || checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED)
                 .put("mediaVideo", Build.VERSION.SDK_INT < 33 || checkSelfPermission(Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED);
+    }
+
+    private JSONObject requestPhoneCapabilityPermissions(JSONObject params) throws Exception {
+        JSONArray requested = params.optJSONArray("permissions");
+        ArrayList<String> permissions = new ArrayList<>();
+        String[] allowed = new String[]{
+                Manifest.permission.READ_CONTACTS, Manifest.permission.WRITE_CONTACTS,
+                Manifest.permission.READ_CALENDAR, Manifest.permission.WRITE_CALENDAR,
+                Manifest.permission.READ_CALL_LOG, Manifest.permission.READ_SMS,
+                Manifest.permission.SEND_SMS, Manifest.permission.CALL_PHONE,
+                Manifest.permission.READ_MEDIA_AUDIO, Manifest.permission.READ_MEDIA_IMAGES,
+                Manifest.permission.READ_MEDIA_VIDEO, Manifest.permission.CAMERA,
+                Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS
+        };
+        for (String permission : allowed) {
+            boolean selected = requested == null || requested.length() == 0;
+            if (!selected) for (int i = 0; i < requested.length(); i++) {
+                String candidate = requested.optString(i, "");
+                if (permission.equals(candidate) || permission.substring(permission.lastIndexOf('.') + 1).equalsIgnoreCase(candidate)) {
+                    selected = true;
+                    break;
+                }
+            }
+            if (selected && checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) permissions.add(permission);
+        }
+        if (!permissions.isEmpty()) runOnUiThread(() -> requestPermissions(permissions.toArray(new String[0]), REQUEST_PHONE_CAPABILITIES));
+        return new JSONObject().put("requested", new JSONArray(permissions))
+                .put("note", permissions.isEmpty() ? "All selected runtime permissions are already granted." : "Android permission prompt opened on the phone.");
     }
 
     private JSONObject nativeInstalledApps() throws Exception {
@@ -953,6 +997,10 @@ public final class MainActivity extends Activity {
                         + "<button onclick=\"showStatus()\">Device Status</button>"
                         + "<button onclick=\"showPerms()\">Permissions</button>"
                         + "<button onclick=\"showApps()\">Installed Apps</button>"
+                        + "<button onclick=\"requestPhoneAccess()\">Request Phone Permissions</button>"
+                        + "<button onclick=\"notificationAccess()\">Notification Access</button>"
+                        + "<button onclick=\"accessibilityAccess()\">Accessibility Control</button>"
+                        + "<button onclick=\"appSettings()\">App Permission Settings</button>"
                         + "<button onclick=\"filePicker()\">File Picker</button>"
                         + "<button onclick=\"notifyTest()\">Test Notification</button>"
                         + "<button onclick=\"micProbe()\">Mic Probe</button>"
@@ -967,6 +1015,10 @@ public final class MainActivity extends Activity {
                         + "function showStatus(){log(parse(OpenClawNativeApp.deviceStatus()));}"
                         + "function showPerms(){log(parse(OpenClawNativeApp.permissions()));}"
                         + "function showApps(){var data=parse(OpenClawNativeApp.apps());if(data&&data.apps){data.apps=data.apps.slice(0,60);}log(data);}"
+                        + "function requestPhoneAccess(){log(parse(OpenClawNativeApp.requestPhoneAccess()));}"
+                        + "function notificationAccess(){log(OpenClawNativeApp.openNotificationAccess());}"
+                        + "function accessibilityAccess(){log(OpenClawNativeApp.openAccessibilityAccess());}"
+                        + "function appSettings(){log(OpenClawNativeApp.openAppSettings());}"
                         + "function filePicker(){log(OpenClawNativeApp.filePicker());}"
                         + "function notifyTest(){log(OpenClawNativeApp.notifyTest());}"
                         + "function micProbe(){log(OpenClawNativeApp.micProbe());}"
@@ -1163,6 +1215,13 @@ public final class MainActivity extends Activity {
             recordDiagnostic(
                     hasNotificationPermission() ? "android.permission.granted" : "android.permission.denied",
                     "POST_NOTIFICATIONS");
+            return;
+        }
+        if (requestCode == REQUEST_PHONE_CAPABILITIES) {
+            int granted = 0;
+            for (int result : grantResults) if (result == PackageManager.PERMISSION_GRANTED) granted++;
+            recordDiagnostic("android.phone_permissions.result", granted + "/" + permissions.length + " granted");
+            if (statusText != null) statusText.setText("Phone access: " + granted + " of " + permissions.length + " permissions granted.");
         }
     }
 
@@ -1190,6 +1249,7 @@ public final class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
     }
 
+    @android.annotation.SuppressLint("WrongConstant")
     private Uri[] collectSelectedFileUris(int resultCode, Intent data) {
         if (resultCode != RESULT_OK || data == null) return new Uri[0];
         ArrayList<Uri> selected = new ArrayList<>();
@@ -1212,7 +1272,7 @@ public final class MainActivity extends Activity {
         int flags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
         for (Uri uri : selected) {
             try {
-                getContentResolver().takePersistableUriPermission(uri, flags & Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                getContentResolver().takePersistableUriPermission(uri, flags);
             } catch (Exception ignored) {
                 // The temporary activity result grant is sufficient for providers without persistable grants.
             }
@@ -1766,6 +1826,7 @@ public final class MainActivity extends Activity {
         statusText.setText("Diagnostics copied.");
     }
 
+    @android.annotation.SuppressLint("MissingPermission")
     private void runNativeMicProbe() {
         if (!hasRecordAudioPermission()) {
             recordDiagnostic("native_mic_probe.skipped", "RECORD_AUDIO permission missing");
@@ -1894,6 +1955,45 @@ public final class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public String requestPhoneAccess() {
+            try {
+                return requestPhoneCapabilityPermissions(new JSONObject()).toString();
+            } catch (Exception e) {
+                return errorJson(e);
+            }
+        }
+
+        @JavascriptInterface
+        public String openNotificationAccess() {
+            try {
+                capabilityBroker.handle("android.settings.notificationAccess", new JSONObject());
+                return "Notification access settings opened.";
+            } catch (Exception e) {
+                return errorJson(e);
+            }
+        }
+
+        @JavascriptInterface
+        public String openAccessibilityAccess() {
+            try {
+                capabilityBroker.handle("android.settings.accessibility", new JSONObject());
+                return "Accessibility settings opened.";
+            } catch (Exception e) {
+                return errorJson(e);
+            }
+        }
+
+        @JavascriptInterface
+        public String openAppSettings() {
+            try {
+                capabilityBroker.handle("android.settings.app", new JSONObject());
+                return "App settings opened.";
+            } catch (Exception e) {
+                return errorJson(e);
+            }
+        }
+
+        @JavascriptInterface
         public String filePicker() {
             openAndroidFilePicker();
             return "File picker opened.";
@@ -1988,6 +2088,7 @@ public final class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        @android.annotation.SuppressLint("MissingPermission")
         public void startCapture(int sampleRateHz, int frameMs) {
             synchronized (lock) {
                 stopCaptureLocked();
