@@ -220,7 +220,7 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("response.output_audio.delta", page)
         self.assertIn("if(recording||awaitingResponse)return", page)
         self.assertIn("if(awaitingResponse){candidateSpeechMs=0;return}", page)
-        self.assertIn("candidateSpeechMs>=200", page)
+        self.assertIn("candidateSpeechMs>=speechRequiredMs", page)
         self.assertIn("responseActive=true", page)
         self.assertIn("first_pcm_enqueued", page)
         self.assertIn("pcm_delivery_done", page)
@@ -283,6 +283,17 @@ class RoutingTests(unittest.TestCase):
         self.assertGreater(len(parts), 2)
         self.assertEqual(" ".join(parts), text)
         self.assertTrue(all(len(part) <= 80 for part in parts))
+
+    def test_short_sentences_are_packed_to_avoid_tts_underruns(self):
+        text = "First short sentence. Second short sentence. Third short sentence."
+        self.assertEqual(split_spoken_text(text), [text])
+
+    def test_playback_vad_rejects_echo_and_covers_native_tail(self):
+        page = render_page()
+        self.assertIn("const speechThreshold=responseActive?.025:.006", page)
+        self.assertIn("const speechRequiredMs=responseActive?600:200", page)
+        self.assertIn("responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500)", page)
+        self.assertIn("report('barge_in','confirmed_user_speech')", page)
 
     def test_spoken_audio_is_paced_in_realtime(self):
         async def run_test():
