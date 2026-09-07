@@ -23,10 +23,11 @@ in the Android Dashboard plus menu.
    characters are retained; the newest context that fits the local model's
    prompt budget is selected dynamically. The page displays the same rolling
    80-message history as user and assistant bubbles.
-6. The supervisor receives a compact, automatically refreshed summary of the
+6. The supervisor receives a compact, continuously background-refreshed summary of the
    last seven days of gateway sessions, including the exact session key,
    title, latest message, and authoritative `hasActiveRun` state. It can answer
-   status questions directly without launching an agent.
+   status questions deterministically without launching an agent or waiting for
+   the local language model.
 7. The service intercepts control tokens before display/TTS. Ordinary tool work
    continues in `agent:main:live-conversation`; explicit requests for another
    agent get an independent session; and follow-ups can be sent to an exact
@@ -36,7 +37,8 @@ in the Android Dashboard plus menu.
    final reply is queued for speech on the next Live Conversation connection.
 8. A persistent local Kokoro TTS worker using the British male George voice
    returns 24 kHz PCM to the Android
-   native playback bridge.
+   native playback bridge. Confirmed barge-in stops server-side paced delivery,
+   so a new short response cannot wait behind the remainder of an older reply.
 9. When OpenClaw Dashboard holds Android's Assistant role, its lightweight
    voice service streams rolling microphone windows to `/wake`. Detecting the
    standalone word “Jarvis” opens and auto-starts Live Conversation over the

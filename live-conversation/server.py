@@ -49,6 +49,7 @@ SAY_SENTINEL = "[[SAY]]"
 IGNORE_SENTINEL = "[[IGNORE]]"
 CAPABILITY_CACHE_SECONDS = 60
 SESSION_CACHE_SECONDS = 3
+SESSION_POLL_SECONDS = 10
 DEFAULT_HISTORY_PATH = "/home/john/.openclaw/state/live-conversation-history.json"
 MAX_HISTORY_MESSAGES = 80
 MAX_HISTORY_CHARS = 48_000
@@ -108,6 +109,36 @@ def has_stale_identity_confusion(text: str) -> bool:
             normalized,
         )
     )
+
+
+def is_gateway_status_question(transcript: str) -> bool:
+    """Recognize broad requests for currently running gateway work."""
+    normalized = re.sub(r"[^a-z0-9]+", " ", transcript.lower()).strip()
+    subject = re.search(r"\b(?:sessions?|agents?|subagents?|tasks?|runs?)\b", normalized)
+    status = re.search(r"\b(?:status|running|active|progress|update|working)\b", normalized)
+    return bool(subject and status and not re.search(r"\b(?:start|launch|create)\b", normalized))
+
+
+def summarize_gateway_status(sessions: str, agent_pending: bool = False) -> str:
+    """Build a short factual answer from the authoritative session catalog."""
+    active: list[str] = []
+    for line in sessions.splitlines():
+        if "hasActiveRun=yes" not in line:
+            continue
+        title_match = re.search(r"(?:^| \| )title=([^|]+)", line)
+        title = title_match.group(1).strip() if title_match else "Untitled session"
+        if title not in active:
+            active.append(title)
+    if not active:
+        if agent_pending:
+            return "One agent request from this Live Conversation is still running."
+        return "No gateway sessions are currently running."
+    displayed = active[:4]
+    names = "; ".join(displayed)
+    remainder = len(active) - len(displayed)
+    suffix = f"; plus {remainder} more" if remainder else ""
+    noun = "session is" if len(active) == 1 else "sessions are"
+    return f"{len(active)} gateway {noun} currently running: {names}{suffix}."
 
 
 @dataclass
@@ -483,6 +514,8 @@ class LiveConversationService:
         self.session_keys: set[str] = set()
         self.sessions_updated_at = 0.0
         self.session_refresh_task: asyncio.Task[str] | None = None
+        self.session_poll_task: asyncio.Task[None] | None = None
+        self.speech_generation = 0
         self.pending_spoken_replies: deque[str] = deque(maxlen=10)
         self.history_path = Path(history_path) if history_path else None
         self.history: deque[dict[str, str]] = deque(maxlen=MAX_HISTORY_MESSAGES)
@@ -574,13 +607,28 @@ class LiveConversationService:
         )
         await self.tts.start()
         await asyncio.gather(self.refresh_capabilities(), self.refresh_sessions())
+        self.session_poll_task = asyncio.create_task(self.poll_sessions())
+
+    async def poll_sessions(self) -> None:
+        while True:
+            await asyncio.sleep(SESSION_POLL_SECONDS)
+            try:
+                await self.refresh_sessions()
+            except Exception as error:
+                LOGGER.warning("session_poll_failed error=%s", error)
 
     async def stop(self) -> None:
         if self.capability_refresh_task and not self.capability_refresh_task.done():
             self.capability_refresh_task.cancel()
         if self.session_refresh_task and not self.session_refresh_task.done():
             self.session_refresh_task.cancel()
+        if self.session_poll_task and not self.session_poll_task.done():
+            self.session_poll_task.cancel()
         await self.tts.stop()
+
+    def interrupt_speech(self) -> None:
+        """Stop paced delivery promptly when confirmed new speech begins."""
+        self.speech_generation += 1
 
     async def transcribe(self, audio: bytes) -> str:
         if not self.stt:
@@ -706,18 +754,20 @@ class LiveConversationService:
         direct_reply = direct_voice_surface_reply(text)
         if direct_reply:
             return "direct", direct_reply, None
+        status_question = is_gateway_status_question(text)
         if time.monotonic() - self.capabilities_updated_at >= CAPABILITY_CACHE_SECONDS:
             if not self.capability_refresh_task or self.capability_refresh_task.done():
                 self.capability_refresh_task = asyncio.create_task(self.refresh_capabilities())
         if time.monotonic() - self.sessions_updated_at >= SESSION_CACHE_SECONDS:
             if not self.session_refresh_task or self.session_refresh_task.done():
                 self.session_refresh_task = asyncio.create_task(self.refresh_sessions())
+            if not self.sessions:
                 try:
-                    await asyncio.wait_for(
-                        asyncio.shield(self.session_refresh_task), timeout=2.5
-                    )
+                    await asyncio.wait_for(asyncio.shield(self.session_refresh_task), timeout=2.5)
                 except asyncio.TimeoutError:
                     pass
+        if status_question:
+            return "direct", summarize_gateway_status(self.sessions, agent_pending), None
         capabilities = self.capabilities
         payload = {
             "model": SPEECH_MODEL,
@@ -771,13 +821,22 @@ class LiveConversationService:
         message_type: str = "reply",
     ) -> int:
         """Synthesize and stream one complete spoken response."""
+        generation = self.speech_generation
+        await socket.send_json({
+            "type": message_type,
+            "text": text,
+            "route": route,
+            "responseId": response_id,
+        })
+        lock_started = time.perf_counter()
         async with self.speech_lock:
-            await socket.send_json({
-                "type": message_type,
-                "text": text,
-                "route": route,
-                "responseId": response_id,
-            })
+            lock_wait_ms = round((time.perf_counter() - lock_started) * 1000)
+            if generation != self.speech_generation:
+                LOGGER.info(
+                    "response_stream_superseded id=%s route=%s lock_wait_ms=%d",
+                    response_id, route, lock_wait_ms,
+                )
+                return 0
             await socket.send_json({"type": "state", "state": "speaking", "route": route})
             speech_parts = split_spoken_text(text)
             tts_started = time.perf_counter()
@@ -790,11 +849,15 @@ class LiveConversationService:
             await socket.send_json({"type": "output_audio_buffer.started", "responseId": response_id})
             chunk_bytes = OUTPUT_SAMPLE_RATE * 2 // 10
             total_pcm_bytes = 0
+            interrupted = False
             for index, _ in enumerate(speech_parts):
                 next_synthesis: asyncio.Task[bytes] | None = None
                 if index + 1 < len(speech_parts):
                     next_synthesis = asyncio.create_task(self.tts.synthesize(speech_parts[index + 1]))
                 for offset in range(0, len(pcm), chunk_bytes):
+                    if generation != self.speech_generation:
+                        interrupted = True
+                        break
                     chunk = pcm[offset:offset + chunk_bytes]
                     await socket.send_json({
                         "type": "response.output_audio.delta",
@@ -804,14 +867,16 @@ class LiveConversationService:
                     })
                     total_pcm_bytes += len(chunk)
                     await asyncio.sleep(len(chunk) / (OUTPUT_SAMPLE_RATE * 2))
+                if interrupted:
+                    break
                 if next_synthesis is not None:
                     wait_started = time.perf_counter()
                     pcm = await next_synthesis
                     tts_ms += round((time.perf_counter() - wait_started) * 1000)
             await socket.send_json({"type": "response.output_audio.done", "responseId": response_id})
             LOGGER.info(
-                "response_stream_done id=%s route=%s pcm_bytes=%d tts_wait_ms=%d",
-                response_id, route, total_pcm_bytes, tts_ms,
+                "response_stream_done id=%s route=%s pcm_bytes=%d tts_wait_ms=%d lock_wait_ms=%d interrupted=%s",
+                response_id, route, total_pcm_bytes, tts_ms, lock_wait_ms, interrupted,
             )
         return tts_ms
 
@@ -878,7 +943,7 @@ function addHistory(role,content){if(!content)return;historyMessages.push({role,
 function rms(b64){const s=atob(b64||'');let sum=0,n=0;for(let i=0;i+1<s.length;i+=2){let v=(s.charCodeAt(i)&255)|((s.charCodeAt(i+1)&255)<<8);if(v&32768)v-=65536;const f=v/32768;sum+=f*f;n++}return n?Math.sqrt(sum/n):0}
 function send(x){if(ws&&ws.readyState===1)ws.send(JSON.stringify(x))}
 function report(event,detail){send({type:'client_event',event:event,detail:String(detail||'')})}
-function begin(){if(recording||awaitingResponse)return;recording=true;candidateSpeechMs=0;speechMs=0;silenceMs=0;if(responseActive){responseActive=false;if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}try{OpenClawNativeAudio.interruptAgentResponsePlayback()}catch(e){}report('barge_in','confirmed_user_speech');send({type:'input_audio_buffer.speech_started'})}send({type:'start'});for(const audioBase64 of pre)send({type:'audio',audioBase64});pre=[];state.textContent='Listening…'}
+function begin(){if(recording||awaitingResponse)return;recording=true;candidateSpeechMs=0;speechMs=0;silenceMs=0;if(responseActive){responseActive=false;if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}try{OpenClawNativeAudio.interruptAgentResponsePlayback()}catch(e){}report('barge_in','confirmed_user_speech')}send({type:'input_audio_buffer.speech_started'});send({type:'start'});for(const audioBase64 of pre)send({type:'audio',audioBase64});pre=[];state.textContent='Listening…'}
 function tick(){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>20)pre.shift();if(awaitingResponse){candidateSpeechMs=0;return}const speechThreshold=responseActive?.025:.006;const speechRequiredMs=responseActive?600:200;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+20:0;if(candidateSpeechMs>=speechRequiredMs)begin();return}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=20;silenceMs=0}else silenceMs+=20;if(speechMs>=200&&silenceMs>=600){recording=false;awaitingResponse=true;candidateSpeechMs=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}}
 function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-80):[];renderHistory()}if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if((m.detail||'').startsWith('Ignored')){pendingTranscript='';awaitingResponse=false}}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;if(pendingTranscript){addHistory('user',pendingTranscript);pendingTranscript=''}addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;candidateSpeechMs=0;pre=[];audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){candidateSpeechMs=0;pre=[];if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
 function stop(){if(timer)clearInterval(timer);timer=null;if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=null;try{OpenClawNativeAudio.stopCapture()}catch(e){}if(ws)ws.close();ws=null;recording=false;awaitingResponse=false;responseActive=false;candidateSpeechMs=0;bar.style.width='0%';state.textContent='Stopped'}
@@ -1004,6 +1069,7 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
         payload = json.loads(message.data)
         kind = payload.get("type")
         if kind == "input_audio_buffer.speech_started":
+            service.interrupt_speech()
             await socket.send_json({"type": "output_audio_buffer.cleared"})
         elif kind == "start":
             audio.clear()

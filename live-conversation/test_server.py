@@ -24,6 +24,7 @@ from server import (
     direct_voice_surface_reply,
     extract_agent_text,
     has_stale_identity_confusion,
+    is_gateway_status_question,
     is_wake_word,
     parse_speech_model_output,
     repair_known_transcription_errors,
@@ -31,6 +32,7 @@ from server import (
     render_page,
     split_spoken_text,
     speech_model_prompt,
+    summarize_gateway_status,
 )
 
 
@@ -69,6 +71,25 @@ class RoutingTests(unittest.TestCase):
         self.assertFalse(has_stale_identity_confusion(
             "I'm Jarvis, the model operating Live Conversation."
         ))
+
+    def test_gateway_status_questions_have_deterministic_summaries(self):
+        sessions = (
+            "key=one | title=Audio repair | hasActiveRun=yes | updated=now\n"
+            "key=two | title=Completed task | hasActiveRun=no | updated=earlier\n"
+            "key=three | title=RAG review | hasActiveRun=yes | updated=now"
+        )
+        self.assertTrue(is_gateway_status_question(
+            "Can you tell me the status of the running sessions?"
+        ))
+        self.assertFalse(is_gateway_status_question("Start another agent."))
+        self.assertEqual(
+            summarize_gateway_status(sessions),
+            "2 gateway sessions are currently running: Audio repair; RAG review.",
+        )
+        self.assertEqual(
+            summarize_gateway_status("No active sessions.", agent_pending=True),
+            "One agent request from this Live Conversation is still running.",
+        )
 
     def test_prompt_ignores_background_speech_and_exposes_capabilities(self):
         prompt = speech_model_prompt(self.now, capabilities="agent research: Research\nskill weather: Forecasts")
@@ -264,6 +285,21 @@ class RoutingTests(unittest.TestCase):
                 self.assertEqual(
                     await service.speech_reply("Are you able to hear me?"),
                     ("direct", "Yes, I can hear you clearly.", None),
+                )
+                client_session.assert_not_called()
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_speech_reply_bypasses_model_for_gateway_status(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.sessions = "key=one | title=Audio repair | hasActiveRun=yes"
+            service.sessions_updated_at = time.monotonic()
+            with patch("server.aiohttp.ClientSession") as client_session:
+                self.assertEqual(
+                    await service.speech_reply("What sessions are running?"),
+                    ("direct", "1 gateway session is currently running: Audio repair.", None),
                 )
                 client_session.assert_not_called()
 
@@ -510,6 +546,7 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("const speechRequiredMs=responseActive?600:200", page)
         self.assertIn("responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500)", page)
         self.assertIn("report('barge_in','confirmed_user_speech')", page)
+        self.assertIn("}send({type:'input_audio_buffer.speech_started'});send({type:'start'})", page)
 
     def test_spoken_audio_is_paced_in_realtime(self):
         async def run_test():
@@ -520,6 +557,29 @@ class RoutingTests(unittest.TestCase):
                 await service.send_spoken_response(socket, "A short response.", "agent", "response-1")
             self.assertEqual(sleep.await_count, 2)
             self.assertEqual(sleep.await_args_list[0].args[0], 0.1)
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_confirmed_barge_in_stops_a_long_server_stream(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 0.72)
+            socket = AsyncMock()
+            service.tts.synthesize = AsyncMock(return_value=b"\0" * 24_000)
+
+            async def interrupt_after_first_chunk(_):
+                service.interrupt_speech()
+
+            with patch("server.asyncio.sleep", AsyncMock(side_effect=interrupt_after_first_chunk)) as sleep:
+                await service.send_spoken_response(socket, "A long response.", "agent", "response-1")
+
+            self.assertEqual(sleep.await_count, 1)
+            payloads = [call.args[0] for call in socket.send_json.await_args_list]
+            self.assertEqual(
+                sum(payload.get("type") == "response.output_audio.delta" for payload in payloads),
+                1,
+            )
+            self.assertEqual(payloads[-1]["type"], "response.output_audio.done")
 
         import asyncio
         asyncio.run(run_test())
