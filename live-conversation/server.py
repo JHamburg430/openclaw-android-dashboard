@@ -39,11 +39,14 @@ DEFAULT_TTS_WORKER = str(Path(__file__).with_name("openclaw-kokoro-tts-worker"))
 DEFAULT_TTS_RUNTIME = "/home/john/.openclaw/tools/sherpa-onnx-tts/runtime"
 DEFAULT_TTS_MODEL_DIR = "/home/john/.openclaw/tools/sherpa-onnx-tts/models/kokoro-en-v0_19"
 DEFAULT_TTS_SPEAKER_ID = 9  # bm_george, a British male voice
-SPEECH_MODEL_URL = "http://127.0.0.1:11434/api/chat"
+SPEECH_MODEL_URL = "http://127.0.0.1:11439/api/chat"
 # Large enough for materially better natural-language supervision while staying
 # within the sub-second warm-response budget on the local Ollama GPUs.
-SPEECH_MODEL = "qwen3.5:4b"
+# Use a dedicated Ollama model identity so unrelated qwen3.5 requests with a
+# different context size cannot replace Live Conversation's warm runner.
+SPEECH_MODEL = "openclaw-live-conversation:4b"
 SPEECH_MODEL_KEEP_ALIVE = "30m"
+SPEECH_MODEL_CONTEXT = 8_192
 SPEECH_NUM_PREDICT = 256
 SPEECH_RETRY_NUM_PREDICT = 512
 AGENT_SENTINEL = "[[OPENCLAW_AGENT]]"
@@ -73,8 +76,8 @@ DEFAULT_HISTORY_PATH = "/home/john/.openclaw/state/live-conversation-history.jso
 DEFAULT_SETTINGS_PATH = "/home/john/.openclaw/state/live-conversation-settings.json"
 MAX_HISTORY_MESSAGES = 80
 MAX_HISTORY_CHARS = 48_000
-PROMPT_HISTORY_MESSAGES = 60
-PROMPT_HISTORY_CHARS = 28_000
+PROMPT_HISTORY_MESSAGES = 24
+PROMPT_HISTORY_CHARS = 12_000
 WAKE_WORD = "jarvis"
 WAKE_WORD_ALIASES = frozenset(("jarvis", "jervis", "chavez"))
 WAKE_WINDOW_SECONDS = 2.5
@@ -1038,7 +1041,14 @@ class LiveConversationService:
             "stream": False,
             "think": False,
             "messages": [{"role": "user", "content": "Reply only: ready"}],
-            "options": {"temperature": 0, "num_predict": 3, "num_ctx": 512},
+            "options": {
+                "temperature": 0,
+                "num_predict": 3,
+                # Match real requests. Ollama keys runners by context size, so
+                # warming a 512-token context still made the first live turn
+                # rebuild the runner for 8k.
+                "num_ctx": SPEECH_MODEL_CONTEXT,
+            },
         }
         try:
             timeout = aiohttp.ClientTimeout(total=60)
@@ -1081,12 +1091,16 @@ class LiveConversationService:
             segments, _ = self.stt._model.transcribe(
                 audio_float,
                 language="en",
-                beam_size=3,
-                best_of=3,
+                beam_size=5,
+                best_of=5,
                 temperature=0.0,
                 condition_on_previous_text=False,
                 without_timestamps=True,
                 no_speech_threshold=0.6,
+                hotwords=(
+                    "John, Jarvis, OpenClaw, Live Conversation, live agent, "
+                    "subagent, gateway, sessions"
+                ),
                 vad_filter=True,
                 vad_parameters={
                     "threshold": 0.5 if purpose == "wake" else 0.6,
@@ -1309,7 +1323,7 @@ class LiveConversationService:
             "options": {
                 "temperature": 0,
                 "num_predict": SPEECH_NUM_PREDICT,
-                "num_ctx": 16_384,
+                "num_ctx": SPEECH_MODEL_CONTEXT,
             },
         }
         timeout = aiohttp.ClientTimeout(total=15)
@@ -1569,7 +1583,7 @@ function rms(b64){const s=atob(b64||'');let sum=0,n=0;for(let i=0;i+1<s.length;i
 function send(x){if(ws&&ws.readyState===1)ws.send(JSON.stringify(x))}
 function report(event,detail){send({type:'client_event',event:event,detail:String(detail||'')})}
 function begin(){if(recording||awaitingResponse)return;recording=true;candidateSpeechMs=0;speechMs=0;silenceMs=0;if(responseActive){responseActive=false;if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}try{OpenClawNativeAudio.interruptAgentResponsePlayback()}catch(e){}report('barge_in','confirmed_user_speech')}send({type:'input_audio_buffer.speech_started'});send({type:'start'});for(const audioBase64 of pre)send({type:'audio',audioBase64});pre=[];state.textContent='Listening…'}
-function tick(){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>20)pre.shift();if(awaitingResponse){candidateSpeechMs=0;return}const speechThreshold=responseActive?.025:.006;const speechRequiredMs=200;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+20:0;if(candidateSpeechMs>=speechRequiredMs)begin();return}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=20;silenceMs=0}else silenceMs+=20;if(speechMs>=200&&silenceMs>=600){recording=false;awaitingResponse=true;candidateSpeechMs=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}}
+function tick(){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>20)pre.shift();if(awaitingResponse){candidateSpeechMs=0;return}const speechThreshold=responseActive?.025:.012;const speechRequiredMs=responseActive?200:300;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+20:0;if(candidateSpeechMs>=speechRequiredMs)begin();return}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=20;silenceMs=0}else silenceMs+=20;if(speechMs>=200&&silenceMs>=600){recording=false;awaitingResponse=true;candidateSpeechMs=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}}
 function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-80):[];renderHistory()}if(m.type==='settings')confirmation.textContent='Action confirmation: '+(m.action_confirmation==='confirm'?'On — asks before actions':'Off — explicit requests proceed');if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.state==='listening'){awaitingResponse=false;recording=false;candidateSpeechMs=0}if((m.detail||'').startsWith('Ignored')||(m.detail||'').startsWith('Silent stop'))pendingTranscript=''}if(m.type==='partial_transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;if(pendingTranscript){addHistory('user',pendingTranscript);pendingTranscript=''}addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;candidateSpeechMs=0;pre=[];audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){candidateSpeechMs=0;pre=[];if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
 function stop(){if(timer)clearInterval(timer);timer=null;if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=null;try{OpenClawNativeAudio.stopCapture()}catch(e){}if(ws)ws.close();ws=null;recording=false;awaitingResponse=false;responseActive=false;candidateSpeechMs=0;bar.style.width='0%';state.textContent='Stopped'}
 document.getElementById('start').onclick=start;document.getElementById('stop').onclick=()=>{stop();try{OpenClawNativeApp.liveConversationStopped()}catch(e){}};window.addEventListener('pagehide',stop);if(new URLSearchParams(location.search).get('autostart')==='1')start();

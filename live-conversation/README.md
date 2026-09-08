@@ -6,11 +6,17 @@ in the Android Dashboard plus menu.
 ## Pipeline
 
 1. The Android native audio bridge captures 16 kHz PCM in 20 ms frames.
-2. Browser-side VAD commits a turn after 600 ms of silence.
+2. Browser-side VAD requires 300 ms of near-field audio above a 0.012 RMS
+   threshold before opening a turn, then commits it after 600 ms of silence.
+   This rejects the lower-level television/road speech that the former 0.006
+   start gate treated as if it came from the person holding the phone.
 3. Pipecat's persistent `faster-whisper` `small.en` service transcribes locally
    with CUDA `float16` beam search on GPU 0 and falls back to CPU `int8` if CUDA
-   initialization fails. The larger cached model improves recognition of terms
-   such as “live agent,” session names, and longer technical requests. While a
+   initialization fails. Five-candidate beam search and a small vocabulary hint
+   for Jarvis, OpenClaw, Live Conversation, agents, and sessions improve the
+   recurring proper-name and system-term substitutions. The larger cached model
+   improves recognition of terms such as “live agent,” session names, and
+   longer technical requests. While a
    user is speaking, the service retranscribes the growing audio buffer about
    once per second and displays partial text. Final decoding consumes
    Faster-Whisper's lazy segment generator entirely on a worker thread, so
@@ -18,10 +24,18 @@ in the Android Dashboard plus menu.
    fixed turn-length cap truncates a user's input. Silero VAD filters non-speech
    audio before decoding, with a stricter threshold for normal turns than for
    the wake word, reducing false transcripts from road and ambient noise.
-4. The local `qwen3.5:4b` speech supervisor returns either a short speakable
-   response or the hidden `[[OPENCLAW_AGENT]]` control token. This model is the
+4. The local `qwen3.5:4b` speech supervisor is installed under the dedicated
+   Ollama identity `openclaw-live-conversation:4b` and returns either a short
+   speakable response or the hidden `[[OPENCLAW_AGENT]]` control token. This model is the
    local latency/quality balance: materially stronger than the former 0.8B
-   supervisor while remaining sub-second once warm on the installed GPUs. The
+   supervisor while remaining sub-second once warm on the installed GPUs. Its
+   fixed 8k context and dedicated identity prevent unrelated qwen3.5 callers
+   with 16k or 32k contexts from repeatedly replacing and reloading its runner.
+   A loopback-only companion Ollama process on port 11439 isolates the live
+   runner from the shared system Ollama scheduler, which otherwise evicted it
+   even while its 30-minute keep-alive was active.
+   Only the newest 24 routing-relevant history messages are included, while all
+   80 messages remain persisted and visible. The
    Ollama request keeps it warm for 30 minutes to avoid repeated cold starts
    during a conversation. The model is also warmed when the service starts.
    The reply budget is 256 tokens rather than the former 80-token ceiling. If
@@ -133,7 +147,10 @@ chmod +x live-conversation/build-tts-worker.sh
 live-conversation/build-tts-worker.sh
 mkdir -p ~/.config/systemd/user
 cp live-conversation/openclaw-live-conversation.service ~/.config/systemd/user/
+cp live-conversation/openclaw-live-ollama.service ~/.config/systemd/user/
+ollama create openclaw-live-conversation:4b -f live-conversation/Modelfile
 systemctl --user daemon-reload
+systemctl --user enable --now openclaw-live-ollama.service
 systemctl --user enable --now openclaw-live-conversation.service
 curl -fsS http://127.0.0.1:8790/health
 ```

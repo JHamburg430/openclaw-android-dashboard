@@ -1,0 +1,6 @@
+FROM qwen3.5:4b
+
+# Live Conversation needs only a compact routing/conversation window. Keeping
+# this as a separate model identity prevents other qwen3.5 callers that request
+# 16k or 32k contexts from tearing down and rebuilding its warm Ollama runner.
+PARAMETER num_ctx 8192

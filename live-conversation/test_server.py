@@ -13,7 +13,9 @@ from server import (
     IGNORE_SENTINEL,
     SAY_SENTINEL,
     SPEECH_MODEL,
+    SPEECH_MODEL_CONTEXT,
     SPEECH_MODEL_KEEP_ALIVE,
+    SPEECH_MODEL_URL,
     SPEECH_NUM_PREDICT,
     SPEECH_RETRY_NUM_PREDICT,
     DEFAULT_NODE_COMMAND,
@@ -325,10 +327,18 @@ class RoutingTests(unittest.TestCase):
         )
 
     def test_speech_supervisor_uses_higher_quality_local_model(self):
-        self.assertEqual(SPEECH_MODEL, "qwen3.5:4b")
+        self.assertEqual(SPEECH_MODEL, "openclaw-live-conversation:4b")
+        self.assertEqual(SPEECH_MODEL_CONTEXT, 8192)
+        self.assertEqual(SPEECH_MODEL_URL, "http://127.0.0.1:11439/api/chat")
         self.assertEqual(SPEECH_MODEL_KEEP_ALIVE, "30m")
         self.assertEqual(SPEECH_NUM_PREDICT, 256)
         self.assertEqual(SPEECH_RETRY_NUM_PREDICT, 512)
+
+    def test_speech_model_warmup_uses_the_live_context_size(self):
+        import inspect
+        source = inspect.getsource(LiveConversationService.warm_speech_model)
+        self.assertIn('"num_ctx": SPEECH_MODEL_CONTEXT', source)
+        self.assertNotIn('"num_ctx": 512', source)
 
     def test_speech_supervisor_retries_instead_of_showing_a_token_limited_reply(self):
         async def run_test():
@@ -853,6 +863,10 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("vad_filter=True", source)
         self.assertIn('"threshold": 0.5 if purpose == "wake" else 0.6', source)
         self.assertIn('"min_speech_duration_ms": 250', source)
+        self.assertIn("beam_size=5", source)
+        self.assertIn("best_of=5", source)
+        self.assertIn("hotwords=", source)
+        self.assertIn("OpenClaw, Live Conversation, live agent", source)
 
     def test_agent_turn_intercepts_sentinel_without_speaking_it(self):
         async def run_test():
@@ -1086,8 +1100,8 @@ class RoutingTests(unittest.TestCase):
 
     def test_playback_vad_rejects_echo_and_covers_native_tail(self):
         page = render_page()
-        self.assertIn("const speechThreshold=responseActive?.025:.006", page)
-        self.assertIn("const speechRequiredMs=200", page)
+        self.assertIn("const speechThreshold=responseActive?.025:.012", page)
+        self.assertIn("const speechRequiredMs=responseActive?200:300", page)
         self.assertIn("responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500)", page)
         self.assertIn("report('barge_in','confirmed_user_speech')", page)
         self.assertIn("}send({type:'input_audio_buffer.speech_started'});send({type:'start'})", page)
