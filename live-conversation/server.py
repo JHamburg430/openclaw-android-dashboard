@@ -47,11 +47,25 @@ AGENT_SENTINEL = "[[OPENCLAW_AGENT]]"
 NEW_AGENT_SENTINEL = "[[OPENCLAW_NEW]]"
 SAY_SENTINEL = "[[SAY]]"
 IGNORE_SENTINEL = "[[IGNORE]]"
+SPEECH_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "route": {
+            "type": "string",
+            "enum": ["direct", "agent", "new_agent", "session", "ignore"],
+        },
+        "reply": {"type": "string"},
+        "session_key": {"type": "string"},
+    },
+    "required": ["route", "reply", "session_key"],
+    "additionalProperties": False,
+}
 CAPABILITY_CACHE_SECONDS = 60
 SESSION_CACHE_SECONDS = 3
 SESSION_POLL_SECONDS = 10
 PARTIAL_TRANSCRIPT_INTERVAL_SECONDS = 1.0
 DEFAULT_HISTORY_PATH = "/home/john/.openclaw/state/live-conversation-history.json"
+DEFAULT_SETTINGS_PATH = "/home/john/.openclaw/state/live-conversation-settings.json"
 MAX_HISTORY_MESSAGES = 80
 MAX_HISTORY_CHARS = 48_000
 PROMPT_HISTORY_MESSAGES = 60
@@ -97,6 +111,61 @@ def direct_voice_surface_reply(transcript: str) -> str | None:
             "I'm Jarvis, the model operating Live Conversation. "
             "I answer here directly and use gateway agents when tool-backed work is needed."
         )
+    testing_statement = re.match(
+        r"^(?:(?:i am|i'm) )?(?:just )?(?:testing|testing out|trying|trying out|"
+        r"checking|checking out)\b",
+        normalized,
+    )
+    explicit_request = re.search(
+        r"\b(?:can|could|would|will) you\b|\bplease\b|"
+        r"\b(?:have|ask|tell)\b.*\bagent\b|"
+        r"\band (?:fix|change|update|monitor|verify|review|inspect|start|spawn|launch)\b",
+        normalized,
+    )
+    if testing_statement and not explicit_request:
+        return "I hear you. Go ahead with the test."
+    return None
+
+
+def confirmation_policy_command(transcript: str) -> str | None:
+    """Recognize voice commands that configure action confirmation."""
+    normalized = re.sub(r"[^a-z0-9']+", " ", transcript.lower()).strip()
+    if re.search(r"\b(?:what is|what's|tell me)\b.*\bconfirmation (?:mode|setting|policy)\b", normalized):
+        return "status"
+    confirmation = re.search(r"\b(?:confirm|confirmation|ask me|permission|approval)\b", normalized)
+    action = re.search(r"\b(?:action|actions|act|acting|anything|proceed|doing|do it)\b", normalized)
+    if not confirmation or not action:
+        return None
+    if re.search(
+        r"\b(?:don't|do not|never) (?:ask|require|need)\b|"
+        r"\b(?:without|no) (?:asking|confirmation|permission|approval)\b|"
+        r"\b(?:disable|turn off|stop asking)\b",
+        normalized,
+    ):
+        return "automatic"
+    if re.search(
+        r"\b(?:always|require|enable|turn on)\b|"
+        r"\bask me\b.*\b(?:before|first)\b|"
+        r"\bget (?:my )?(?:confirmation|permission|approval)\b",
+        normalized,
+    ):
+        return "confirm"
+    return None
+
+
+def confirmation_answer(transcript: str) -> bool | None:
+    """Resolve a short answer to a pending action-confirmation question."""
+    normalized = re.sub(r"[^a-z0-9']+", " ", transcript.lower()).strip()
+    if len(normalized) > 80:
+        return None
+    if re.fullmatch(r"(?:yes|yeah|yep|sure|okay|ok|go ahead|proceed|do it|please do|confirm)(?: please)?", normalized):
+        return True
+    if re.fullmatch(
+        r"(?:no|nope)(?: cancel(?: it| that)?)?|"
+        r"(?:cancel|stop|don't|do not|never mind|nevermind)(?: it| that)?",
+        normalized,
+    ):
+        return False
     return None
 
 
@@ -112,12 +181,44 @@ def has_stale_identity_confusion(text: str) -> bool:
     )
 
 
+def is_operational_acknowledgment(text: str) -> bool:
+    """Exclude prior routing acknowledgments from future routing examples."""
+    normalized = re.sub(r"\s+", " ", text.lower()).strip()
+    return bool(
+        re.search(
+            r"\b(?:i'll|i will|let me)\b.*\b(?:agent|monitor|verify|investigate|"
+            r"inspect|fix|update|check|spawn|launch)\b",
+            normalized,
+        )
+        or re.search(r"\b(?:spawned|started|launched) (?:a|an|the|another) agent\b", normalized)
+    )
+
+
 def is_gateway_status_question(transcript: str) -> bool:
     """Recognize broad requests for currently running gateway work."""
     normalized = re.sub(r"[^a-z0-9]+", " ", transcript.lower()).strip()
     subject = re.search(r"\b(?:sessions?|agents?|subagents?|tasks?|runs?)\b", normalized)
     status = re.search(r"\b(?:status|running|active|progress|update|working)\b", normalized)
     return bool(subject and status and not re.search(r"\b(?:start|launch|create)\b", normalized))
+
+
+def has_explicit_action_request(transcript: str) -> bool:
+    """Require affirmative request language before any tool-backed route."""
+    normalized = re.sub(r"[^a-z0-9']+", " ", transcript.lower()).strip()
+    return bool(
+        re.search(r"\b(?:can|could|would|will) you\b|\bplease\b", normalized)
+        or re.search(r"\b(?:i need|i want) you to\b", normalized)
+        or re.search(r"\b(?:have|ask|tell)\b.*\bagent\b", normalized)
+        or re.match(
+            r"^(?:also )?(?:fix|change|update|monitor|verify|review|inspect|check|"
+            r"start|spawn|launch|create|send|add|remove|stop|run|build|deploy)\b",
+            normalized,
+        )
+        or re.search(
+            r"\bneeds? (?:to be )?(?:fixed|changed|updated|reviewed|checked|investigated)\b",
+            normalized,
+        )
+    )
 
 
 def summarize_gateway_status(sessions: str, agent_pending: bool = False) -> str:
@@ -169,6 +270,7 @@ def speech_model_prompt(
     agent_pending: bool = False,
     capabilities: str = "",
     sessions: str = "",
+    confirmation_required: bool = False,
 ) -> str:
     clock = now or datetime.now(ZoneInfo("America/Detroit"))
     pending_note = (
@@ -176,50 +278,71 @@ def speech_model_prompt(
         if agent_pending else
         "No agent request launched by this voice connection is currently awaiting a final response. "
     )
+    confirmation_note = (
+        "Action confirmation is ON. The bridge will ask before executing an action. "
+        if confirmation_required else
+        "Action confirmation is OFF. Explicit action requests execute after your acknowledgment. "
+    )
     return f"""You are Jarvis, the model operating John's Live Conversation voice interface right now.
 Jarvis and the Live Conversation model are the same speaker: both refer to you. You receive John's locally transcribed microphone input, choose how each turn is handled, and speak the response. A gateway agent is only a tool-backed work session that you may use; it is not a separate Live Conversation model. Never claim that you are merely a supervisor outside Live Conversation, and never ask an agent to verify whether you can hear John. If a microphone utterance reaches you as a transcript, you heard it.
 You are not a general chatbot pretending to lack system access. You can see the live gateway-session summary and capability catalog below, answer questions about them directly, route a follow-up into an existing session, or launch a separate agent session. {pending_note}
-Output exactly one of these forms:
-- Only for speech that is clearly not addressed to you and has no plausible request, question, or conversational meaning: {IGNORE_SENTINEL} alone. Do not ignore a plausible command or question merely because its grammar is imperfect or speech recognition likely changed a word.
-- For casual conversation or timeless general knowledge answerable confidently without tools: {SAY_SENTINEL} followed by one short natural spoken response.
-- For a hearing check such as “can you hear me?”, answer exactly: {SAY_SENTINEL} Yes, I can hear you clearly. Do not qualify the answer or involve an agent.
-- For a new request needing apps, projects, private context, files, logs, calendar, messages, memory, current external facts, tools, judgment, or an action: {AGENT_SENTINEL} followed by a short natural acknowledgment. The bridge starts an agent and speaks its final response when it returns.
-- If John explicitly asks for another, new, separate, or additional agent, use {NEW_AGENT_SENTINEL} followed by the acknowledgment. Multiple agents may work concurrently.
-- To add instructions or a follow-up to a specific active or recent session listed below, output [[OPENCLAW_SESSION:exact-session-key]] followed by the acknowledgment. Copy the key exactly. Use the most clearly referenced session; never invent a key. The bridge sends the message to that session and speaks its eventual response.
-- For a question asking for status, progress, active agents, recent sessions, or what is currently running, answer directly from the live session summary with {SAY_SENTINEL}. Do not ask an agent merely to read information already present below. Say none are active when none have hasActiveRun=yes.
-- If a transcript is visibly unfinished, such as “start another agent that...”, do not launch it yet. Use {SAY_SENTINEL} to ask John to finish the instruction. If the next transcript continues that thought, use both turns to infer the complete request and select the proper agent route.
+{confirmation_note}
+First decide whether John actually requested something. Statements describing what he is currently doing, testing, observing, or noticing are conversation—not authorization to start work. Words such as “test,” “updates,” “performance,” or an agent name do not make a statement actionable. Launch or message an agent only when the transcript contains a request, command, or unmistakable instruction. Never invent work such as monitoring, verifying, checking, or updating when John merely says he is testing something.
+Return one JSON object matching the required schema. Choose `route` before writing `reply`:
+- `direct`: conversation, observations, acknowledgments, timeless knowledge, or answers already available in this prompt. The reply must answer or acknowledge naturally and must not promise agent work.
+- `agent`: an explicit request requiring apps, projects, private context, files, logs, calendar, messages, memory, current facts, tools, judgment, or a system action. The reply briefly acknowledges the work.
+- `new_agent`: only when John explicitly requests another, new, separate, or additional agent. Multiple agents may work concurrently.
+- `session`: only for a follow-up clearly aimed at one listed session. Copy its exact key into `session_key`; never invent one.
+- `ignore`: only speech clearly not addressed to you and having no plausible conversational meaning. Use an empty reply.
+Use an empty `session_key` for every route except `session`. A question about status or currently running work is `direct`; answer it from the session summary. If a transcript is visibly unfinished, ask John to finish it with `direct`. Imperfect grammar alone is not grounds to ignore a turn.
 The current local date and time is {clock.strftime('%A, %B %-d, %Y, %-I:%M %p')} America/Detroit; time and date questions can be answered directly.
 Available OpenClaw capabilities (cached and refreshed automatically):
 {capabilities or 'Capability catalog is temporarily unavailable; delegate capability questions to the agent.'}
 Live and recent gateway sessions (refreshed automatically; hasActiveRun is authoritative):
 {sessions or 'No active or recent gateway sessions were returned.'}
-Use this catalog to answer capability questions quickly. If the user asks to use, configure, expand, or change a capability, acknowledge and delegate with {AGENT_SENTINEL}. Do not claim an unavailable capability exists. Newly added agents and skills appear after the catalog refreshes.
+Use this catalog to answer capability questions quickly. If the user explicitly asks to use, configure, expand, or change a capability, choose `agent`. Do not claim an unavailable capability exists. Newly added agents and skills appear after the catalog refreshes.
 Interpret likely recognition mistakes using the conversation and session context. In this voice app, “five agent” or “five conversation model” means “live agent” or “live conversation model” unless John explicitly discusses the number five or five distinct agents; correct that known ASR error without asking and use the corrected word “live” in the acknowledgment. Do not silently replace any other uncertain proper noun; ask a short clarification instead.
-When John asks to make the live agent or Live Conversation model more capable, that is a complete actionable request: delegate it with {AGENT_SENTINEL} so the agent can review the conversation and current implementation. Do not ask which capabilities he means unless he explicitly presents alternatives requiring a choice.
-Never fabricate private, project, or agent progress. Control sentinels and session keys are machine-readable and must not be spoken.
+When John asks to make the live agent or Live Conversation model more capable, that is a complete actionable request: choose `agent` so the agent can review the conversation and current implementation. Do not ask which capabilities he means unless he explicitly presents alternatives requiring a choice.
+Never fabricate private, project, or agent progress. Keep `reply` short and natural for speech.
 Examples:
+User: Testing out the latest Live Conversation updates.
+Assistant: {{"route":"direct","reply":"I hear you. Go ahead with the test.","session_key":""}}
+User: I'm trying the new audio behavior.
+Assistant: {{"route":"direct","reply":"I'm listening.","session_key":""}}
+User: I'm testing the update; have an agent monitor the logs.
+Assistant: {{"route":"agent","reply":"I’ll have the agent monitor the logs during your test.","session_key":""}}
 User: How is the RAG app improvement going?
-Assistant: {SAY_SENTINEL} The Manuals RAG session is still active and working on retrieval accuracy.
+Assistant: {{"route":"direct","reply":"The Manuals RAG session is still active and working on retrieval accuracy.","session_key":""}}
 User: Fix the routing bug.
-Assistant: {AGENT_SENTINEL} I’ll have the agent inspect and fix the routing bug.
+Assistant: {{"route":"agent","reply":"I’ll have the agent inspect and fix the routing bug.","session_key":""}}
 User: Also tell that active routing agent to check the reconnect path.
-Assistant: [[OPENCLAW_SESSION:agent:main:dashboard:example]] I’ll add the reconnect check to that session.
+Assistant: {{"route":"session","reply":"I’ll add the reconnect check to that session.","session_key":"agent:main:dashboard:example"}}
 User: Start another agent to inspect the audio cutoff.
-Assistant: {NEW_AGENT_SENTINEL} I’ll start a separate agent to inspect the audio cutoff.
+Assistant: {{"route":"new_agent","reply":"I’ll start a separate agent to inspect the audio cutoff.","session_key":""}}
 User: Make the five agent more capable.
-Assistant: {AGENT_SENTINEL} I’ll have the agent review this conversation and improve the live agent’s capabilities.
+Assistant: {{"route":"agent","reply":"I’ll have the agent review this conversation and improve the live agent’s capabilities.","session_key":""}}
 User: Who wrote The Hobbit?
-Assistant: {SAY_SENTINEL} J. R. R. Tolkien wrote The Hobbit.
+Assistant: {{"route":"direct","reply":"J. R. R. Tolkien wrote The Hobbit.","session_key":""}}
 User: What time is it?
-Assistant: {SAY_SENTINEL} It is {clock.strftime('%-I:%M %p')}.
+Assistant: {{"route":"direct","reply":"It is {clock.strftime('%-I:%M %p')}.","session_key":""}}
 User: Are you able to hear me?
-Assistant: {SAY_SENTINEL} Yes, I can hear you clearly.
+Assistant: {{"route":"direct","reply":"Yes, I can hear you clearly.","session_key":""}}
 User: Are you the Live Conversation model?
-Assistant: {SAY_SENTINEL} Yes. I'm Jarvis, the model operating Live Conversation."""
+Assistant: {{"route":"direct","reply":"Yes. I'm Jarvis, the model operating Live Conversation.","session_key":""}}"""
 
 
 def parse_speech_model_output(text: str) -> tuple[str, str, str | None]:
     cleaned = text.strip()
+    try:
+        structured = json.loads(cleaned)
+    except (ValueError, TypeError):
+        structured = None
+    if isinstance(structured, dict):
+        route = structured.get("route")
+        reply = structured.get("reply")
+        session_key = structured.get("session_key")
+        if route in {"direct", "agent", "new_agent", "session", "ignore"} and isinstance(reply, str):
+            return route, reply.strip(), session_key.strip() if isinstance(session_key, str) and session_key.strip() else None
     if IGNORE_SENTINEL in cleaned:
         return "ignore", "", None
     session_match = re.search(r"\[\[OPENCLAW_SESSION:([^\]]+)\]\]", cleaned)
@@ -520,7 +643,13 @@ class PersistentTtsWorker:
 
 
 class LiveConversationService:
-    def __init__(self, session_key: str, tts_speed: float, history_path: str | None = None):
+    def __init__(
+        self,
+        session_key: str,
+        tts_speed: float,
+        history_path: str | None = None,
+        settings_path: str | None = None,
+    ):
         self.session_key = session_key
         self.stt: WhisperSTTService | None = None
         self.stt_description = "not loaded"
@@ -537,9 +666,54 @@ class LiveConversationService:
         self.session_poll_task: asyncio.Task[None] | None = None
         self.speech_generation = 0
         self.pending_spoken_replies: deque[str] = deque(maxlen=10)
+        self.confirmation_required = False
+        self.pending_confirmation: tuple[str, str | None, str] | None = None
         self.history_path = Path(history_path) if history_path else None
+        self.settings_path = Path(settings_path) if settings_path else None
         self.history: deque[dict[str, str]] = deque(maxlen=MAX_HISTORY_MESSAGES)
+        self._load_settings()
         self._load_history()
+
+    def _load_settings(self) -> None:
+        if not self.settings_path or not self.settings_path.exists():
+            return
+        try:
+            payload = json.loads(self.settings_path.read_text(encoding="utf-8"))
+            self.confirmation_required = payload.get("action_confirmation") == "confirm"
+        except (OSError, ValueError, TypeError) as error:
+            LOGGER.warning("conversation_settings_load_failed error=%s", error)
+
+    def _save_settings(self) -> None:
+        if not self.settings_path:
+            return
+        try:
+            self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.settings_path.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps({
+                    "action_confirmation": (
+                        "confirm" if self.confirmation_required else "automatic"
+                    )
+                }, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(self.settings_path)
+        except OSError as error:
+            LOGGER.warning("conversation_settings_save_failed error=%s", error)
+
+    def set_confirmation_required(self, required: bool) -> None:
+        self.confirmation_required = required
+        if not required:
+            self.pending_confirmation = None
+        self._save_settings()
+
+    def settings_payload(self) -> dict[str, str]:
+        return {
+            "type": "settings",
+            "action_confirmation": (
+                "confirm" if self.confirmation_required else "automatic"
+            ),
+        }
 
     def _load_history(self) -> None:
         if not self.history_path or not self.history_path.exists():
@@ -586,9 +760,16 @@ class LiveConversationService:
             self.pending_spoken_replies.append(reply.strip())
 
     def prompt_history(self) -> list[dict[str, str]]:
+        filtered: list[dict[str, str]] = []
+        for message in self.history:
+            if message["role"] == "assistant" and is_operational_acknowledgment(message["content"]):
+                if filtered and filtered[-1]["role"] == "user":
+                    filtered.pop()
+                continue
+            filtered.append(message)
         selected: deque[dict[str, str]] = deque()
         used_chars = 0
-        for message in reversed(self.history):
+        for message in reversed(filtered):
             if message["role"] == "assistant" and has_stale_identity_confusion(message["content"]):
                 continue
             size = len(message["content"])
@@ -853,11 +1034,13 @@ class LiveConversationService:
             "keep_alive": SPEECH_MODEL_KEEP_ALIVE,
             "stream": False,
             "think": False,
+            "format": SPEECH_OUTPUT_SCHEMA,
             "messages": [
                 {"role": "system", "content": speech_model_prompt(
                     agent_pending=agent_pending,
                     capabilities=capabilities,
                     sessions=self.sessions,
+                    confirmation_required=self.confirmation_required,
                 )},
                 *self.prompt_history(),
                 {"role": "user", "content": text},
@@ -870,6 +1053,15 @@ class LiveConversationService:
                 async with session.post(SPEECH_MODEL_URL, json=payload) as response:
                     response.raise_for_status()
                     result = await response.json()
+            LOGGER.info(
+                "speech_supervisor_complete prompt_tokens=%s output_tokens=%s "
+                "load_ms=%.0f prompt_ms=%.0f generation_ms=%.0f",
+                result.get("prompt_eval_count", "unknown"),
+                result.get("eval_count", "unknown"),
+                result.get("load_duration", 0) / 1_000_000,
+                result.get("prompt_eval_duration", 0) / 1_000_000,
+                result.get("eval_duration", 0) / 1_000_000,
+            )
             route, reply, target_session = parse_speech_model_output(
                 result.get("message", {}).get("content", "")
             )
@@ -882,6 +1074,17 @@ class LiveConversationService:
                     "I answer here directly and use gateway agents when tool-backed work is needed.",
                     None,
                 )
+            explicit_action = has_explicit_action_request(text)
+            if route in {"agent", "new_agent", "session"} and not explicit_action:
+                LOGGER.warning("speech_supervisor_blocked_unrequested_action route=%s", route)
+                route, reply, target_session = "direct", "I understand.", None
+            elif route == "direct" and is_operational_acknowledgment(reply):
+                if explicit_action:
+                    LOGGER.warning("speech_supervisor_repaired_missing_agent_route")
+                    route, target_session = "agent", None
+                else:
+                    LOGGER.warning("speech_supervisor_removed_invented_action")
+                    reply = "I understand."
             if route == "session" and target_session not in self.session_keys:
                 LOGGER.warning("speech_supervisor_invalid_session target=%s", target_session)
                 route, target_session = "agent", None
@@ -975,9 +1178,43 @@ class LiveConversationService:
             await socket.send_json({"type": "transcript", "text": transcript})
 
             stage = time.perf_counter()
-            route, reply, target_session = await self.speech_reply(
-                transcript, agent_pending=agent_pending
-            )
+            handoff_request: str | None = None
+            policy_command = confirmation_policy_command(transcript)
+            answer = confirmation_answer(transcript) if self.pending_confirmation else None
+            if policy_command:
+                if policy_command == "status":
+                    mode = "on" if self.confirmation_required else "off"
+                    reply = f"Action confirmation is {mode}."
+                else:
+                    self.set_confirmation_required(policy_command == "confirm")
+                    if self.confirmation_required:
+                        reply = "Action confirmation is on. I'll ask before taking actions."
+                    else:
+                        reply = "Action confirmation is off. Explicit requests will proceed immediately."
+                    await socket.send_json(self.settings_payload())
+                route, target_session = "direct", None
+            elif answer is not None:
+                pending_request, pending_target, pending_route = self.pending_confirmation
+                self.pending_confirmation = None
+                if answer:
+                    route, reply, target_session = pending_route, "Okay, proceeding.", pending_target
+                    handoff_request = pending_request
+                else:
+                    route, reply, target_session = "direct", "Okay, I won't take that action.", None
+            else:
+                route, reply, target_session = await self.speech_reply(
+                    transcript, agent_pending=agent_pending
+                )
+                agent_request = self.contextualize_agent_request(transcript)
+                if route in ("agent", "new_agent", "session"):
+                    if self.confirmation_required:
+                        self.pending_confirmation = (agent_request, target_session, route)
+                        summary = re.sub(r"\s+", " ", transcript).strip()[:180].rstrip(" .?!")
+                        route = "confirmation"
+                        target_session = None
+                        reply = f"Before I take that action, should I proceed with: {summary}?"
+                    else:
+                        handoff_request = agent_request
             metrics.routing_ms = round((time.perf_counter() - stage) * 1000)
             metrics.route = route
 
@@ -985,7 +1222,6 @@ class LiveConversationService:
                 await socket.send_json({"type": "state", "state": "listening", "detail": "Ignored likely background speech."})
                 return None
 
-            agent_request = self.contextualize_agent_request(transcript)
             self.remember("user", transcript)
             self.remember("assistant", reply)
 
@@ -996,16 +1232,16 @@ class LiveConversationService:
             metrics.total_ms = round((time.perf_counter() - started) * 1000)
             await socket.send_json({"type": "metrics", **asdict(metrics)})
             await socket.send_json({"type": "state", "state": "listening"})
-            if route in ("agent", "new_agent", "session"):
+            if handoff_request is not None:
                 if route == "agent":
                     target_session = self.session_key
-                agent_request = repair_known_transcription_errors(agent_request)
-                if agent_request != transcript:
+                repaired_request = repair_known_transcription_errors(handoff_request)
+                if repaired_request != handoff_request:
                     LOGGER.info(
                         "transcript_repaired original=%r repaired=%r",
-                        transcript, agent_request,
+                        handoff_request, repaired_request,
                     )
-                return agent_request, reply, target_session
+                return repaired_request, reply, target_session
         except Exception as error:
             await socket.send_json({"type": "error", "message": str(error)})
         return None
@@ -1014,9 +1250,9 @@ def render_page() -> str:
     return """<!doctype html>
 <html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>Live Conversation</title><style>
-html,body{margin:0;min-height:100%;background:#060a10;color:#f4f8fc;font-family:system-ui,sans-serif}main{padding:18px 14px 28px;max-width:760px;margin:auto}h1{font-size:23px;margin:0 0 5px}.sub{color:#9aa9b8;margin:0 0 16px}.state{font-size:18px;color:#54e0b4;margin:12px 0}.meter{height:14px;background:#101820;border:1px solid #304050;border-radius:8px;overflow:hidden}.meter div{height:100%;width:0;background:#00ab7e;transition:width 60ms}.buttons{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:14px 0}button{min-height:48px;border:1px solid #00ab7e;border-radius:8px;background:#1e2630;color:#fff;font-size:15px}.card{background:#0a0e14;border-radius:8px;padding:12px;margin-top:10px;min-height:48px}.label{color:#8797a8;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.metrics{font-size:12px;color:#aebdca;margin-top:12px}.route{display:inline-block;border:1px solid #36556a;border-radius:10px;padding:2px 7px;font-size:11px;margin-left:6px}.history{margin-top:18px}.history-list{display:flex;flex-direction:column;gap:8px;margin-top:8px}.history-empty{color:#718294;font-size:13px}.message{max-width:88%;padding:9px 11px;border-radius:12px;line-height:1.35;white-space:pre-wrap;overflow-wrap:anywhere}.message.user{align-self:flex-end;background:#0e5948}.message.assistant{align-self:flex-start;background:#182431}.message-role{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:#9db0bf;margin-bottom:3px}
-</style></head><body><main><h1>Live Conversation</h1><p class="sub">Accurate local speech recognition. Simple requests answer here; complex work routes to the right OpenClaw session.</p><div id="state" class="state">Ready</div><div class="meter"><div id="bar"></div></div><div class="buttons"><button id="start">Start conversation</button><button id="stop">Stop</button></div><div class="card"><div class="label">You</div><div id="user">—</div></div><div class="card"><div class="label">Assistant <span id="route" class="route">waiting</span></div><div id="assistant">—</div></div><div id="metrics" class="metrics"></div><section class="history"><div class="label">Conversation history · last 80 messages</div><div id="history" class="history-list"><div class="history-empty">No conversation history yet.</div></div></section></main><script>
-const state=document.getElementById('state'),bar=document.getElementById('bar'),user=document.getElementById('user'),assistant=document.getElementById('assistant'),route=document.getElementById('route'),metrics=document.getElementById('metrics'),historyList=document.getElementById('history');let ws,timer,recording=false,awaitingResponse=false,responseActive=false,responseTailTimer=null,speechMs=0,silenceMs=0,candidateSpeechMs=0,pre=[],historyMessages=[],pendingTranscript='';
+html,body{margin:0;min-height:100%;background:#060a10;color:#f4f8fc;font-family:system-ui,sans-serif}main{padding:18px 14px 28px;max-width:760px;margin:auto}h1{font-size:23px;margin:0 0 5px}.sub{color:#9aa9b8;margin:0 0 7px}.setting{color:#7fcbb4;font-size:12px;margin-bottom:16px}.state{font-size:18px;color:#54e0b4;margin:12px 0}.meter{height:14px;background:#101820;border:1px solid #304050;border-radius:8px;overflow:hidden}.meter div{height:100%;width:0;background:#00ab7e;transition:width 60ms}.buttons{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:14px 0}button{min-height:48px;border:1px solid #00ab7e;border-radius:8px;background:#1e2630;color:#fff;font-size:15px}.card{background:#0a0e14;border-radius:8px;padding:12px;margin-top:10px;min-height:48px}.label{color:#8797a8;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.metrics{font-size:12px;color:#aebdca;margin-top:12px}.route{display:inline-block;border:1px solid #36556a;border-radius:10px;padding:2px 7px;font-size:11px;margin-left:6px}.history{margin-top:18px}.history-list{display:flex;flex-direction:column;gap:8px;margin-top:8px}.history-empty{color:#718294;font-size:13px}.message{max-width:88%;padding:9px 11px;border-radius:12px;line-height:1.35;white-space:pre-wrap;overflow-wrap:anywhere}.message.user{align-self:flex-end;background:#0e5948}.message.assistant{align-self:flex-start;background:#182431}.message-role{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:#9db0bf;margin-bottom:3px}
+</style></head><body><main><h1>Live Conversation</h1><p class="sub">Accurate local speech recognition. Simple requests answer here; complex work routes to the right OpenClaw session.</p><div id="confirmation" class="setting">Action confirmation: loading…</div><div id="state" class="state">Ready</div><div class="meter"><div id="bar"></div></div><div class="buttons"><button id="start">Start conversation</button><button id="stop">Stop</button></div><div class="card"><div class="label">You</div><div id="user">—</div></div><div class="card"><div class="label">Assistant <span id="route" class="route">waiting</span></div><div id="assistant">—</div></div><div id="metrics" class="metrics"></div><section class="history"><div class="label">Conversation history · last 80 messages</div><div id="history" class="history-list"><div class="history-empty">No conversation history yet.</div></div></section></main><script>
+const state=document.getElementById('state'),bar=document.getElementById('bar'),user=document.getElementById('user'),assistant=document.getElementById('assistant'),route=document.getElementById('route'),metrics=document.getElementById('metrics'),confirmation=document.getElementById('confirmation'),historyList=document.getElementById('history');let ws,timer,recording=false,awaitingResponse=false,responseActive=false,responseTailTimer=null,speechMs=0,silenceMs=0,candidateSpeechMs=0,pre=[],historyMessages=[],pendingTranscript='';
 function renderHistory(){historyList.replaceChildren();if(!historyMessages.length){const empty=document.createElement('div');empty.className='history-empty';empty.textContent='No conversation history yet.';historyList.appendChild(empty);return}for(const message of historyMessages.slice(-80)){const bubble=document.createElement('div');bubble.className='message '+message.role;const who=document.createElement('div');who.className='message-role';who.textContent=message.role==='user'?'You':'Assistant';const content=document.createElement('div');content.textContent=message.content;bubble.append(who,content);historyList.appendChild(bubble)}historyList.lastElementChild?.scrollIntoView({block:'nearest'})}
 function addHistory(role,content){if(!content)return;historyMessages.push({role,content});historyMessages=historyMessages.slice(-80);renderHistory()}
 function rms(b64){const s=atob(b64||'');let sum=0,n=0;for(let i=0;i+1<s.length;i+=2){let v=(s.charCodeAt(i)&255)|((s.charCodeAt(i+1)&255)<<8);if(v&32768)v-=65536;const f=v/32768;sum+=f*f;n++}return n?Math.sqrt(sum/n):0}
@@ -1024,7 +1260,7 @@ function send(x){if(ws&&ws.readyState===1)ws.send(JSON.stringify(x))}
 function report(event,detail){send({type:'client_event',event:event,detail:String(detail||'')})}
 function begin(){if(recording||awaitingResponse)return;recording=true;candidateSpeechMs=0;speechMs=0;silenceMs=0;if(responseActive){responseActive=false;if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}try{OpenClawNativeAudio.interruptAgentResponsePlayback()}catch(e){}report('barge_in','confirmed_user_speech')}send({type:'input_audio_buffer.speech_started'});send({type:'start'});for(const audioBase64 of pre)send({type:'audio',audioBase64});pre=[];state.textContent='Listening…'}
 function tick(){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>20)pre.shift();if(awaitingResponse){candidateSpeechMs=0;return}const speechThreshold=responseActive?.025:.006;const speechRequiredMs=responseActive?600:200;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+20:0;if(candidateSpeechMs>=speechRequiredMs)begin();return}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=20;silenceMs=0}else silenceMs+=20;if(speechMs>=200&&silenceMs>=600){recording=false;awaitingResponse=true;candidateSpeechMs=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}}
-function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-80):[];renderHistory()}if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.state==='listening'){awaitingResponse=false;recording=false;candidateSpeechMs=0}if((m.detail||'').startsWith('Ignored'))pendingTranscript=''}if(m.type==='partial_transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;if(pendingTranscript){addHistory('user',pendingTranscript);pendingTranscript=''}addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;candidateSpeechMs=0;pre=[];audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){candidateSpeechMs=0;pre=[];if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
+function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-80):[];renderHistory()}if(m.type==='settings')confirmation.textContent='Action confirmation: '+(m.action_confirmation==='confirm'?'On — asks before actions':'Off — explicit requests proceed');if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.state==='listening'){awaitingResponse=false;recording=false;candidateSpeechMs=0}if((m.detail||'').startsWith('Ignored'))pendingTranscript=''}if(m.type==='partial_transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;if(pendingTranscript){addHistory('user',pendingTranscript);pendingTranscript=''}addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;candidateSpeechMs=0;pre=[];audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){candidateSpeechMs=0;pre=[];if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
 function stop(){if(timer)clearInterval(timer);timer=null;if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=null;try{OpenClawNativeAudio.stopCapture()}catch(e){}if(ws)ws.close();ws=null;recording=false;awaitingResponse=false;responseActive=false;candidateSpeechMs=0;bar.style.width='0%';state.textContent='Stopped'}
 document.getElementById('start').onclick=start;document.getElementById('stop').onclick=()=>{stop();try{OpenClawNativeApp.liveConversationStopped()}catch(e){}};window.addEventListener('pagehide',stop);if(new URLSearchParams(location.search).get('autostart')==='1')start();
 </script></body></html>"""
@@ -1041,6 +1277,9 @@ async def health(request: web.Request) -> web.Response:
         "pipecat": "1.8.1",
         "stt": service.stt_description,
         "history_messages": len(service.history),
+        "action_confirmation": (
+            "confirm" if service.confirmation_required else "automatic"
+        ),
     })
 
 
@@ -1075,6 +1314,7 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
     socket = web.WebSocketResponse(heartbeat=20)
     await socket.prepare(request)
     await socket.send_json({"type": "history", "messages": service.recent_history()})
+    await socket.send_json(service.settings_payload())
     while service.pending_spoken_replies:
         reply = service.pending_spoken_replies.popleft()
         await service.send_spoken_response(
@@ -1196,7 +1436,9 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
 
 
 async def build_app(args: argparse.Namespace) -> web.Application:
-    service = LiveConversationService(args.session_key, args.tts_speed, args.history_path)
+    service = LiveConversationService(
+        args.session_key, args.tts_speed, args.history_path, args.settings_path
+    )
     await service.start()
     app = web.Application()
     app["service"] = service
@@ -1218,6 +1460,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--session-key", default=DEFAULT_SESSION_KEY)
     parser.add_argument("--history-path", default=DEFAULT_HISTORY_PATH)
+    parser.add_argument("--settings-path", default=DEFAULT_SETTINGS_PATH)
     parser.add_argument("--tts-speed", type=float, default=1.15)
     args = parser.parse_args()
     web.run_app(build_app(args), host=args.host, port=args.port, print=None)

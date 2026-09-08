@@ -21,11 +21,15 @@ from server import (
     LiveConversationService,
     MAX_HISTORY_MESSAGES,
     PROMPT_HISTORY_CHARS,
+    confirmation_answer,
+    confirmation_policy_command,
     direct_voice_surface_reply,
     extract_agent_text,
     has_stale_identity_confusion,
+    has_explicit_action_request,
     is_explicit_new_agent_request,
     is_gateway_status_question,
+    is_operational_acknowledgment,
     is_wake_word,
     parse_speech_model_output,
     repair_known_transcription_errors,
@@ -41,10 +45,11 @@ class RoutingTests(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 9, 2, 12, 34, tzinfo=ZoneInfo("America/Detroit"))
 
-    def test_speech_model_prompt_defines_hidden_escalation_contract(self):
+    def test_speech_model_prompt_defines_structured_routing_contract(self):
         prompt = speech_model_prompt(self.now)
-        self.assertIn(AGENT_SENTINEL, prompt)
-        self.assertIn(SAY_SENTINEL, prompt)
+        self.assertIn('"route":"agent"', prompt)
+        self.assertIn('"route":"direct"', prompt)
+        self.assertIn('"session_key"', prompt)
         self.assertIn("12:34 PM", prompt)
         self.assertNotIn("I'll check and let you know", prompt)
         self.assertIn("Jarvis and the Live Conversation model are the same speaker", prompt)
@@ -62,6 +67,35 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("model operating Live Conversation", direct_voice_surface_reply("Who are you?"))
         self.assertIsNone(direct_voice_surface_reply("Can you check the RAG app?"))
 
+    def test_testing_statements_do_not_invent_agent_work(self):
+        self.assertEqual(
+            direct_voice_surface_reply("Testing out the latest live conversation updates."),
+            "I hear you. Go ahead with the test.",
+        )
+        self.assertEqual(
+            direct_voice_surface_reply("I'm just trying out the new audio behavior."),
+            "I hear you. Go ahead with the test.",
+        )
+        self.assertIsNone(
+            direct_voice_surface_reply("I'm testing the update; have an agent monitor the logs.")
+        )
+
+    def test_action_confirmation_voice_commands(self):
+        self.assertEqual(
+            confirmation_policy_command("Always ask me before taking actions."), "confirm"
+        )
+        self.assertEqual(
+            confirmation_policy_command("Don't ask for confirmation before actions."),
+            "automatic",
+        )
+        self.assertEqual(
+            confirmation_policy_command("What is the confirmation setting?"), "status"
+        )
+        self.assertIsNone(confirmation_policy_command("Please confirm the meeting time."))
+        self.assertTrue(confirmation_answer("Go ahead."))
+        self.assertFalse(confirmation_answer("No, cancel that."))
+        self.assertIsNone(confirmation_answer("Yes, but change the request first."))
+
     def test_known_false_identity_claim_is_detected(self):
         self.assertTrue(has_stale_identity_confusion(
             "I am Jarvis, not the live conversation model itself."
@@ -72,6 +106,23 @@ class RoutingTests(unittest.TestCase):
         self.assertFalse(has_stale_identity_confusion(
             "I'm Jarvis, the model operating Live Conversation."
         ))
+
+    def test_operational_acknowledgments_are_not_reused_as_routing_examples(self):
+        self.assertTrue(is_operational_acknowledgment(
+            "I'll have the agent monitor the latest updates during your testing."
+        ))
+        self.assertFalse(is_operational_acknowledgment(
+            "I hear you. Go ahead with the test."
+        ))
+        service = LiveConversationService("agent:main:live-conversation", 1.15)
+        service.remember("user", "Testing out the latest updates.")
+        service.remember("assistant", "I'll have the agent monitor the updates.")
+        service.remember("user", "The transcript is visible now.")
+        service.remember("assistant", "I can see that too.")
+        self.assertEqual(service.prompt_history(), [
+            {"role": "user", "content": "The transcript is visible now."},
+            {"role": "assistant", "content": "I can see that too."},
+        ])
 
     def test_gateway_status_questions_have_deterministic_summaries(self):
         sessions = (
@@ -102,13 +153,41 @@ class RoutingTests(unittest.TestCase):
         self.assertFalse(is_explicit_new_agent_request("Start another agent that..."))
         self.assertFalse(is_explicit_new_agent_request("What agents are running?"))
 
+    def test_tool_routes_require_explicit_action_language(self):
+        self.assertFalse(has_explicit_action_request(
+            "The response time still seems about the same."
+        ))
+        self.assertFalse(has_explicit_action_request(
+            "Testing out the latest live conversation updates."
+        ))
+        self.assertTrue(has_explicit_action_request("Please fix the response latency."))
+        self.assertTrue(has_explicit_action_request("Can you monitor the logs?"))
+        self.assertTrue(has_explicit_action_request("The routing needs to be fixed."))
+
     def test_prompt_ignores_background_speech_and_exposes_capabilities(self):
         prompt = speech_model_prompt(self.now, capabilities="agent research: Research\nskill weather: Forecasts")
-        self.assertIn(IGNORE_SENTINEL, prompt)
+        self.assertIn("`ignore`", prompt)
         self.assertIn("clearly not addressed to you", prompt)
-        self.assertIn("grammar is imperfect", prompt)
+        self.assertIn("Imperfect grammar", prompt)
         self.assertIn("agent research: Research", prompt)
         self.assertIn("answer capability questions quickly", prompt)
+        self.assertIn("Statements describing what he is currently doing", prompt)
+        self.assertIn("Testing out the latest Live Conversation updates", prompt)
+
+    def test_confirmation_setting_persists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            service = LiveConversationService(
+                "agent:main:live-conversation", 1.15, settings_path=str(settings_path)
+            )
+            service.set_confirmation_required(True)
+            restarted = LiveConversationService(
+                "agent:main:live-conversation", 1.15, settings_path=str(settings_path)
+            )
+            self.assertTrue(restarted.confirmation_required)
+            self.assertEqual(
+                json.loads(settings_path.read_text())["action_confirmation"], "confirm"
+            )
 
     def test_page_displays_and_updates_the_rolling_history(self):
         page = render_page()
@@ -119,6 +198,8 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("addHistory('assistant',m.text)", page)
         self.assertIn("get('autostart')==='1'", page)
         self.assertIn("liveConversationStopped", page)
+        self.assertIn("Action confirmation: loading", page)
+        self.assertIn("m.type==='settings'", page)
 
     def test_ignore_token_produces_no_spoken_text(self):
         self.assertEqual(parse_speech_model_output(IGNORE_SENTINEL), ("ignore", "", None))
@@ -174,7 +255,7 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("still awaiting a final response", prompt)
         self.assertIn("Multiple agents may work concurrently", prompt)
         self.assertIn("hasActiveRun=yes", prompt)
-        self.assertIn(NEW_AGENT_SENTINEL, prompt)
+        self.assertIn("`new_agent`", prompt)
 
     def test_server_has_no_synthetic_periodic_agent_updates(self):
         import inspect
@@ -192,6 +273,16 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(
             parse_speech_model_output(f"{NEW_AGENT_SENTINEL} I’ll start another."),
             ("new_agent", "I’ll start another.", None),
+        )
+
+    def test_speech_model_output_parses_structured_route(self):
+        self.assertEqual(
+            parse_speech_model_output(json.dumps({
+                "route": "agent",
+                "reply": "I'll handle that.",
+                "session_key": "",
+            })),
+            ("agent", "I'll handle that.", None),
         )
         self.assertEqual(
             parse_speech_model_output(
@@ -452,6 +543,45 @@ class RoutingTests(unittest.TestCase):
             ("agent", "I’ll add that.", None),
         )
 
+    def test_speech_reply_enforces_action_authorization_postconditions(self):
+        async def decide(transcript, model_payload):
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.sessions_updated_at = time.monotonic()
+            service.capabilities_updated_at = time.monotonic()
+            response = AsyncMock()
+            response.raise_for_status = lambda: None
+            response.json = AsyncMock(return_value={
+                "message": {"content": json.dumps(model_payload)}
+            })
+            context = MagicMock()
+            context.__aenter__.return_value = response
+            session = MagicMock()
+            session.post.return_value = context
+            session_context = MagicMock()
+            session_context.__aenter__.return_value = session
+            with patch("server.aiohttp.ClientSession", return_value=session_context):
+                return await service.speech_reply(transcript)
+
+        import asyncio
+        invented = {
+            "route": "agent",
+            "reply": "I'll have the agent monitor that.",
+            "session_key": "",
+        }
+        missing_route = {
+            "route": "direct",
+            "reply": "I'll have the agent fix that.",
+            "session_key": "",
+        }
+        self.assertEqual(
+            asyncio.run(decide("The response feels the same.", invented)),
+            ("direct", "I understand.", None),
+        )
+        self.assertEqual(
+            asyncio.run(decide("Please fix the response latency.", missing_route)),
+            ("agent", "I'll have the agent fix that.", None),
+        )
+
     def test_start_uses_the_more_accurate_cached_whisper_model(self):
         import inspect
         source = inspect.getsource(LiveConversationService.start)
@@ -513,6 +643,63 @@ class RoutingTests(unittest.TestCase):
                     "agent:main:live-conversation",
                 ),
             )
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_confirmation_mode_blocks_action_until_explicit_yes(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.confirmation_required = True
+            service.transcribe = AsyncMock(side_effect=["Fix the routing bug.", "Go ahead."])
+            service.speech_reply = AsyncMock(
+                return_value=("agent", "I'll have the agent fix the routing bug.", None)
+            )
+            service.tts.synthesize = AsyncMock(return_value=b"")
+            socket = AsyncMock()
+
+            self.assertIsNone(await service.process_turn(socket, b"first"))
+            self.assertIsNotNone(service.pending_confirmation)
+            replies = [
+                call.args[0] for call in socket.send_json.await_args_list
+                if call.args[0].get("type") == "reply"
+            ]
+            self.assertEqual(replies[-1]["route"], "confirmation")
+            self.assertIn("should I proceed", replies[-1]["text"])
+
+            handoff = await service.process_turn(socket, b"second")
+            self.assertEqual(
+                handoff,
+                ("Fix the routing bug.", "Okay, proceeding.", service.session_key),
+            )
+            self.assertIsNone(service.pending_confirmation)
+            self.assertEqual(service.speech_reply.await_count, 1)
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_voice_command_changes_confirmation_mode_without_an_agent(self):
+        async def run_test():
+            with tempfile.TemporaryDirectory() as directory:
+                service = LiveConversationService(
+                    "agent:main:live-conversation",
+                    1.15,
+                    settings_path=str(Path(directory) / "settings.json"),
+                )
+                service.transcribe = AsyncMock(
+                    return_value="Always ask me before taking actions."
+                )
+                service.speech_reply = AsyncMock()
+                service.tts.synthesize = AsyncMock(return_value=b"")
+                socket = AsyncMock()
+
+                self.assertIsNone(await service.process_turn(socket, b"audio"))
+                self.assertTrue(service.confirmation_required)
+                service.speech_reply.assert_not_awaited()
+                messages = [call.args[0] for call in socket.send_json.await_args_list]
+                self.assertIn(
+                    {"type": "settings", "action_confirmation": "confirm"}, messages
+                )
 
         import asyncio
         asyncio.run(run_test())

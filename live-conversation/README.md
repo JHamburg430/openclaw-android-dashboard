@@ -60,6 +60,19 @@ contracts for new-agent and existing-session handoffs, and resolves likely ASR
 errors from context while asking for clarification when a proper noun remains
 uncertain.
 
+Declarative remarks such as “testing out the latest Live Conversation updates”
+are handled as conversation and never treated as permission to invent monitoring
+or other agent work. Common testing statements bypass the local routing model,
+which also removes routing-model latency from those turns.
+
+Action confirmation is a persistent voice-controlled setting stored in
+`~/.openclaw/state/live-conversation-settings.json`. Say “Always ask me before
+taking actions” to enable it, “Don't ask for confirmation before actions” to
+disable it, or ask “What is the confirmation setting?” When enabled, agent,
+new-agent, and existing-session actions are held until a short affirmative reply
+such as “go ahead”; a negative reply cancels the pending action. The current mode
+is shown near the top of the Live Conversation page.
+
 The bridge forwards escalated transcripts without adding response-length or
 reasoning instructions. Voice response policy belongs to the gateway agent's
 workspace instructions so complex requests can finish normal tool-backed work
