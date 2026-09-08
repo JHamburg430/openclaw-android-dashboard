@@ -30,6 +30,7 @@ from server import (
     has_explicit_action_request,
     is_explicit_new_agent_request,
     is_gateway_status_question,
+    is_referential_agent_question,
     is_operational_acknowledgment,
     is_silent_stop_command,
     is_wake_word,
@@ -42,6 +43,7 @@ from server import (
     split_spoken_text,
     speech_model_prompt,
     summarize_gateway_status,
+    summarize_tracked_agent,
 )
 
 
@@ -148,6 +150,7 @@ class RoutingTests(unittest.TestCase):
         service.remember("user", "The transcript is visible now.")
         service.remember("assistant", "I can see that too.")
         self.assertEqual(service.prompt_history(), [
+            {"role": "user", "content": "Testing out the latest updates."},
             {"role": "user", "content": "The transcript is visible now."},
             {"role": "assistant", "content": "I can see that too."},
         ])
@@ -162,9 +165,22 @@ class RoutingTests(unittest.TestCase):
             "Can you tell me the status of the running sessions?"
         ))
         self.assertFalse(is_gateway_status_question("Start another agent."))
+        self.assertTrue(is_referential_agent_question("How is this agent running?"))
+        self.assertTrue(is_referential_agent_question("Tell that agent to check audio too."))
         self.assertEqual(
             summarize_gateway_status(sessions),
             "2 gateway sessions are currently running: Audio repair; RAG review.",
+        )
+
+    def test_tracked_agent_summary_preserves_the_requested_task(self):
+        tracked = {
+            "session_key": "agent:main:live-conversation-cutoff-123",
+            "request": "fix the issue where your messages are being cut off",
+            "state": "running",
+        }
+        self.assertEqual(
+            summarize_tracked_agent(tracked, {"hasActiveRun": True}),
+            "The agent assigned to this task is still running: fix the issue where your messages are being cut off.",
         )
         self.assertEqual(
             summarize_gateway_status("No active sessions.", agent_pending=True),
@@ -216,6 +232,42 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(
                 json.loads(settings_path.read_text())["action_confirmation"], "confirm"
             )
+
+    def test_voice_launched_session_tracking_persists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            first = LiveConversationService(
+                "agent:main:live-conversation", 1.15, settings_path=str(settings_path)
+            )
+            key = first.allocate_agent_session_key(
+                "spawn a subagent to fix messages being cut off"
+            )
+            first.register_agent_session(
+                key, "spawn a subagent to fix messages being cut off"
+            )
+            second = LiveConversationService(
+                "agent:main:live-conversation", 1.15, settings_path=str(settings_path)
+            )
+            self.assertEqual(second.latest_agent_session()["session_key"], key)
+            self.assertIn("fix messages being cut off", second.voice_session_summary())
+
+    def test_legacy_voice_session_is_recovered_from_history_and_gateway(self):
+        service = LiveConversationService("agent:main:live-conversation", 1.15)
+        service.remember("user", "Spawn a subagent to fix message cutoff.")
+        service.remember("assistant", "I'll start a separate agent for that.")
+        key = "agent:main:live-conversation-legacy-123"
+        service.session_records = {
+            key: {"key": key, "hasActiveRun": False, "status": "done", "updatedAt": 20}
+        }
+
+        service.recover_recent_agent_session()
+
+        self.assertEqual(service.latest_agent_session(), {
+            "session_key": key,
+            "request": "Spawn a subagent to fix message cutoff.",
+            "state": "complete",
+            "started_at": service.latest_agent_session()["started_at"],
+        })
 
     def test_page_displays_and_updates_the_rolling_history(self):
         page = render_page()
@@ -284,6 +336,19 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("Multiple agents may work concurrently", prompt)
         self.assertIn("hasActiveRun=yes", prompt)
         self.assertIn("`new_agent`", prompt)
+
+    def test_prompt_exposes_voice_session_referents(self):
+        prompt = speech_model_prompt(
+            self.now,
+            sessions="key=agent:main:live-conversation-cutoff-123 | hasActiveRun=yes",
+            voice_sessions=(
+                "key=agent:main:live-conversation-cutoff-123 | state=running | "
+                "request=fix message cutoff"
+            ),
+        )
+        self.assertIn("Sessions launched from this Live Conversation", prompt)
+        self.assertIn("request=fix message cutoff", prompt)
+        self.assertIn("Resolve “this agent,”", prompt)
 
     def test_server_has_no_synthetic_periodic_agent_updates(self):
         import inspect
@@ -460,14 +525,16 @@ class RoutingTests(unittest.TestCase):
     def test_speech_reply_bypasses_model_for_gateway_status(self):
         async def run_test():
             service = LiveConversationService("agent:main:live-conversation", 1.15)
-            service.sessions = "key=one | title=Audio repair | hasActiveRun=yes"
-            service.sessions_updated_at = time.monotonic()
+            service.openclaw_json = AsyncMock(return_value={"sessions": [{
+                "key": "one", "displayName": "Audio repair", "hasActiveRun": True,
+            }]})
             with patch("server.aiohttp.ClientSession") as client_session:
                 self.assertEqual(
                     await service.speech_reply("What sessions are running?"),
                     ("direct", "1 gateway session is currently running: Audio repair.", None),
                 )
                 client_session.assert_not_called()
+            service.openclaw_json.assert_awaited_once()
 
         import asyncio
         asyncio.run(run_test())
@@ -570,6 +637,50 @@ class RoutingTests(unittest.TestCase):
             self.assertIn("hasActiveRun=yes", catalog)
             self.assertIn("Inspecting the playback queue", catalog)
             self.assertIn("agent:main:dashboard:abc", service.session_keys)
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_referential_status_force_refreshes_and_answers_for_exact_agent(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            key = "agent:main:live-conversation-fix-cutoff-123"
+            service.register_agent_session(key, "fix the issue where messages are being cut off")
+            service.sessions = "stale catalog"
+            service.sessions_updated_at = time.monotonic()
+            service.openclaw_json = AsyncMock(return_value={"sessions": [{
+                "key": key,
+                "displayName": "Fix message cutoff",
+                "hasActiveRun": True,
+                "status": "running",
+                "updatedAt": 1788828000000,
+            }]})
+
+            result = await service.speech_reply("Can you tell me how this agent is running?")
+
+            self.assertEqual(result, (
+                "direct",
+                "The agent assigned to this task is still running: fix the issue where messages are being cut off.",
+                None,
+            ))
+            service.openclaw_json.assert_awaited_once()
+            self.assertIn(key, service.session_records)
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_referential_followup_targets_exact_latest_voice_session(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            key = "agent:main:live-conversation-fix-cutoff-123"
+            service.register_agent_session(key, "fix message cutoff")
+            service.sessions_updated_at = time.monotonic()
+            service.capabilities_updated_at = time.monotonic()
+
+            self.assertEqual(
+                await service.speech_reply("Tell that agent to also check long replies."),
+                ("session", "I'll add that to the same agent.", key),
+            )
 
         import asyncio
         asyncio.run(run_test())
@@ -745,6 +856,28 @@ class RoutingTests(unittest.TestCase):
             )
             self.assertIsNone(service.pending_confirmation)
             self.assertEqual(service.speech_reply.await_count, 1)
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_confirmation_preserves_new_agent_session_identity(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.confirmation_required = True
+            service.transcribe = AsyncMock(side_effect=[
+                "Spawn a subagent to fix message cutoff.", "Go ahead."
+            ])
+            service.speech_reply = AsyncMock(
+                return_value=("new_agent", "I'll start a separate agent for that.", None)
+            )
+            service.tts.synthesize = AsyncMock(return_value=b"")
+            socket = AsyncMock()
+
+            self.assertIsNone(await service.process_turn(socket, b"first"))
+            pending_key = service.pending_confirmation[1]
+            self.assertTrue(pending_key.startswith("agent:main:live-conversation-fix-message-cutoff-"))
+            handoff = await service.process_turn(socket, b"second")
+            self.assertEqual(handoff[2], pending_key)
 
         import asyncio
         asyncio.run(run_test())

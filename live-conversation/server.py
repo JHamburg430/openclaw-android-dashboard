@@ -225,6 +225,36 @@ def is_gateway_status_question(transcript: str) -> bool:
     return bool(subject and status and not re.search(r"\b(?:start|launch|create)\b", normalized))
 
 
+def is_referential_agent_question(transcript: str) -> bool:
+    """Recognize questions or follow-ups aimed at the most recently launched agent."""
+    normalized = re.sub(r"[^a-z0-9']+", " ", transcript.lower()).strip()
+    return bool(re.search(
+        r"\b(?:this|that|the|it)\s+(?:sub\s*)?agent\b|\b(?:it|that one)\b",
+        normalized,
+    ))
+
+
+def summarize_tracked_agent(
+    tracked: dict[str, Any], gateway: dict[str, Any] | None = None
+) -> str:
+    """Answer an anaphoric status question about one exact voice-launched session."""
+    request = re.sub(r"\s+", " ", str(tracked.get("request") or "the requested task")).strip()
+    request = request[:180].rstrip(" .?!")
+    state = str(tracked.get("state") or "running")
+    if gateway:
+        if gateway.get("hasActiveRun"):
+            state = "running"
+        elif gateway.get("status") in {"failed", "error"}:
+            state = "failed"
+        elif gateway.get("status") in {"done", "completed"}:
+            state = "complete"
+    if state == "running":
+        return f"The agent assigned to this task is still running: {request}."
+    if state == "failed":
+        return f"The agent assigned to this task stopped with an error: {request}."
+    return f"The agent assigned to this task has completed: {request}."
+
+
 def has_explicit_action_request(transcript: str) -> bool:
     """Require affirmative request language before any tool-backed route."""
     normalized = re.sub(r"[^a-z0-9']+", " ", transcript.lower()).strip()
@@ -293,6 +323,7 @@ def speech_model_prompt(
     agent_pending: bool = False,
     capabilities: str = "",
     sessions: str = "",
+    voice_sessions: str = "",
     confirmation_required: bool = False,
 ) -> str:
     clock = now or datetime.now(ZoneInfo("America/Detroit"))
@@ -323,6 +354,9 @@ Available OpenClaw capabilities (cached and refreshed automatically):
 {capabilities or 'Capability catalog is temporarily unavailable; delegate capability questions to the agent.'}
 Live and recent gateway sessions (refreshed automatically; hasActiveRun is authoritative):
 {sessions or 'No active or recent gateway sessions were returned.'}
+Sessions launched from this Live Conversation, newest first:
+{voice_sessions or 'No session has been launched from this Live Conversation yet.'}
+Resolve “this agent,” “that agent,” “it,” and similar follow-ups to the newest relevant Live Conversation session above. Preserve the subject and intent established by recent user turns. Do not replace a specific referent with a generic list of all sessions.
 Use this catalog to answer capability questions quickly. If the user explicitly asks to use, configure, expand, or change a capability, choose `agent`. Do not claim an unavailable capability exists. Newly added agents and skills appear after the catalog refreshes.
 Interpret likely recognition mistakes using the conversation and session context. In this voice app, “five agent” or “five conversation model” means “live agent” or “live conversation model” unless John explicitly discusses the number five or five distinct agents; correct that known ASR error without asking and use the corrected word “live” in the acknowledgment. Do not silently replace any other uncertain proper noun; ask a short clarification instead.
 When John asks to make the live agent or Live Conversation model more capable, that is a complete actionable request: choose `agent` so the agent can review the conversation and current implementation. Do not ask which capabilities he means unless he explicitly presents alternatives requiring a choice.
@@ -738,6 +772,7 @@ class LiveConversationService:
         self.capability_refresh_task: asyncio.Task[str] | None = None
         self.sessions = ""
         self.session_keys: set[str] = set()
+        self.session_records: dict[str, dict[str, Any]] = {}
         self.sessions_updated_at = 0.0
         self.session_refresh_task: asyncio.Task[str] | None = None
         self.session_poll_task: asyncio.Task[None] | None = None
@@ -745,6 +780,7 @@ class LiveConversationService:
         self.pending_spoken_replies: deque[str] = deque(maxlen=10)
         self.confirmation_required = False
         self.pending_confirmation: tuple[str, str | None, str] | None = None
+        self.recent_agent_sessions: deque[dict[str, Any]] = deque(maxlen=12)
         self.history_path = Path(history_path) if history_path else None
         self.settings_path = Path(settings_path) if settings_path else None
         self.history: deque[dict[str, str]] = deque(maxlen=MAX_HISTORY_MESSAGES)
@@ -757,6 +793,15 @@ class LiveConversationService:
         try:
             payload = json.loads(self.settings_path.read_text(encoding="utf-8"))
             self.confirmation_required = payload.get("action_confirmation") == "confirm"
+            tracked = payload.get("recent_agent_sessions", [])
+            if isinstance(tracked, list):
+                for item in tracked[-12:]:
+                    if (
+                        isinstance(item, dict)
+                        and isinstance(item.get("session_key"), str)
+                        and isinstance(item.get("request"), str)
+                    ):
+                        self.recent_agent_sessions.append(dict(item))
         except (OSError, ValueError, TypeError) as error:
             LOGGER.warning("conversation_settings_load_failed error=%s", error)
 
@@ -770,7 +815,8 @@ class LiveConversationService:
                 json.dumps({
                     "action_confirmation": (
                         "confirm" if self.confirmation_required else "automatic"
-                    )
+                    ),
+                    "recent_agent_sessions": list(self.recent_agent_sessions),
                 }, indent=2),
                 encoding="utf-8",
             )
@@ -836,12 +882,92 @@ class LiveConversationService:
         if reply.strip():
             self.pending_spoken_replies.append(reply.strip())
 
+    def allocate_agent_session_key(self, request: str) -> str:
+        words = re.findall(r"[a-z0-9]+", request.lower())
+        stop_words = {
+            "a", "an", "the", "to", "for", "of", "and", "agent", "subagent",
+            "spawn", "start", "launch", "create",
+        }
+        slug = "-".join(word for word in words if word not in stop_words)[:48].strip("-")
+        return f"agent:main:live-conversation-{slug or 'task'}-{time.monotonic_ns()}"
+
+    def register_agent_session(self, session_key: str, request: str) -> None:
+        self.recent_agent_sessions = deque(
+            (item for item in self.recent_agent_sessions if item.get("session_key") != session_key),
+            maxlen=12,
+        )
+        self.recent_agent_sessions.append({
+            "session_key": session_key,
+            "request": re.sub(r"\s+", " ", request).strip(),
+            "state": "running",
+            "started_at": int(time.time()),
+        })
+        self.sessions_updated_at = 0.0
+        self._save_settings()
+
+    def update_agent_session(self, session_key: str, state: str) -> None:
+        for item in self.recent_agent_sessions:
+            if item.get("session_key") == session_key:
+                item["state"] = state
+                break
+        self.sessions_updated_at = 0.0
+        self._save_settings()
+
+    def latest_agent_session(self) -> dict[str, Any] | None:
+        return dict(self.recent_agent_sessions[-1]) if self.recent_agent_sessions else None
+
+    def voice_session_summary(self) -> str:
+        lines = []
+        for item in reversed(self.recent_agent_sessions):
+            key = str(item.get("session_key") or "")
+            gateway = self.session_records.get(key, {})
+            active = gateway.get("hasActiveRun", item.get("state") == "running")
+            state = "running" if active else str(item.get("state") or gateway.get("status") or "unknown")
+            lines.append(
+                f"key={key} | state={state} | request={str(item.get('request') or '')[:220]}"
+            )
+        return "\n".join(lines)
+
+    def recover_recent_agent_session(self) -> None:
+        """Migrate the newest pre-tracking voice session from history and the gateway."""
+        if self.recent_agent_sessions:
+            return
+        candidates = [
+            item for key, item in self.session_records.items()
+            if key.startswith("agent:main:live-conversation-")
+        ]
+        if not candidates:
+            return
+        request = ""
+        for index in range(len(self.history) - 1, 0, -1):
+            message = self.history[index]
+            previous = self.history[index - 1]
+            if (
+                message["role"] == "assistant"
+                and is_operational_acknowledgment(message["content"])
+                and previous["role"] == "user"
+            ):
+                request = previous["content"]
+                break
+        if not request:
+            return
+        newest = max(candidates, key=lambda item: item.get("updatedAt") or 0)
+        key = str(newest["key"])
+        state = "running" if newest.get("hasActiveRun") else (
+            "failed" if newest.get("status") in {"failed", "error"} else "complete"
+        )
+        self.recent_agent_sessions.append({
+            "session_key": key,
+            "request": request,
+            "state": state,
+            "started_at": int(time.time()),
+        })
+        self._save_settings()
+
     def prompt_history(self) -> list[dict[str, str]]:
         filtered: list[dict[str, str]] = []
         for message in self.history:
             if message["role"] == "assistant" and is_operational_acknowledgment(message["content"]):
-                if filtered and filtered[-1]["role"] == "user":
-                    filtered.pop()
                 continue
             filtered.append(message)
         selected: deque[dict[str, str]] = deque()
@@ -899,6 +1025,7 @@ class LiveConversationService:
             self.stt_description = "faster-whisper small.en cpu-int8 fallback"
         await self.tts.start()
         await asyncio.gather(self.refresh_capabilities(), self.refresh_sessions())
+        self.recover_recent_agent_session()
         await self.warm_speech_model()
         self.session_poll_task = asyncio.create_task(self.poll_sessions())
 
@@ -1012,8 +1139,8 @@ class LiveConversationService:
             LOGGER.warning("capability_refresh_failed error=%s", error)
         return self.capabilities
 
-    async def refresh_sessions(self) -> str:
-        if self.sessions and time.monotonic() - self.sessions_updated_at < SESSION_CACHE_SECONDS:
+    async def refresh_sessions(self, force: bool = False) -> str:
+        if not force and self.sessions and time.monotonic() - self.sessions_updated_at < SESSION_CACHE_SECONDS:
             return self.sessions
         try:
             payload = await self.openclaw_json(
@@ -1028,11 +1155,13 @@ class LiveConversationService:
             items = payload.get("sessions", []) if isinstance(payload, dict) else []
             lines: list[str] = []
             keys: set[str] = set()
+            records: dict[str, dict[str, Any]] = {}
             for item in items:
                 key = item.get("key")
                 if not isinstance(key, str) or not key:
                     continue
                 keys.add(key)
+                records[key] = dict(item)
                 title = (
                     item.get("displayName") or item.get("derivedTitle")
                     or item.get("label") or "Untitled"
@@ -1053,8 +1182,22 @@ class LiveConversationService:
                     + (f" | latest={preview}" if preview else "")
                 )
             self.session_keys = keys
+            self.session_records = records
             self.sessions = "\n".join(lines) or "No active or recent gateway sessions were returned."
             self.sessions_updated_at = time.monotonic()
+            tracking_changed = False
+            for tracked in self.recent_agent_sessions:
+                gateway = records.get(str(tracked.get("session_key") or ""))
+                if not gateway:
+                    continue
+                state = "running" if gateway.get("hasActiveRun") else (
+                    "failed" if gateway.get("status") in {"failed", "error"} else "complete"
+                )
+                if tracked.get("state") != state:
+                    tracked["state"] = state
+                    tracking_changed = True
+            if tracking_changed:
+                self._save_settings()
         except Exception as error:
             LOGGER.warning("session_refresh_failed error=%s", error)
         return self.sessions
@@ -1120,7 +1263,9 @@ class LiveConversationService:
         if time.monotonic() - self.capabilities_updated_at >= CAPABILITY_CACHE_SECONDS:
             if not self.capability_refresh_task or self.capability_refresh_task.done():
                 self.capability_refresh_task = asyncio.create_task(self.refresh_capabilities())
-        if time.monotonic() - self.sessions_updated_at >= SESSION_CACHE_SECONDS:
+        if status_question:
+            await self.refresh_sessions(force=True)
+        elif time.monotonic() - self.sessions_updated_at >= SESSION_CACHE_SECONDS:
             if not self.session_refresh_task or self.session_refresh_task.done():
                 self.session_refresh_task = asyncio.create_task(self.refresh_sessions())
             if not self.sessions:
@@ -1129,7 +1274,18 @@ class LiveConversationService:
                 except asyncio.TimeoutError:
                     pass
         if status_question:
+            if is_referential_agent_question(text):
+                tracked = self.latest_agent_session()
+                if tracked:
+                    key = str(tracked.get("session_key") or "")
+                    return "direct", summarize_tracked_agent(
+                        tracked, self.session_records.get(key)
+                    ), None
             return "direct", summarize_gateway_status(self.sessions, agent_pending), None
+        if is_referential_agent_question(text) and has_explicit_action_request(text):
+            tracked = self.latest_agent_session()
+            if tracked:
+                return "session", "I'll add that to the same agent.", str(tracked["session_key"])
         capabilities = self.capabilities
         payload = {
             "model": SPEECH_MODEL,
@@ -1142,6 +1298,7 @@ class LiveConversationService:
                     agent_pending=agent_pending,
                     capabilities=capabilities,
                     sessions=self.sessions,
+                    voice_sessions=self.voice_session_summary(),
                     confirmation_required=self.confirmation_required,
                 )},
                 *self.prompt_history(),
@@ -1323,6 +1480,8 @@ class LiveConversationService:
                 )
                 agent_request = self.contextualize_agent_request(transcript)
                 if route in ("agent", "new_agent", "session"):
+                    if route == "new_agent" and target_session is None:
+                        target_session = self.allocate_agent_session_key(agent_request)
                     if self.confirmation_required:
                         self.pending_confirmation = (agent_request, target_session, route)
                         summary = re.sub(r"\s+", " ", transcript).strip()[:180].rstrip(" .?!")
@@ -1459,8 +1618,10 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
 
     async def run_agent(transcript: str, target_session: str | None) -> None:
         if target_session is None:
-            target_session = f"agent:main:live-conversation-{time.monotonic_ns()}"
+            target_session = service.allocate_agent_session_key(transcript)
+        service.register_agent_session(target_session, transcript)
         work = asyncio.create_task(service.agent_reply(transcript, target_session))
+        refresh = asyncio.create_task(service.refresh_sessions(force=True))
         started = time.monotonic()
         reply = ""
         try:
@@ -1472,6 +1633,9 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
                 except (ConnectionError, RuntimeError):
                     pass
             reply = await work
+            await refresh
+            service.update_agent_session(target_session, "complete")
+            await service.refresh_sessions(force=True)
             service.remember("assistant", reply)
             if socket.closed:
                 service.queue_pending_reply(reply)
@@ -1486,8 +1650,10 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
             await socket.send_json({"type": "state", "state": "listening"})
         except asyncio.CancelledError:
             work.cancel()
+            refresh.cancel()
             raise
         except Exception as error:
+            service.update_agent_session(target_session, "failed")
             if reply:
                 service.queue_pending_reply(reply)
                 return
