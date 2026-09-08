@@ -15,7 +15,9 @@ in the Android Dashboard plus menu.
    once per second and displays partial text. Final decoding consumes
    Faster-Whisper's lazy segment generator entirely on a worker thread, so
    inference cannot wedge the WebSocket event loop. No transcription timeout or
-   fixed turn-length cap truncates a user's input.
+   fixed turn-length cap truncates a user's input. Silero VAD filters non-speech
+   audio before decoding, with a stricter threshold for normal turns than for
+   the wake word, reducing false transcripts from road and ambient noise.
 4. The local `qwen3.5:4b` speech supervisor returns either a short speakable
    response or the hidden `[[OPENCLAW_AGENT]]` control token. This model is the
    local latency/quality balance: materially stronger than the former 0.8B
@@ -38,13 +40,21 @@ in the Android Dashboard plus menu.
    continues in `agent:main:live-conversation`; explicit requests for another
    agent get an independent session; and follow-ups can be sent to an exact
    active or recent gateway session. Concurrent agents are supported, and each
-   final CLI result is returned to the bridge and spoken when it completes. If
-   the WebView disconnects while an agent works, the task continues and its
-   final reply is queued for speech on the next Live Conversation connection.
+   final CLI result is returned to the bridge and spoken when it completes.
+   Tool-only `sessions_yield` handoffs are recognized as delegated work rather
+   than failed responses; Live Conversation watches that exact session for its
+   eventual visible result. If the WebView disconnects while an agent works,
+   the task continues and its final reply is queued for speech on the next Live
+   Conversation connection.
 8. A persistent local Kokoro TTS worker using the British male George voice
    returns 24 kHz PCM to the Android
-   native playback bridge. Confirmed barge-in stops server-side paced delivery,
-   so a new short response cannot wait behind the remainder of an older reply.
+   native playback bridge. Replies are synthesized in short, look-ahead-buffered
+   units so the first audio starts promptly while later speech is generated
+   during playback. Confirmed user speech stops playback after about 200 ms, so
+   new input cannot wait behind the remainder of an older reply. Spoken
+   controls such as “Jarvis stop,” “stop talking,” “be quiet,” and “that's
+   enough” stop playback without entering history, invoking a model, or
+   producing a reply.
 9. When OpenClaw Dashboard holds Android's Assistant role, its lightweight
    voice service streams rolling microphone windows to `/wake`. Detecting the
    standalone word “Jarvis” opens and auto-starts Live Conversation over the
@@ -62,8 +72,10 @@ uncertain.
 
 Declarative remarks such as “testing out the latest Live Conversation updates”
 are handled as conversation and never treated as permission to invent monitoring
-or other agent work. Common testing statements bypass the local routing model,
-which also removes routing-model latency from those turns.
+or other agent work. A reply postcondition removes unrequested promises to
+monitor, verify, investigate, or keep sessions active while preserving factual
+conversation around them. Common testing statements bypass the local routing
+model, which also removes routing-model latency from those turns.
 
 Action confirmation is a persistent voice-controlled setting stored in
 `~/.openclaw/state/live-conversation-settings.json`. Say “Always ask me before

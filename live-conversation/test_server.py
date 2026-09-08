@@ -24,16 +24,20 @@ from server import (
     confirmation_answer,
     confirmation_policy_command,
     direct_voice_surface_reply,
+    extract_agent_acknowledgment,
     extract_agent_text,
     has_stale_identity_confusion,
     has_explicit_action_request,
     is_explicit_new_agent_request,
     is_gateway_status_question,
     is_operational_acknowledgment,
+    is_silent_stop_command,
     is_wake_word,
     parse_speech_model_output,
     repair_known_transcription_errors,
     normalize_spoken_text,
+    latest_assistant_text,
+    remove_unrequested_action_promises,
     render_page,
     split_spoken_text,
     speech_model_prompt,
@@ -66,6 +70,16 @@ class RoutingTests(unittest.TestCase):
         )
         self.assertIn("model operating Live Conversation", direct_voice_surface_reply("Who are you?"))
         self.assertIsNone(direct_voice_surface_reply("Can you check the RAG app?"))
+
+    def test_spoken_stop_commands_are_silent_controls(self):
+        for transcript in (
+            "Jarvis stop.", "Hey Jarvis, stop talking please.", "Be quiet.",
+            "Stop speaking, Jarvis.", "That's enough.", "Jarvis, please stop.",
+            "Could you stop talking now?", "Please be quiet, Jarvis.",
+        ):
+            self.assertTrue(is_silent_stop_command(transcript), transcript)
+        self.assertFalse(is_silent_stop_command("Jarvis, stop the agent."))
+        self.assertFalse(is_silent_stop_command("Why did you stop talking?"))
 
     def test_testing_statements_do_not_invent_agent_work(self):
         self.assertEqual(
@@ -114,6 +128,20 @@ class RoutingTests(unittest.TestCase):
         self.assertFalse(is_operational_acknowledgment(
             "I hear you. Go ahead with the test."
         ))
+        self.assertEqual(
+            remove_unrequested_action_promises(
+                "I understand. Road noise caused the mistake. "
+                "I will keep the sessions active and continue monitoring the conversation."
+            ),
+            "I understand. Road noise caused the mistake.",
+        )
+        self.assertEqual(
+            remove_unrequested_action_promises(
+                "I understand. Road noise is interfering. "
+                "I'll adjust the noise-floor threshold to improve it."
+            ),
+            "I understand. Road noise is interfering.",
+        )
         service = LiveConversationService("agent:main:live-conversation", 1.15)
         service.remember("user", "Testing out the latest updates.")
         service.remember("assistant", "I'll have the agent monitor the updates.")
@@ -302,6 +330,21 @@ class RoutingTests(unittest.TestCase):
     def test_agent_json_extraction(self):
         payload = {"result": {"payloads": [{"text": "Ready."}]}}
         self.assertEqual(extract_agent_text(payload), "Ready.")
+        delegated = {"messages": [{"role": "assistant", "content": [{
+            "type": "toolCall",
+            "name": "sessions_yield",
+            "arguments": {"acknowledgment": "The child is working."},
+        }]}]}
+        self.assertEqual(extract_agent_acknowledgment(delegated), "The child is working.")
+        self.assertEqual(latest_assistant_text(delegated), "")
+        with_prior_reply = {"messages": [{
+            "role": "assistant", "content": "An older reply."
+        }, *delegated["messages"]]}
+        self.assertEqual(latest_assistant_text(with_prior_reply), "")
+        completed = {"messages": [*with_prior_reply["messages"], {
+            "role": "assistant", "content": [{"type": "text", "text": "Finished."}]
+        }]}
+        self.assertEqual(latest_assistant_text(completed), "Finished.")
         self.assertTrue(DEFAULT_NODE_COMMAND.endswith("/node"))
         self.assertTrue(DEFAULT_OPENCLAW_MODULE.endswith("/openclaw.mjs"))
 
@@ -319,6 +362,27 @@ class RoutingTests(unittest.TestCase):
                 self.assertEqual(command[command.index("--message") + 1], transcript)
                 self.assertNotIn("--thinking", command)
                 self.assertEqual(command[command.index("--timeout") + 1], "600")
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_agent_waits_for_final_after_sessions_yield(self):
+        async def run_test():
+            delegated = {"messages": [{"role": "assistant", "content": [{
+                "type": "toolCall",
+                "name": "sessions_yield",
+                "arguments": {"acknowledgment": "The child is working."},
+            }]}]}
+            completed = {"messages": [*delegated["messages"], {
+                "role": "assistant", "content": "The noise-rejection work is complete."
+            }]}
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.openclaw_json = AsyncMock(side_effect=[{}, delegated, completed])
+            with patch("server.asyncio.sleep", AsyncMock()) as sleep:
+                reply = await service.agent_reply("Improve noise rejection.", "agent:test")
+            self.assertEqual(reply, "The noise-rejection work is complete.")
+            sleep.assert_awaited_once()
+            self.assertEqual(service.openclaw_json.await_count, 3)
 
         import asyncio
         asyncio.run(run_test())
@@ -619,6 +683,13 @@ class RoutingTests(unittest.TestCase):
         import asyncio
         asyncio.run(run_test())
 
+    def test_transcription_uses_silero_noise_filtering(self):
+        import inspect
+        source = inspect.getsource(LiveConversationService.transcribe)
+        self.assertIn("vad_filter=True", source)
+        self.assertIn('"threshold": 0.5 if purpose == "wake" else 0.6', source)
+        self.assertIn('"min_speech_duration_ms": 250', source)
+
     def test_agent_turn_intercepts_sentinel_without_speaking_it(self):
         async def run_test():
             service = LiveConversationService("agent:main:live-conversation", 0.85)
@@ -678,6 +749,29 @@ class RoutingTests(unittest.TestCase):
         import asyncio
         asyncio.run(run_test())
 
+    def test_stop_command_interrupts_without_reply_or_model_call(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.transcribe = AsyncMock(return_value="Jarvis, stop talking.")
+            service.speech_reply = AsyncMock()
+            service.tts.synthesize = AsyncMock()
+            service.speech_generation = 4
+            socket = AsyncMock()
+
+            self.assertIsNone(await service.process_turn(socket, b"audio"))
+            self.assertEqual(service.speech_generation, 5)
+            service.speech_reply.assert_not_awaited()
+            service.tts.synthesize.assert_not_awaited()
+            messages = [call.args[0] for call in socket.send_json.await_args_list]
+            self.assertIn(
+                {"type": "state", "state": "listening", "detail": "Silent stop command."},
+                messages,
+            )
+            self.assertFalse(any(message.get("type") == "reply" for message in messages))
+
+        import asyncio
+        asyncio.run(run_test())
+
     def test_voice_command_changes_confirmation_mode_without_an_agent(self):
         async def run_test():
             with tempfile.TemporaryDirectory() as directory:
@@ -728,6 +822,7 @@ class RoutingTests(unittest.TestCase):
         source = inspect.getsource(server.websocket)
         self.assertIn('purpose="partial"', source)
         self.assertIn('"type": "partial_transcript"', source)
+        self.assertIn("silent_stop_detected", source)
         self.assertNotIn("len(audio) < SAMPLE_RATE * 2 * 30", source)
 
     def test_default_tts_speed_is_faster(self):
@@ -793,10 +888,20 @@ class RoutingTests(unittest.TestCase):
         text = "First short sentence. Second short sentence. Third short sentence."
         self.assertEqual(split_spoken_text(text), [text])
 
+    def test_default_tts_units_are_short_enough_for_fast_first_audio(self):
+        text = (
+            "Two gateway sessions are currently running: live conversation session; "
+            "improve voice recognition in road noise."
+        )
+        parts = split_spoken_text(text)
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(len(part) <= 90 for part in parts))
+        self.assertEqual(" ".join(parts), text)
+
     def test_playback_vad_rejects_echo_and_covers_native_tail(self):
         page = render_page()
         self.assertIn("const speechThreshold=responseActive?.025:.006", page)
-        self.assertIn("const speechRequiredMs=responseActive?600:200", page)
+        self.assertIn("const speechRequiredMs=200", page)
         self.assertIn("responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500)", page)
         self.assertIn("report('barge_in','confirmed_user_speech')", page)
         self.assertIn("}send({type:'input_audio_buffer.speech_started'});send({type:'start'})", page)

@@ -64,6 +64,8 @@ CAPABILITY_CACHE_SECONDS = 60
 SESSION_CACHE_SECONDS = 3
 SESSION_POLL_SECONDS = 10
 PARTIAL_TRANSCRIPT_INTERVAL_SECONDS = 1.0
+AGENT_RESULT_POLL_SECONDS = 3.0
+AGENT_RESULT_WAIT_SECONDS = 600.0
 DEFAULT_HISTORY_PATH = "/home/john/.openclaw/state/live-conversation-history.json"
 DEFAULT_SETTINGS_PATH = "/home/john/.openclaw/state/live-conversation-settings.json"
 MAX_HISTORY_MESSAGES = 80
@@ -79,6 +81,17 @@ WAKE_COOLDOWN_SECONDS = 5.0
 def is_wake_word(transcript: str) -> bool:
     normalized = re.sub(r"[^a-z]+", " ", transcript.lower()).strip()
     return bool(WAKE_WORD_ALIASES.intersection(normalized.split()))
+
+
+def is_silent_stop_command(transcript: str) -> bool:
+    """Recognize spoken playback-stop commands that must never get a reply."""
+    normalized = re.sub(r"[^a-z']+", " ", transcript.lower()).strip()
+    return bool(re.fullmatch(
+        r"(?:(?:hey )?jarvis )?(?:(?:can|could|would|will) you )?(?:please )?"
+        r"(?:stop(?: (?:talking|speaking))?|be quiet|quiet|shut up|"
+        r"that's enough|that is enough)(?: please| now)?(?: jarvis)?",
+        normalized,
+    ))
 
 
 def repair_known_transcription_errors(transcript: str) -> str:
@@ -186,12 +199,21 @@ def is_operational_acknowledgment(text: str) -> bool:
     normalized = re.sub(r"\s+", " ", text.lower()).strip()
     return bool(
         re.search(
-            r"\b(?:i'll|i will|let me)\b.*\b(?:agent|monitor|verify|investigate|"
-            r"inspect|fix|update|check|spawn|launch)\b",
+            r"\b(?:i'll|i will|let me)\b.*\b(?:agent|monitor(?:ing)?|verif(?:y|ying)|"
+            r"investigat(?:e|ing)|inspect(?:ing)?|fix(?:ing)?|updat(?:e|ing)|"
+            r"check(?:ing)?|spawn(?:ing)?|launch(?:ing)?|adjust(?:ing)?|tun(?:e|ing)|"
+            r"configur(?:e|ing)|improv(?:e|ing)|refin(?:e|ing)|keep .*sessions? active)\b",
             normalized,
         )
         or re.search(r"\b(?:spawned|started|launched) (?:a|an|the|another) agent\b", normalized)
     )
+
+
+def remove_unrequested_action_promises(text: str) -> str:
+    """Keep conversational content while removing invented future operations."""
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    kept = [sentence for sentence in sentences if not is_operational_acknowledgment(sentence)]
+    return " ".join(kept).strip() or "I understand."
 
 
 def is_gateway_status_question(transcript: str) -> bool:
@@ -380,6 +402,59 @@ def extract_agent_text(payload: Any) -> str:
     return ""
 
 
+def extract_agent_acknowledgment(payload: Any) -> str:
+    """Extract a tool-owned acknowledgment without speaking raw tool JSON."""
+    if isinstance(payload, str):
+        try:
+            return extract_agent_acknowledgment(json.loads(payload))
+        except (ValueError, TypeError):
+            return ""
+    if isinstance(payload, dict):
+        acknowledgment = payload.get("acknowledgment")
+        if isinstance(acknowledgment, str) and acknowledgment.strip():
+            return acknowledgment.strip()
+        for key in ("arguments", "input", "content", "messages", "payloads", "result", "data"):
+            if key in payload:
+                found = extract_agent_acknowledgment(payload[key])
+                if found:
+                    return found
+    if isinstance(payload, list):
+        for value in reversed(payload):
+            found = extract_agent_acknowledgment(value)
+            if found:
+                return found
+    return ""
+
+
+def latest_assistant_text(payload: Any) -> str:
+    """Return visible assistant text produced after the newest delegated handoff."""
+    messages = payload.get("messages", []) if isinstance(payload, dict) else []
+    if not isinstance(messages, list):
+        return ""
+    delegation_index = -1
+    for index, message in enumerate(messages):
+        if extract_agent_acknowledgment(message):
+            delegation_index = index
+    for message in reversed(messages[delegation_index + 1:]):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if isinstance(content, list):
+            parts = [
+                block.get("text", "").strip()
+                for block in content
+                if isinstance(block, dict)
+                and block.get("type") in {"text", "output_text"}
+                and isinstance(block.get("text"), str)
+                and block.get("text", "").strip()
+            ]
+            if parts:
+                return "\n".join(parts)
+    return ""
+
+
 _CARDINAL_UNDER_20 = (
     "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
     "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
@@ -542,7 +617,7 @@ def normalize_spoken_text(text: str) -> str:
     return spoken.removeprefix(". ")
 
 
-def split_spoken_text(text: str, max_chars: int = 240) -> list[str]:
+def split_spoken_text(text: str, max_chars: int = 90) -> list[str]:
     """Split long replies into buffered TTS units without sentence-boundary stalls."""
     normalized = normalize_spoken_text(text)
     if not normalized:
@@ -561,8 +636,9 @@ def split_spoken_text(text: str, max_chars: int = 240) -> list[str]:
         if sentence:
             fragments.append(sentence)
 
-    # Kokoro has a fixed cost per request. One request per sentence can exhaust
-    # the one-part lookahead buffer and leave audible holes at boundaries.
+    # Keep the first synthesis unit short so playback starts promptly. Packing
+    # fragments up to the cap still gives the one-part lookahead enough audio
+    # to synthesize the next unit without an audible boundary gap.
     parts: list[str] = []
     current = ""
     for fragment in fragments:
@@ -881,7 +957,13 @@ class LiveConversationService:
                 condition_on_previous_text=False,
                 without_timestamps=True,
                 no_speech_threshold=0.6,
-                vad_filter=len(audio) > SAMPLE_RATE * 2 * 29,
+                vad_filter=True,
+                vad_parameters={
+                    "threshold": 0.5 if purpose == "wake" else 0.6,
+                    "min_speech_duration_ms": 250,
+                    "min_silence_duration_ms": 300,
+                    "speech_pad_ms": 200,
+                },
             )
             text = "".join(
                 f"{segment.text} "
@@ -1002,9 +1084,28 @@ class LiveConversationService:
                 )
                 await asyncio.sleep(delay)
         reply = extract_agent_text(payload)
-        if not reply:
+        if reply:
+            return reply
+
+        history = await self.openclaw_json(
+            "gateway", "call", "chat.history", "--json", "--params",
+            json.dumps({"sessionKey": target_key, "limit": 40}),
+        )
+        acknowledgment = extract_agent_acknowledgment(history)
+        if not acknowledgment:
             raise RuntimeError("Agent returned no speakable text")
-        return reply
+        LOGGER.info("agent_delegated_waiting_for_final target=%s", target_key)
+        deadline = time.monotonic() + AGENT_RESULT_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            await asyncio.sleep(AGENT_RESULT_POLL_SECONDS)
+            history = await self.openclaw_json(
+                "gateway", "call", "chat.history", "--json", "--params",
+                json.dumps({"sessionKey": target_key, "limit": 40}),
+            )
+            final_text = latest_assistant_text(history)
+            if final_text:
+                return final_text
+        return "The delegated agent is still working in its session."
 
     async def speech_reply(
         self, text: str, agent_pending: bool = False
@@ -1084,7 +1185,7 @@ class LiveConversationService:
                     route, target_session = "agent", None
                 else:
                     LOGGER.warning("speech_supervisor_removed_invented_action")
-                    reply = "I understand."
+                    reply = remove_unrequested_action_promises(reply)
             if route == "session" and target_session not in self.session_keys:
                 LOGGER.warning("speech_supervisor_invalid_session target=%s", target_session)
                 route, target_session = "agent", None
@@ -1176,6 +1277,12 @@ class LiveConversationService:
                 await socket.send_json({"type": "state", "state": "listening", "detail": "No clear speech detected."})
                 return
             await socket.send_json({"type": "transcript", "text": transcript})
+            if is_silent_stop_command(transcript):
+                self.interrupt_speech()
+                await socket.send_json({
+                    "type": "state", "state": "listening", "detail": "Silent stop command."
+                })
+                return None
 
             stage = time.perf_counter()
             handoff_request: str | None = None
@@ -1259,8 +1366,8 @@ function rms(b64){const s=atob(b64||'');let sum=0,n=0;for(let i=0;i+1<s.length;i
 function send(x){if(ws&&ws.readyState===1)ws.send(JSON.stringify(x))}
 function report(event,detail){send({type:'client_event',event:event,detail:String(detail||'')})}
 function begin(){if(recording||awaitingResponse)return;recording=true;candidateSpeechMs=0;speechMs=0;silenceMs=0;if(responseActive){responseActive=false;if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}try{OpenClawNativeAudio.interruptAgentResponsePlayback()}catch(e){}report('barge_in','confirmed_user_speech')}send({type:'input_audio_buffer.speech_started'});send({type:'start'});for(const audioBase64 of pre)send({type:'audio',audioBase64});pre=[];state.textContent='Listening…'}
-function tick(){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>20)pre.shift();if(awaitingResponse){candidateSpeechMs=0;return}const speechThreshold=responseActive?.025:.006;const speechRequiredMs=responseActive?600:200;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+20:0;if(candidateSpeechMs>=speechRequiredMs)begin();return}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=20;silenceMs=0}else silenceMs+=20;if(speechMs>=200&&silenceMs>=600){recording=false;awaitingResponse=true;candidateSpeechMs=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}}
-function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-80):[];renderHistory()}if(m.type==='settings')confirmation.textContent='Action confirmation: '+(m.action_confirmation==='confirm'?'On — asks before actions':'Off — explicit requests proceed');if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.state==='listening'){awaitingResponse=false;recording=false;candidateSpeechMs=0}if((m.detail||'').startsWith('Ignored'))pendingTranscript=''}if(m.type==='partial_transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;if(pendingTranscript){addHistory('user',pendingTranscript);pendingTranscript=''}addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;candidateSpeechMs=0;pre=[];audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){candidateSpeechMs=0;pre=[];if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
+function tick(){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>20)pre.shift();if(awaitingResponse){candidateSpeechMs=0;return}const speechThreshold=responseActive?.025:.006;const speechRequiredMs=200;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+20:0;if(candidateSpeechMs>=speechRequiredMs)begin();return}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=20;silenceMs=0}else silenceMs+=20;if(speechMs>=200&&silenceMs>=600){recording=false;awaitingResponse=true;candidateSpeechMs=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}}
+function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-80):[];renderHistory()}if(m.type==='settings')confirmation.textContent='Action confirmation: '+(m.action_confirmation==='confirm'?'On — asks before actions':'Off — explicit requests proceed');if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.state==='listening'){awaitingResponse=false;recording=false;candidateSpeechMs=0}if((m.detail||'').startsWith('Ignored')||(m.detail||'').startsWith('Silent stop'))pendingTranscript=''}if(m.type==='partial_transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;if(pendingTranscript){addHistory('user',pendingTranscript);pendingTranscript=''}addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;candidateSpeechMs=0;pre=[];audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){candidateSpeechMs=0;pre=[];if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
 function stop(){if(timer)clearInterval(timer);timer=null;if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=null;try{OpenClawNativeAudio.stopCapture()}catch(e){}if(ws)ws.close();ws=null;recording=false;awaitingResponse=false;responseActive=false;candidateSpeechMs=0;bar.style.width='0%';state.textContent='Stopped'}
 document.getElementById('start').onclick=start;document.getElementById('stop').onclick=()=>{stop();try{OpenClawNativeApp.liveConversationStopped()}catch(e){}};window.addEventListener('pagehide',stop);if(new URLSearchParams(location.search).get('autostart')==='1')start();
 </script></body></html>"""
@@ -1323,14 +1430,20 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
     audio = bytearray()
     turn_task: asyncio.Task[None] | None = None
     partial_task: asyncio.Task[None] | None = None
+    silent_stop_detected = False
     turn_sequence = 0
     next_partial_bytes = round(SAMPLE_RATE * 2 * PARTIAL_TRANSCRIPT_INTERVAL_SECONDS)
     agent_tasks: set[asyncio.Task[None]] = set()
 
     async def run_partial(snapshot: bytes, sequence: int) -> None:
+        nonlocal silent_stop_detected
         try:
             transcript = await service.transcribe(snapshot, purpose="partial")
-            if transcript and sequence == turn_sequence and not socket.closed:
+            if transcript and sequence == turn_sequence and is_silent_stop_command(transcript):
+                silent_stop_detected = True
+                service.interrupt_speech()
+                await socket.send_json({"type": "output_audio_buffer.cleared"})
+            elif transcript and sequence == turn_sequence and not socket.closed:
                 await socket.send_json({"type": "partial_transcript", "text": transcript})
         except Exception as error:
             LOGGER.warning("partial_transcription_failed error=%s", error)
@@ -1403,6 +1516,7 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
             await socket.send_json({"type": "output_audio_buffer.cleared"})
         elif kind == "start":
             turn_sequence += 1
+            silent_stop_detected = False
             audio.clear()
             next_partial_bytes = round(
                 SAMPLE_RATE * 2 * PARTIAL_TRANSCRIPT_INTERVAL_SECONDS
@@ -1421,6 +1535,13 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
                 partial_task = asyncio.create_task(run_partial(snapshot, sequence))
         elif kind == "commit" and audio:
             turn_sequence += 1
+            if silent_stop_detected:
+                audio.clear()
+                silent_stop_detected = False
+                await socket.send_json({
+                    "type": "state", "state": "listening", "detail": "Silent stop command."
+                })
+                continue
             if turn_task and not turn_task.done():
                 turn_task.cancel()
             turn = bytes(audio)
