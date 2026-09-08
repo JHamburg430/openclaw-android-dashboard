@@ -30,6 +30,7 @@ from pipecat.transcriptions.language import Language
 
 SAMPLE_RATE = 16_000
 OUTPUT_SAMPLE_RATE = 24_000
+PLAYBACK_PREFILL_SECONDS = 0.3
 DEFAULT_PORT = 8790
 DEFAULT_SESSION_KEY = "agent:main:live-conversation"
 DEFAULT_NODE_COMMAND = "/home/john/nodejs/bin/node"
@@ -1231,6 +1232,9 @@ class LiveConversationService:
             )
             await socket.send_json({"type": "output_audio_buffer.started", "responseId": response_id})
             chunk_bytes = OUTPUT_SAMPLE_RATE * 2 // 10
+            prefill_bytes = round(
+                OUTPUT_SAMPLE_RATE * 2 * PLAYBACK_PREFILL_SECONDS
+            )
             total_pcm_bytes = 0
             interrupted = False
             for index, _ in enumerate(speech_parts):
@@ -1249,7 +1253,12 @@ class LiveConversationService:
                         "audioBase64": base64.b64encode(chunk).decode("ascii"),
                     })
                     total_pcm_bytes += len(chunk)
-                    await asyncio.sleep(len(chunk) / (OUTPUT_SAMPLE_RATE * 2))
+                    # Keep a small PCM lead ahead of Android's AudioTrack. Sending
+                    # exactly one 100 ms delta every 100 ms left no jitter margin,
+                    # so ordinary WebView/network scheduling pauses sounded like
+                    # the reply was being cut off every few seconds.
+                    if total_pcm_bytes > prefill_bytes:
+                        await asyncio.sleep(len(chunk) / (OUTPUT_SAMPLE_RATE * 2))
                 if interrupted:
                     break
                 if next_synthesis is not None:

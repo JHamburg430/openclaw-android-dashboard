@@ -50,7 +50,10 @@ in the Android Dashboard plus menu.
    returns 24 kHz PCM to the Android
    native playback bridge. Replies are synthesized in short, look-ahead-buffered
    units so the first audio starts promptly while later speech is generated
-   during playback. Confirmed user speech stops playback after about 200 ms, so
+   during playback. The server sends a 300 ms PCM prefill before settling into
+   realtime pacing, giving Android's AudioTrack enough scheduling margin to
+   avoid periodic underruns without adding perceptible startup delay. Confirmed
+   user speech stops playback after about 200 ms, so
    new input cannot wait behind the remainder of an older reply. Spoken
    controls such as “Jarvis stop,” “stop talking,” “be quiet,” and “that's
    enough” stop playback without entering history, invoking a model, or

@@ -906,15 +906,20 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("report('barge_in','confirmed_user_speech')", page)
         self.assertIn("}send({type:'input_audio_buffer.speech_started'});send({type:'start'})", page)
 
-    def test_spoken_audio_is_paced_in_realtime(self):
+    def test_spoken_audio_prefills_before_realtime_pacing(self):
         async def run_test():
             service = LiveConversationService("agent:main:live-conversation", 0.72)
             socket = AsyncMock()
-            service.tts.synthesize = AsyncMock(return_value=b"\0" * 9600)
+            service.tts.synthesize = AsyncMock(return_value=b"\0" * 19_200)
             with patch("server.asyncio.sleep", AsyncMock()) as sleep:
                 await service.send_spoken_response(socket, "A short response.", "agent", "response-1")
-            self.assertEqual(sleep.await_count, 2)
+            self.assertEqual(sleep.await_count, 1)
             self.assertEqual(sleep.await_args_list[0].args[0], 0.1)
+            payloads = [call.args[0] for call in socket.send_json.await_args_list]
+            self.assertEqual(
+                sum(payload.get("type") == "response.output_audio.delta" for payload in payloads),
+                4,
+            )
 
         import asyncio
         asyncio.run(run_test())
@@ -925,17 +930,17 @@ class RoutingTests(unittest.TestCase):
             socket = AsyncMock()
             service.tts.synthesize = AsyncMock(return_value=b"\0" * 24_000)
 
-            async def interrupt_after_first_chunk(_):
+            async def interrupt_after_prefill(_):
                 service.interrupt_speech()
 
-            with patch("server.asyncio.sleep", AsyncMock(side_effect=interrupt_after_first_chunk)) as sleep:
+            with patch("server.asyncio.sleep", AsyncMock(side_effect=interrupt_after_prefill)) as sleep:
                 await service.send_spoken_response(socket, "A long response.", "agent", "response-1")
 
             self.assertEqual(sleep.await_count, 1)
             payloads = [call.args[0] for call in socket.send_json.await_args_list]
             self.assertEqual(
                 sum(payload.get("type") == "response.output_audio.delta" for payload in payloads),
-                1,
+                4,
             )
             self.assertEqual(payloads[-1]["type"], "response.output_audio.done")
 
