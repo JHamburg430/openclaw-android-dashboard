@@ -166,4 +166,18 @@ PYTHONPATH=live-conversation \
   ~/.openclaw/tools/pipecat-live-conversation/venv/bin/python \
   -m unittest discover -s live-conversation -p 'test_*.py' -v
 node scripts/test-live-conversation-app.mjs
+node scripts/test-live-conversation-turns.mjs
 ```
+
+The Python discovery suite includes `test_voice_audio.py`, a model-backed audio
+matrix. It generates fresh user utterances in memory with the production Kokoro
+George voice, resamples them to the Android microphone's 16 kHz PCM format, and
+passes them through the production Faster-Whisper `small.en` decoder and exact
+production decoding options. The integration suite uses CPU `int8` inference so
+it remains deterministic outside the CUDA-configured systemd service. The cases
+cover three-turn conversational continuity, close-spaced barge-in while an
+earlier response is pending, spoken action confirmation, room noise, noise-only
+rejection, a 500 ms thinking pause, silent spoken interruption, and non-silent
+fixture validation. If the local production voice assets are not installed, these
+hardware integration cases report an explicit skip while the fast unit suite
+continues.
