@@ -278,7 +278,7 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("Conversation history · last 80 messages", page)
         self.assertIn("m.type==='history'", page)
         self.assertIn("historyMessages.slice(-80)", page)
-        self.assertIn("addHistory('user',pendingTranscript)", page)
+        self.assertIn("addHistory('user',m.text)", page)
         self.assertIn("addHistory('assistant',m.text)", page)
         self.assertIn("get('autostart')==='1'", page)
         self.assertIn("liveConversationStopped", page)
@@ -972,6 +972,182 @@ class RoutingTests(unittest.TestCase):
         import asyncio
         asyncio.run(run_test())
 
+    def test_multiple_back_and_forth_turns_are_all_heard_and_remembered(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.transcribe = AsyncMock(side_effect=[
+                "Can you hear the first question?",
+                "Here is my second question.",
+                "And this is the third one.",
+            ])
+            service.speech_reply = AsyncMock(side_effect=[
+                ("direct", "I heard the first question.", None),
+                ("direct", "I heard the second question.", None),
+                ("direct", "I heard the third question.", None),
+            ])
+            service.tts.synthesize = AsyncMock(return_value=b"")
+            socket = AsyncMock()
+
+            for turn in (b"one", b"two", b"three"):
+                self.assertIsNone(await service.process_turn(socket, turn))
+
+            self.assertEqual(service.recent_history(), [
+                {"role": "user", "content": "Can you hear the first question?"},
+                {"role": "assistant", "content": "I heard the first question."},
+                {"role": "user", "content": "Here is my second question."},
+                {"role": "assistant", "content": "I heard the second question."},
+                {"role": "user", "content": "And this is the third one."},
+                {"role": "assistant", "content": "I heard the third question."},
+            ])
+            transcripts = [
+                call.args[0]["text"] for call in socket.send_json.await_args_list
+                if call.args[0].get("type") == "transcript"
+            ]
+            self.assertEqual(transcripts, [
+                "Can you hear the first question?",
+                "Here is my second question.",
+                "And this is the third one.",
+            ])
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_new_user_speech_suppresses_stale_reply_but_preserves_both_inputs(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.transcribe = AsyncMock(side_effect=[
+                "Start with the first part.", "Actually, add this clarification."
+            ])
+            first_routing_started = asyncio.Event()
+            release_first_routing = asyncio.Event()
+
+            async def speech_reply(text, agent_pending=False):
+                if text.startswith("Start"):
+                    first_routing_started.set()
+                    await release_first_routing.wait()
+                    return "direct", "Here is the now-stale first reply.", None
+                return "direct", "I heard the clarification too.", None
+
+            service.speech_reply = AsyncMock(side_effect=speech_reply)
+            service.tts.synthesize = AsyncMock(return_value=b"")
+            socket = AsyncMock()
+
+            first = asyncio.create_task(service.process_turn(socket, b"first"))
+            await first_routing_started.wait()
+            service.interrupt_speech()
+            release_first_routing.set()
+            self.assertIsNone(await first)
+            self.assertIsNone(await service.process_turn(socket, b"second"))
+
+            self.assertEqual(service.recent_history(), [
+                {"role": "user", "content": "Start with the first part."},
+                {"role": "user", "content": "Actually, add this clarification."},
+                {"role": "assistant", "content": "I heard the clarification too."},
+            ])
+            messages = [call.args[0] for call in socket.send_json.await_args_list]
+            self.assertTrue(any(item.get("type") == "turn_superseded" for item in messages))
+            replies = [item["text"] for item in messages if item.get("type") == "reply"]
+            self.assertEqual(replies, ["I heard the clarification too."])
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_websocket_queues_rapid_commits_in_fifo_order_without_cancellation(self):
+        async def run_test():
+            import base64
+            from collections import deque
+            from aiohttp import web
+            from aiohttp.test_utils import TestClient, TestServer
+            from server import websocket
+
+            class FakeService:
+                def __init__(self):
+                    self.pending_spoken_replies = deque()
+                    self.started = asyncio.Event()
+                    self.release = asyncio.Event()
+                    self.completed = []
+                    self.generations = []
+                    self.interruptions = 0
+                    self.speech_generation = 0
+
+                def recent_history(self):
+                    return []
+
+                def settings_payload(self):
+                    return {"type": "settings", "action_confirmation": "automatic"}
+
+                def interrupt_speech(self):
+                    self.interruptions += 1
+                    self.speech_generation += 1
+
+                async def process_turn(
+                    self, socket, audio, agent_pending=False, turn_generation=None
+                ):
+                    if not self.completed:
+                        self.started.set()
+                        await self.release.wait()
+                    self.completed.append(audio)
+                    self.generations.append(turn_generation)
+                    return None
+
+            service = FakeService()
+            app = web.Application()
+            app["service"] = service
+            app.router.add_get("/ws", websocket)
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            socket = await client.ws_connect("/ws")
+            await socket.receive_json()
+            await socket.receive_json()
+
+            async def send_turn(content):
+                await socket.send_json({"type": "input_audio_buffer.speech_started"})
+                await socket.send_json({"type": "start"})
+                await socket.send_json({
+                    "type": "audio", "audioBase64": base64.b64encode(content).decode()
+                })
+                await socket.send_json({"type": "commit"})
+
+            await send_turn(b"first")
+            await service.started.wait()
+            await send_turn(b"second")
+            await asyncio.sleep(0.02)
+            self.assertEqual(service.completed, [])
+            service.release.set()
+            for _ in range(50):
+                if len(service.completed) == 2:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(service.completed, [b"first", b"second"])
+            self.assertEqual(service.generations, [1, 2])
+            self.assertEqual(service.interruptions, 2)
+
+            await socket.close()
+            await client.close()
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_background_noise_turn_returns_to_listening_without_history_or_reply(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.transcribe = AsyncMock(return_value="")
+            service.speech_reply = AsyncMock()
+            service.tts.synthesize = AsyncMock()
+            socket = AsyncMock()
+
+            self.assertIsNone(await service.process_turn(socket, b"road-noise"))
+            service.speech_reply.assert_not_awaited()
+            service.tts.synthesize.assert_not_awaited()
+            self.assertEqual(service.recent_history(), [])
+            self.assertIn(
+                {"type": "state", "state": "listening", "detail": "No clear speech detected."},
+                [call.args[0] for call in socket.send_json.await_args_list],
+            )
+
+        import asyncio
+        asyncio.run(run_test())
+
     def test_voice_command_changes_confirmation_mode_without_an_agent(self):
         async def run_test():
             with tempfile.TemporaryDirectory() as directory:
@@ -1006,14 +1182,16 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("OpenClawNativeAudio.prepareAgentResponsePlayback()", page)
         self.assertIn("OpenClawNativeAudio.interruptAgentResponsePlayback()", page)
         self.assertIn("response.output_audio.delta", page)
-        self.assertIn("if(recording||awaitingResponse)return", page)
-        self.assertIn("if(awaitingResponse){candidateSpeechMs=0;return}", page)
+        self.assertIn("if(recording)return", page)
+        self.assertNotIn("if(awaitingResponse){candidateSpeechMs=0;return}", page)
+        self.assertIn("interruptedWait?'while_awaiting_response':'ready'", page)
         self.assertIn("candidateSpeechMs>=speechRequiredMs", page)
         self.assertIn("responseActive=true", page)
         self.assertIn("first_pcm_enqueued", page)
         self.assertIn("pcm_delivery_done", page)
-        self.assertIn("if(m.state==='listening'){awaitingResponse=false", page)
+        self.assertIn("if(m.state==='listening'&&!recording)", page)
         self.assertIn("m.type==='partial_transcript'", page)
+        self.assertIn("addHistory('user',m.text)", page)
 
     def test_websocket_generates_incremental_partials_without_a_turn_cap(self):
         import inspect
@@ -1023,6 +1201,11 @@ class RoutingTests(unittest.TestCase):
         self.assertIn('purpose="partial"', source)
         self.assertIn('"type": "partial_transcript"', source)
         self.assertIn("silent_stop_detected", source)
+        self.assertIn("turn_queue.put_nowait((turn, service.speech_generation))", source)
+        self.assertIn("async def run_turn_queue", source)
+        self.assertIn("await conversation_idle.wait()", source)
+        self.assertIn("if turn_queue.empty() and not user_input_active", source)
+        self.assertNotIn("turn_task.cancel()", source)
         self.assertNotIn("len(audio) < SAMPLE_RATE * 2 * 30", source)
 
     def test_default_tts_speed_is_faster(self):

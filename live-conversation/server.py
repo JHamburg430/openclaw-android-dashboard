@@ -1409,9 +1409,17 @@ class LiveConversationService:
         route: str,
         response_id: str,
         message_type: str = "reply",
+        expected_generation: int | None = None,
     ) -> int:
         """Synthesize and stream one complete spoken response."""
-        generation = self.speech_generation
+        generation = (
+            self.speech_generation if expected_generation is None else expected_generation
+        )
+        if generation != self.speech_generation:
+            LOGGER.info(
+                "response_skipped_for_newer_speech id=%s route=%s", response_id, route
+            )
+            return -1
         await socket.send_json({
             "type": message_type,
             "text": text,
@@ -1426,7 +1434,7 @@ class LiveConversationService:
                     "response_stream_superseded id=%s route=%s lock_wait_ms=%d",
                     response_id, route, lock_wait_ms,
                 )
-                return 0
+                return -1
             await socket.send_json({"type": "state", "state": "speaking", "route": route})
             speech_parts = split_spoken_text(text)
             tts_started = time.perf_counter()
@@ -1479,9 +1487,13 @@ class LiveConversationService:
         return tts_ms
 
     async def process_turn(
-        self, socket: web.WebSocketResponse, audio: bytes, agent_pending: bool = False
+        self, socket: web.WebSocketResponse, audio: bytes, agent_pending: bool = False,
+        turn_generation: int | None = None,
     ) -> tuple[str, str, str | None] | None:
         started = time.perf_counter()
+        if turn_generation is None:
+            turn_generation = self.speech_generation
+        pending_confirmation_before = self.pending_confirmation
         metrics = TurnMetrics()
         try:
             await socket.send_json({"type": "state", "state": "transcribing"})
@@ -1547,11 +1559,21 @@ class LiveConversationService:
                 return None
 
             self.remember("user", transcript)
+            if turn_generation != self.speech_generation:
+                self.pending_confirmation = pending_confirmation_before
+                LOGGER.info(
+                    "turn_superseded_by_newer_speech transcript=%r", transcript
+                )
+                await socket.send_json({
+                    "type": "turn_superseded", "text": transcript
+                })
+                return None
             self.remember("assistant", reply)
 
             response_id = f"response-{time.monotonic_ns()}"
             metrics.tts_ms = await self.send_spoken_response(
-                socket, reply, metrics.route, response_id
+                socket, reply, metrics.route, response_id,
+                expected_generation=turn_generation,
             )
             metrics.total_ms = round((time.perf_counter() - started) * 1000)
             await socket.send_json({"type": "metrics", **asdict(metrics)})
@@ -1582,9 +1604,9 @@ function addHistory(role,content){if(!content)return;historyMessages.push({role,
 function rms(b64){const s=atob(b64||'');let sum=0,n=0;for(let i=0;i+1<s.length;i+=2){let v=(s.charCodeAt(i)&255)|((s.charCodeAt(i+1)&255)<<8);if(v&32768)v-=65536;const f=v/32768;sum+=f*f;n++}return n?Math.sqrt(sum/n):0}
 function send(x){if(ws&&ws.readyState===1)ws.send(JSON.stringify(x))}
 function report(event,detail){send({type:'client_event',event:event,detail:String(detail||'')})}
-function begin(){if(recording||awaitingResponse)return;recording=true;candidateSpeechMs=0;speechMs=0;silenceMs=0;if(responseActive){responseActive=false;if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}try{OpenClawNativeAudio.interruptAgentResponsePlayback()}catch(e){}report('barge_in','confirmed_user_speech')}send({type:'input_audio_buffer.speech_started'});send({type:'start'});for(const audioBase64 of pre)send({type:'audio',audioBase64});pre=[];state.textContent='Listening…'}
-function tick(){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>20)pre.shift();if(awaitingResponse){candidateSpeechMs=0;return}const speechThreshold=responseActive?.025:.012;const speechRequiredMs=responseActive?200:300;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+20:0;if(candidateSpeechMs>=speechRequiredMs)begin();return}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=20;silenceMs=0}else silenceMs+=20;if(speechMs>=200&&silenceMs>=600){recording=false;awaitingResponse=true;candidateSpeechMs=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}}
-function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-80):[];renderHistory()}if(m.type==='settings')confirmation.textContent='Action confirmation: '+(m.action_confirmation==='confirm'?'On — asks before actions':'Off — explicit requests proceed');if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.state==='listening'){awaitingResponse=false;recording=false;candidateSpeechMs=0}if((m.detail||'').startsWith('Ignored')||(m.detail||'').startsWith('Silent stop'))pendingTranscript=''}if(m.type==='partial_transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;if(pendingTranscript){addHistory('user',pendingTranscript);pendingTranscript=''}addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;candidateSpeechMs=0;pre=[];audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){candidateSpeechMs=0;pre=[];if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
+function begin(){if(recording)return;const interruptedWait=awaitingResponse;recording=true;awaitingResponse=false;candidateSpeechMs=0;speechMs=0;silenceMs=0;if(responseActive){responseActive=false;if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}try{OpenClawNativeAudio.interruptAgentResponsePlayback()}catch(e){}report('barge_in','confirmed_user_speech')}send({type:'input_audio_buffer.speech_started'});send({type:'start'});for(const audioBase64 of pre)send({type:'audio',audioBase64});pre=[];report('speech_started',interruptedWait?'while_awaiting_response':'ready');state.textContent='Listening…'}
+function tick(){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>20)pre.shift();const speechThreshold=responseActive?.025:.012;const speechRequiredMs=responseActive?200:300;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+20:0;if(candidateSpeechMs>=speechRequiredMs)begin();return}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=20;silenceMs=0}else silenceMs+=20;if(speechMs>=200&&silenceMs>=600){recording=false;awaitingResponse=true;candidateSpeechMs=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}}
+function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-80):[];renderHistory()}if(m.type==='settings')confirmation.textContent='Action confirmation: '+(m.action_confirmation==='confirm'?'On — asks before actions':'Off — explicit requests proceed');if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.state==='listening'&&!recording){awaitingResponse=false;candidateSpeechMs=0}if((m.detail||'').startsWith('Ignored')||(m.detail||'').startsWith('Silent stop'))pendingTranscript=''}if(m.type==='partial_transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript='';addHistory('user',m.text)}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
 function stop(){if(timer)clearInterval(timer);timer=null;if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=null;try{OpenClawNativeAudio.stopCapture()}catch(e){}if(ws)ws.close();ws=null;recording=false;awaitingResponse=false;responseActive=false;candidateSpeechMs=0;bar.style.width='0%';state.textContent='Stopped'}
 document.getElementById('start').onclick=start;document.getElementById('stop').onclick=()=>{stop();try{OpenClawNativeApp.liveConversationStopped()}catch(e){}};window.addEventListener('pagehide',stop);if(new URLSearchParams(location.search).get('autostart')==='1')start();
 </script></body></html>"""
@@ -1645,12 +1667,17 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
             socket, reply, "agent", f"agent-reconnect-{time.monotonic_ns()}"
         )
     audio = bytearray()
-    turn_task: asyncio.Task[None] | None = None
+    turn_queue: asyncio.Queue[tuple[bytes, int]] = asyncio.Queue()
+    turn_worker: asyncio.Task[None] | None = None
     partial_task: asyncio.Task[None] | None = None
     silent_stop_detected = False
     turn_sequence = 0
     next_partial_bytes = round(SAMPLE_RATE * 2 * PARTIAL_TRANSCRIPT_INTERVAL_SECONDS)
     agent_tasks: set[asyncio.Task[None]] = set()
+    user_input_active = False
+    conversation_idle = asyncio.Event()
+    conversation_idle.set()
+    callback_delivery_lock = asyncio.Lock()
 
     async def run_partial(snapshot: bytes, sequence: int) -> None:
         nonlocal silent_stop_detected
@@ -1685,11 +1712,27 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
             await refresh
             service.update_agent_session(target_session, "complete")
             await service.refresh_sessions(force=True)
-            service.remember("assistant", reply)
             if socket.closed:
+                service.remember("assistant", reply)
                 service.queue_pending_reply(reply)
                 return
-            await service.send_spoken_response(socket, reply, "agent", f"agent-{time.monotonic_ns()}")
+            async with callback_delivery_lock:
+                await conversation_idle.wait()
+                if socket.closed:
+                    service.remember("assistant", reply)
+                    service.queue_pending_reply(reply)
+                    return
+                conversation_idle.clear()
+                callback_generation = service.speech_generation
+                service.remember("assistant", reply)
+                try:
+                    await service.send_spoken_response(
+                        socket, reply, "agent", f"agent-{time.monotonic_ns()}",
+                        expected_generation=callback_generation,
+                    )
+                finally:
+                    if turn_queue.empty() and not user_input_active:
+                        conversation_idle.set()
             await socket.send_json({
                 "type": "agent_status",
                 "state": "complete",
@@ -1714,28 +1757,57 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
             if socket.closed:
                 service.queue_pending_reply(message)
             else:
-                await service.send_spoken_response(
-                    socket, message, "agent", f"agent-error-{time.monotonic_ns()}"
-                )
+                async with callback_delivery_lock:
+                    await conversation_idle.wait()
+                    conversation_idle.clear()
+                    try:
+                        await service.send_spoken_response(
+                            socket, message, "agent",
+                            f"agent-error-{time.monotonic_ns()}",
+                        )
+                    finally:
+                        if turn_queue.empty() and not user_input_active:
+                            conversation_idle.set()
                 await socket.send_json({
                     "type": "agent_status", "state": "error", "sessionKey": target_session
                 })
 
-    async def run_turn(turn: bytes) -> None:
+    async def run_turn(turn: bytes, generation: int) -> None:
         handoff = await service.process_turn(
-            socket, turn, agent_pending=bool(agent_tasks)
+            socket, turn, agent_pending=bool(agent_tasks),
+            turn_generation=generation,
         )
         if handoff:
             transcript, _, target_session = handoff
             task = asyncio.create_task(run_agent(transcript, target_session))
             agent_tasks.add(task)
             task.add_done_callback(agent_tasks.discard)
+
+    async def run_turn_queue() -> None:
+        while True:
+            turn, generation = await turn_queue.get()
+            conversation_idle.clear()
+            try:
+                await run_turn(turn, generation)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                LOGGER.exception("queued_turn_failed error=%s", error)
+            finally:
+                turn_queue.task_done()
+                if turn_queue.empty() and not user_input_active:
+                    conversation_idle.set()
+
+    turn_worker = asyncio.create_task(run_turn_queue())
+
     async for message in socket:
         if message.type != WSMsgType.TEXT:
             continue
         payload = json.loads(message.data)
         kind = payload.get("type")
         if kind == "input_audio_buffer.speech_started":
+            user_input_active = True
+            conversation_idle.clear()
             service.interrupt_speech()
             await socket.send_json({"type": "output_audio_buffer.cleared"})
         elif kind == "start":
@@ -1757,24 +1829,30 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
                     SAMPLE_RATE * 2 * PARTIAL_TRANSCRIPT_INTERVAL_SECONDS
                 )
                 partial_task = asyncio.create_task(run_partial(snapshot, sequence))
-        elif kind == "commit" and audio:
+        elif kind == "commit":
             turn_sequence += 1
+            user_input_active = False
+            if not audio:
+                if turn_queue.empty():
+                    conversation_idle.set()
+                continue
             if silent_stop_detected:
                 audio.clear()
                 silent_stop_detected = False
                 await socket.send_json({
                     "type": "state", "state": "listening", "detail": "Silent stop command."
                 })
+                if turn_queue.empty():
+                    conversation_idle.set()
                 continue
-            if turn_task and not turn_task.done():
-                turn_task.cancel()
             turn = bytes(audio)
             audio.clear()
-            turn_task = asyncio.create_task(run_turn(turn))
+            turn_queue.put_nowait((turn, service.speech_generation))
         elif kind == "client_event":
             LOGGER.info("client_event event=%s detail=%s", payload.get("event", ""), payload.get("detail", ""))
-    if turn_task and not turn_task.done():
-        turn_task.cancel()
+    if turn_worker and not turn_worker.done():
+        turn_worker.cancel()
+    conversation_idle.set()
     # Agent tasks deliberately survive a WebView disconnect. Their final reply
     # is persisted and queued for speech when Live Conversation reconnects.
     return socket
