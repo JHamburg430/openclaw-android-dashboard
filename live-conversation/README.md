@@ -24,6 +24,11 @@ in the Android Dashboard plus menu.
    supervisor while remaining sub-second once warm on the installed GPUs. The
    Ollama request keeps it warm for 30 minutes to avoid repeated cold starts
    during a conversation. The model is also warmed when the service starts.
+   The reply budget is 256 tokens rather than the former 80-token ceiling. If
+   Ollama reports that the budget was exhausted (or returns exactly the capped
+   token count), the request is retried once with 512 tokens instead of showing
+   and speaking a syntactically valid JSON response whose `reply` ends midway
+   through a sentence.
 5. A bounded conversation history supplies the previous user and assistant
    turns to the speech supervisor. It is persisted at
    `~/.openclaw/state/live-conversation-history.json`, so context survives a

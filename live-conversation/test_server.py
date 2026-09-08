@@ -14,6 +14,8 @@ from server import (
     SAY_SENTINEL,
     SPEECH_MODEL,
     SPEECH_MODEL_KEEP_ALIVE,
+    SPEECH_NUM_PREDICT,
+    SPEECH_RETRY_NUM_PREDICT,
     DEFAULT_NODE_COMMAND,
     DEFAULT_OPENCLAW_MODULE,
     DEFAULT_TTS_MODEL_DIR,
@@ -325,6 +327,57 @@ class RoutingTests(unittest.TestCase):
     def test_speech_supervisor_uses_higher_quality_local_model(self):
         self.assertEqual(SPEECH_MODEL, "qwen3.5:4b")
         self.assertEqual(SPEECH_MODEL_KEEP_ALIVE, "30m")
+        self.assertEqual(SPEECH_NUM_PREDICT, 256)
+        self.assertEqual(SPEECH_RETRY_NUM_PREDICT, 512)
+
+    def test_speech_supervisor_retries_instead_of_showing_a_token_limited_reply(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            response = AsyncMock()
+            response.raise_for_status = lambda: None
+            response.json = AsyncMock(side_effect=[
+                {
+                    "done_reason": "length",
+                    "eval_count": SPEECH_NUM_PREDICT,
+                    "message": {"content": json.dumps({
+                        "route": "direct",
+                        "reply": "This reply was cut off and I",
+                        "session_key": "",
+                    })},
+                },
+                {
+                    "done_reason": "stop",
+                    "eval_count": 96,
+                    "message": {"content": json.dumps({
+                        "route": "direct",
+                        "reply": "This reply now reaches a complete ending.",
+                        "session_key": "",
+                    })},
+                },
+            ])
+            context = MagicMock()
+            context.__aenter__.return_value = response
+            session = MagicMock()
+            session.post.return_value = context
+            session_context = MagicMock()
+            session_context.__aenter__.return_value = session
+
+            with patch("server.aiohttp.ClientSession", return_value=session_context):
+                result = await service.speech_reply("Give me a detailed answer.")
+
+            self.assertEqual(
+                result,
+                ("direct", "This reply now reaches a complete ending.", None),
+            )
+            self.assertEqual(session.post.call_count, 2)
+            limits = [
+                call.kwargs["json"]["options"]["num_predict"]
+                for call in session.post.call_args_list
+            ]
+            self.assertEqual(limits, [SPEECH_NUM_PREDICT, SPEECH_RETRY_NUM_PREDICT])
+
+        import asyncio
+        asyncio.run(run_test())
 
     def test_pending_agent_prompt_keeps_the_supervisor_conversational(self):
         prompt = speech_model_prompt(

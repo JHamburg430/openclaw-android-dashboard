@@ -44,6 +44,8 @@ SPEECH_MODEL_URL = "http://127.0.0.1:11434/api/chat"
 # within the sub-second warm-response budget on the local Ollama GPUs.
 SPEECH_MODEL = "qwen3.5:4b"
 SPEECH_MODEL_KEEP_ALIVE = "30m"
+SPEECH_NUM_PREDICT = 256
+SPEECH_RETRY_NUM_PREDICT = 512
 AGENT_SENTINEL = "[[OPENCLAW_AGENT]]"
 NEW_AGENT_SENTINEL = "[[OPENCLAW_NEW]]"
 SAY_SENTINEL = "[[SAY]]"
@@ -360,7 +362,7 @@ Resolve “this agent,” “that agent,” “it,” and similar follow-ups to 
 Use this catalog to answer capability questions quickly. If the user explicitly asks to use, configure, expand, or change a capability, choose `agent`. Do not claim an unavailable capability exists. Newly added agents and skills appear after the catalog refreshes.
 Interpret likely recognition mistakes using the conversation and session context. In this voice app, “five agent” or “five conversation model” means “live agent” or “live conversation model” unless John explicitly discusses the number five or five distinct agents; correct that known ASR error without asking and use the corrected word “live” in the acknowledgment. Do not silently replace any other uncertain proper noun; ask a short clarification instead.
 When John asks to make the live agent or Live Conversation model more capable, that is a complete actionable request: choose `agent` so the agent can review the conversation and current implementation. Do not ask which capabilities he means unless he explicitly presents alternatives requiring a choice.
-Never fabricate private, project, or agent progress. Keep `reply` short and natural for speech.
+Never fabricate private, project, or agent progress. Keep `reply` short and natural for speech. Complete every reply as a grammatical sentence; never end mid-sentence.
 Examples:
 User: Testing out the latest Live Conversation updates.
 Assistant: {{"route":"direct","reply":"I hear you. Go ahead with the test.","session_key":""}}
@@ -1304,19 +1306,52 @@ class LiveConversationService:
                 *self.prompt_history(),
                 {"role": "user", "content": text},
             ],
-            "options": {"temperature": 0, "num_predict": 80, "num_ctx": 16_384},
+            "options": {
+                "temperature": 0,
+                "num_predict": SPEECH_NUM_PREDICT,
+                "num_ctx": 16_384,
+            },
         }
         timeout = aiohttp.ClientTimeout(total=15)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(SPEECH_MODEL_URL, json=payload) as response:
-                    response.raise_for_status()
-                    result = await response.json()
+                result: dict[str, Any] = {}
+                for attempt, prediction_limit in enumerate(
+                    (SPEECH_NUM_PREDICT, SPEECH_RETRY_NUM_PREDICT), start=1
+                ):
+                    request_payload = {
+                        **payload,
+                        "options": {
+                            **payload["options"],
+                            "num_predict": prediction_limit,
+                        },
+                    }
+                    async with session.post(
+                        SPEECH_MODEL_URL, json=request_payload
+                    ) as response:
+                        response.raise_for_status()
+                        result = await response.json()
+                    eval_count = result.get("eval_count")
+                    output_limited = (
+                        result.get("done_reason") == "length"
+                        or isinstance(eval_count, int) and eval_count >= prediction_limit
+                    )
+                    if not output_limited:
+                        break
+                    LOGGER.warning(
+                        "speech_supervisor_output_limited attempt=%d output_tokens=%s "
+                        "num_predict=%d done_reason=%s",
+                        attempt, eval_count, prediction_limit,
+                        result.get("done_reason", "unknown"),
+                    )
+                else:
+                    raise ValueError("speech supervisor exceeded its output limit")
             LOGGER.info(
                 "speech_supervisor_complete prompt_tokens=%s output_tokens=%s "
-                "load_ms=%.0f prompt_ms=%.0f generation_ms=%.0f",
+                "done_reason=%s load_ms=%.0f prompt_ms=%.0f generation_ms=%.0f",
                 result.get("prompt_eval_count", "unknown"),
                 result.get("eval_count", "unknown"),
+                result.get("done_reason", "unknown"),
                 result.get("load_duration", 0) / 1_000_000,
                 result.get("prompt_eval_duration", 0) / 1_000_000,
                 result.get("eval_duration", 0) / 1_000_000,
