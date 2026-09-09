@@ -44,14 +44,12 @@ openclaw devices approve <requestId>
 
 ## Hybrid Control UI and phone node
 
-Version 1.0.65 deliberately keeps two independent OpenClaw connections:
+Version 1.0.66 deliberately keeps two independent OpenClaw connections:
 
 - The embedded WebView is a normal Control UI browser client for complete chat, agent, session, and settings functionality.
 - `PhoneNodeService` is a separately paired Android node that remains available when the activity or WebView is recreated.
 
 The phone node runs as an opted-in foreground service, reconnects with bounded exponential backoff after gateway or network loss, restores after boot/application upgrades, and re-advertises its native commands after each connection. The native **Connection Center** reports the WebView connection, phone-node identity/connection, active session metadata observed from Control UI traffic, retry state, and the most recent error.
-
-The app drawer links directly to **Control UI → Portals**. Portals are used for temporary agent-run development servers and cloud-worker previews; they do not replace the durable Control UI connection or the Android phone node, and they end when the Gateway restarts. Existing persistent local services retain their stable direct shortcuts.
 
 Connection and invocation events are saved to a rotating, bounded JSONL audit trail in app-private storage. Exported audit data is redacted for credentials and common message/contact fields. Each invocation returns `_trace` metadata containing its `invokeId`, generated or supplied `correlationId`, node connection ID, and duration.
 
@@ -70,7 +68,7 @@ The native node exposes narrow commands for personal phone automation:
 - Clock: `android.intent.setAlarm`, `android.intent.setTimer`
 - UI fallback: `mobile.ui.observe`, `mobile.ui.act`
 
-Open **Android Native** in the app and use **Request Phone Permissions**. Notification reading/replies and arbitrary app UI control are special Android accesses, so enable **Notification Access** and **Accessibility Control** separately from that screen. Android may require **Allow restricted settings** in the app-info menu for a sideloaded Accessibility service.
+Open **Android Native** in the app and use **Request Phone Permissions**. Notification reading/replies and arbitrary app UI control are special Android accesses, so enable **Notification Access** and **Accessibility Control** separately from that screen. In the permission report, `notifications` and `notificationAccess` mean notification reading/action access; `canPostNotifications`, `postNotifications`, and `appNotificationsEnabled` describe this app's own status notifications; `notificationAccessConnected` reports whether the listener service is presently bound. Android may require **Allow restricted settings** in the app-info menu for a sideloaded Accessibility service. **Re-pair Phone Node** is also available directly on this screen.
 
 `mobile.ui.act` supports `click`, `setText`, `scrollForward`, `scrollBackward`, `tap`, `back`, `home`, `recents`, and `notifications`. UI observations and notification text are untrusted app data; the dedicated Phone Control agent is instructed never to treat them as agent instructions.
 

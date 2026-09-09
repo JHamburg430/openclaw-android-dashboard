@@ -231,11 +231,17 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
     }
 
     private JSONObject permissions() throws Exception {
+        boolean postNotifications = Build.VERSION.SDK_INT < 33 || granted(Manifest.permission.POST_NOTIFICATIONS);
+        boolean appNotificationsEnabled = PhoneNotificationListenerService.areAppNotificationsEnabled(this);
+        boolean notificationAccess = PhoneNotificationListenerService.isAccessEnabled(this);
         return new JSONObject()
                 .put("recordAudio", granted(Manifest.permission.RECORD_AUDIO))
                 .put("camera", granted(Manifest.permission.CAMERA))
                 .put("bluetoothConnect", granted(Manifest.permission.BLUETOOTH_CONNECT))
-                .put("notifications", Build.VERSION.SDK_INT < 33 || granted(Manifest.permission.POST_NOTIFICATIONS))
+                .put("notifications", notificationAccess)
+                .put("canPostNotifications", postNotifications && appNotificationsEnabled)
+                .put("postNotifications", postNotifications)
+                .put("appNotificationsEnabled", appNotificationsEnabled)
                 .put("contacts", granted(Manifest.permission.READ_CONTACTS))
                 .put("contactsWrite", granted(Manifest.permission.WRITE_CONTACTS))
                 .put("calendarRead", granted(Manifest.permission.READ_CALENDAR))
@@ -244,7 +250,8 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
                 .put("smsRead", granted(Manifest.permission.READ_SMS))
                 .put("smsSend", granted(Manifest.permission.SEND_SMS))
                 .put("callPhone", granted(Manifest.permission.CALL_PHONE))
-                .put("notificationAccess", PhoneNotificationListenerService.isConnected())
+                .put("notificationAccess", notificationAccess)
+                .put("notificationAccessConnected", PhoneNotificationListenerService.isConnected())
                 .put("accessibilityControl", PhoneAccessibilityService.isConnected());
     }
 

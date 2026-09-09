@@ -69,7 +69,8 @@ final class AndroidCapabilityBroker {
                 .put("smsRead", granted(Manifest.permission.READ_SMS))
                 .put("smsSend", granted(Manifest.permission.SEND_SMS))
                 .put("callPhone", granted(Manifest.permission.CALL_PHONE))
-                .put("notificationAccess", PhoneNotificationListenerService.isConnected())
+                .put("notificationAccess", PhoneNotificationListenerService.isAccessEnabled(context))
+                .put("notificationAccessConnected", PhoneNotificationListenerService.isConnected())
                 .put("accessibilityControl", PhoneAccessibilityService.isConnected());
     }
 

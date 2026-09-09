@@ -7,6 +7,7 @@ const activity = read("app/src/main/java/ai/openclaw/dashboard/MainActivity.java
 const client = read("app/src/main/java/ai/openclaw/dashboard/OpenClawClient.java");
 const service = read("app/src/main/java/ai/openclaw/dashboard/PhoneNodeService.java");
 const audit = read("app/src/main/java/ai/openclaw/dashboard/ConnectionAuditLog.java");
+const notificationListener = read("app/src/main/java/ai/openclaw/dashboard/PhoneNotificationListenerService.java");
 
 assert.match(manifest, /android:name="\.PhoneNodeService"/);
 assert.match(manifest, /android:foregroundServiceType="connectedDevice"/);
@@ -25,8 +26,11 @@ assert.match(service, /onInvokeFinished/);
 assert.doesNotMatch(activity, /OpenClawClient nodeClient/);
 assert.match(activity, /bindPhoneNodeService/);
 assert.match(activity, /Connection Center/);
-assert.match(activity, /openControlUiPath\("portals"\)/);
+assert.doesNotMatch(activity, /appButton\("Portals"/);
+assert.match(activity, /<button onclick=\\"repairPhoneNode\(\)\\">Re-pair Phone Node<\/button>/);
+assert.match(activity, /notificationAccessConnected/);
 assert.match(activity, /traceSession\(message\)/);
+assert.match(notificationListener, /isAccessEnabled\(Context context\)/);
 
 assert.match(client, /CLIENT_VERSION = BuildConfig\.VERSION_NAME/);
 assert.match(client, /nodeConnectionId/);
@@ -37,4 +41,4 @@ for (const sensitive of ["token", "password", "secret", "body", "reply", "phone"
 }
 assert.match(audit, /MAX_BYTES = 1024L \* 1024L/);
 
-console.log("persistent phone node, portal access, correlation, and redacted audit are wired");
+console.log("persistent phone node, native re-pair, permission diagnostics, correlation, and redacted audit are wired");

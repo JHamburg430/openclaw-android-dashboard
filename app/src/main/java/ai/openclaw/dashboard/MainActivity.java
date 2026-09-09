@@ -591,16 +591,11 @@ public final class MainActivity extends Activity {
         row3.addView(appButton("Manuals RAG", v -> openLocalApp(8601)), new LinearLayout.LayoutParams(0, dp(46), 1));
         drawer.addView(row3);
 
-        LinearLayout row4 = appButtonRow();
-        row4.addView(appButton("Portals", v -> {
-            setAppsDrawerVisible(false);
-            openControlUiPath("portals");
-        }), new LinearLayout.LayoutParams(0, dp(46), 1));
-        row4.addView(appButton("Android Native", v -> {
+        Button androidNative = appButton("Android Native", v -> {
             setAppsDrawerVisible(false);
             openNativeToolsPage();
-        }), new LinearLayout.LayoutParams(0, dp(46), 1));
-        drawer.addView(row4);
+        });
+        drawer.addView(androidNative, new LinearLayout.LayoutParams(-1, dp(46)));
 
         Button close = button("Close");
         close.setOnClickListener(v -> setAppsDrawerVisible(false));
@@ -646,22 +641,6 @@ public final class MainActivity extends Activity {
         } catch (Exception e) {
             statusText.setText("Could not open app: " + e.getMessage());
             recordDiagnostic("app.open.failed", e.getMessage());
-        }
-    }
-
-    private void openControlUiPath(String path) {
-        try {
-            String base = buildDashboardUrl();
-            String normalized = path == null ? "" : path.replaceFirst("^/+", "");
-            String url = java.net.URI.create(base).resolve(normalized).toString();
-            webView.stopLoading();
-            webView.loadUrl(url);
-            setConnectedUiVisible(true);
-            statusText.setText("Opening Control UI /" + normalized);
-            recordDiagnostic("control_ui.open", url);
-        } catch (Exception error) {
-            statusText.setText("Could not open Control UI page: " + error.getMessage());
-            recordDiagnostic("control_ui.open.failed", error.getMessage());
         }
     }
 
@@ -911,9 +890,17 @@ public final class MainActivity extends Activity {
     private JSONObject nativeDeviceStatus() throws Exception {
         BatteryManager batteryManager = (BatteryManager) getSystemService(Context.BATTERY_SERVICE);
         int battery = batteryManager == null ? -1 : batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY);
+        boolean postNotifications = hasNotificationPermission();
+        boolean appNotificationsEnabled = PhoneNotificationListenerService.areAppNotificationsEnabled(this);
+        boolean notificationAccess = PhoneNotificationListenerService.isAccessEnabled(this);
         return nativeDeviceInfo()
                 .put("batteryPercent", battery >= 0 ? battery : JSONObject.NULL)
-                .put("notifications", hasNotificationPermission())
+                .put("notifications", notificationAccess)
+                .put("canPostNotifications", postNotifications && appNotificationsEnabled)
+                .put("postNotifications", postNotifications)
+                .put("appNotificationsEnabled", appNotificationsEnabled)
+                .put("notificationAccess", notificationAccess)
+                .put("notificationAccessConnected", PhoneNotificationListenerService.isConnected())
                 .put("microphone", hasRecordAudioPermission())
                 .put("bluetoothConnect", hasBluetoothConnectPermission())
                 .put("camera", hasCameraPermission())
@@ -921,11 +908,17 @@ public final class MainActivity extends Activity {
     }
 
     private JSONObject nativePermissions() throws Exception {
+        boolean postNotifications = hasNotificationPermission();
+        boolean appNotificationsEnabled = PhoneNotificationListenerService.areAppNotificationsEnabled(this);
+        boolean notificationAccess = PhoneNotificationListenerService.isAccessEnabled(this);
         return new JSONObject()
                 .put("recordAudio", hasRecordAudioPermission())
                 .put("camera", hasCameraPermission())
                 .put("bluetoothConnect", hasBluetoothConnectPermission())
-                .put("notifications", hasNotificationPermission())
+                .put("notifications", notificationAccess)
+                .put("canPostNotifications", postNotifications && appNotificationsEnabled)
+                .put("postNotifications", postNotifications)
+                .put("appNotificationsEnabled", appNotificationsEnabled)
                 .put("contacts", checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED)
                 .put("contactsWrite", checkSelfPermission(Manifest.permission.WRITE_CONTACTS) == PackageManager.PERMISSION_GRANTED)
                 .put("calendarRead", checkSelfPermission(Manifest.permission.READ_CALENDAR) == PackageManager.PERMISSION_GRANTED)
@@ -934,7 +927,8 @@ public final class MainActivity extends Activity {
                 .put("smsRead", checkSelfPermission(Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED)
                 .put("smsSend", checkSelfPermission(Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED)
                 .put("callPhone", checkSelfPermission(Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED)
-                .put("notificationAccess", PhoneNotificationListenerService.isConnected())
+                .put("notificationAccess", notificationAccess)
+                .put("notificationAccessConnected", PhoneNotificationListenerService.isConnected())
                 .put("accessibilityControl", PhoneAccessibilityService.isConnected())
                 .put("mediaAudio", Build.VERSION.SDK_INT < 33 || checkSelfPermission(Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED)
                 .put("mediaImages", Build.VERSION.SDK_INT < 33 || checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED)
@@ -1094,6 +1088,7 @@ public final class MainActivity extends Activity {
                         + "<button onclick=\"requestPhoneAccess()\">Request Phone Permissions</button>"
                         + "<button onclick=\"notificationAccess()\">Notification Access</button>"
                         + "<button onclick=\"accessibilityAccess()\">Accessibility Control</button>"
+                        + "<button onclick=\"repairPhoneNode()\">Re-pair Phone Node</button>"
                         + "<button onclick=\"appSettings()\">App Permission Settings</button>"
                         + "<button onclick=\"filePicker()\">File Picker</button>"
                         + "<button onclick=\"notifyTest()\">Test Notification</button>"
@@ -1112,6 +1107,7 @@ public final class MainActivity extends Activity {
                         + "function requestPhoneAccess(){log(parse(OpenClawNativeApp.requestPhoneAccess()));}"
                         + "function notificationAccess(){log(OpenClawNativeApp.openNotificationAccess());}"
                         + "function accessibilityAccess(){log(OpenClawNativeApp.openAccessibilityAccess());}"
+                        + "function repairPhoneNode(){log(OpenClawNativeApp.repairPhoneNode());}"
                         + "function appSettings(){log(OpenClawNativeApp.openAppSettings());}"
                         + "function filePicker(){log(OpenClawNativeApp.filePicker());}"
                         + "function notifyTest(){log(OpenClawNativeApp.notifyTest());}"
@@ -2035,7 +2031,6 @@ public final class MainActivity extends Activity {
 
     private static String classifyWebSurface(String url) {
         if (url == null || url.isEmpty()) return "none";
-        if (url.contains("/portals")) return "portal_catalog";
         if (url.contains(":" + LIVE_CONVERSATION_PORT)) return "live_conversation";
         if (url.contains("/android-native/")) return "android_native";
         try {
@@ -2233,6 +2228,12 @@ public final class MainActivity extends Activity {
             } catch (Exception e) {
                 return errorJson(e);
             }
+        }
+
+        @JavascriptInterface
+        public String repairPhoneNode() {
+            runOnUiThread(MainActivity.this::repairPhoneNode);
+            return "Stored phone-node authorization cleared. Reconnecting for gateway approval.";
         }
 
         @JavascriptInterface

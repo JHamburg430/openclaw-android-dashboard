@@ -1,12 +1,16 @@
 package ai.openclaw.dashboard;
 
 import android.app.Notification;
+import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.RemoteInput;
+import android.content.ComponentName;
+import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
 import android.service.notification.NotificationListenerService;
 import android.service.notification.StatusBarNotification;
+import android.provider.Settings;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -19,6 +23,24 @@ public final class PhoneNotificationListenerService extends NotificationListener
     @Override public void onDestroy() { if (instance == this) instance = null; super.onDestroy(); }
 
     static boolean isConnected() { return instance != null; }
+
+    static boolean isAccessEnabled(Context context) {
+        String enabled = Settings.Secure.getString(
+                context.getContentResolver(),
+                "enabled_notification_listeners");
+        if (enabled == null || enabled.isEmpty()) return false;
+        ComponentName expected = new ComponentName(context, PhoneNotificationListenerService.class);
+        for (String flattened : enabled.split(":")) {
+            ComponentName candidate = ComponentName.unflattenFromString(flattened);
+            if (expected.equals(candidate)) return true;
+        }
+        return false;
+    }
+
+    static boolean areAppNotificationsEnabled(Context context) {
+        NotificationManager manager = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+        return manager != null && manager.areNotificationsEnabled();
+    }
 
     static JSONObject list(int limit, String packageFilter) throws Exception {
         PhoneNotificationListenerService service = requireService();
