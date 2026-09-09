@@ -44,12 +44,14 @@ openclaw devices approve <requestId>
 
 ## Hybrid Control UI and phone node
 
-Version 1.0.66 deliberately keeps two independent OpenClaw connections:
+Version 1.0.67 deliberately keeps two independent OpenClaw connections:
 
 - The embedded WebView is a normal Control UI browser client for complete chat, agent, session, and settings functionality.
 - `PhoneNodeService` is a separately paired Android node that remains available when the activity or WebView is recreated.
 
 The phone node runs as an opted-in foreground service, reconnects with bounded exponential backoff after gateway or network loss, restores after boot/application upgrades, and re-advertises its native commands after each connection. The native **Connection Center** reports the WebView connection, phone-node identity/connection, active session metadata observed from Control UI traffic, retry state, and the most recent error.
+
+The custom node uses OpenClaw's canonical `openclaw-android` protocol client ID because Gateway client IDs are a closed protocol enum. It remains distinguishable from the stock app by its stable device identity, **John's S25 Ultra — Dashboard** display name, Dashboard product metadata, app version, and expanded command list.
 
 Connection and invocation events are saved to a rotating, bounded JSONL audit trail in app-private storage. Exported audit data is redacted for credentials and common message/contact fields. Each invocation returns `_trace` metadata containing its `invokeId`, generated or supplied `correlationId`, node connection ID, and duration.
 

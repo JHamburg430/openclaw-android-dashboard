@@ -1968,7 +1968,8 @@ public final class MainActivity extends Activity {
             if (!nodeId.isEmpty()) text.append("\n  node ").append(shortId(nodeId));
             String connectionId = state.optString("nodeConnectionId", "");
             if (!connectionId.isEmpty()) text.append(" · connection ").append(shortId(connectionId));
-            text.append("\n  client openclaw-android-dashboard/").append(state.optString("clientVersion", APP_VERSION_NAME));
+            text.append("\n  app OpenClaw Dashboard/").append(state.optString("clientVersion", APP_VERSION_NAME));
+            text.append(" · protocol ").append(state.optString("clientId", "openclaw-android"));
             int retry = state.optInt("nodeRetryAttempt", 0);
             if (retry > 0) text.append(" · retry ").append(retry);
             String sessionKey = state.optString("sessionKey", "");

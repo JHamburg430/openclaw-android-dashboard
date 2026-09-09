@@ -85,7 +85,8 @@ final class ConnectionAuditLog {
             result.put("nodeLastEventAt", prefs.getLong("trace.node.lastEventAt", 0L));
             result.put("nodeRetryAttempt", prefs.getInt("trace.node.retryAttempt", 0));
             result.put("nodeLastError", prefs.getString("trace.node.lastError", ""));
-            result.put("clientId", "openclaw-android-dashboard");
+            result.put("clientId", "openclaw-android");
+            result.put("clientProduct", "openclaw-android-dashboard");
             result.put("clientVersion", BuildConfig.VERSION_NAME);
         } catch (Exception ignored) {
         }

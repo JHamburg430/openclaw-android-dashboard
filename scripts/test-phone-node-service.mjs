@@ -33,6 +33,8 @@ assert.match(activity, /traceSession\(message\)/);
 assert.match(notificationListener, /isAccessEnabled\(Context context\)/);
 
 assert.match(client, /CLIENT_VERSION = BuildConfig\.VERSION_NAME/);
+assert.match(client, /CLIENT_ID = "openclaw-android"/);
+assert.doesNotMatch(client, /CLIENT_ID = "openclaw-android-dashboard"/);
 assert.match(client, /nodeConnectionId/);
 assert.match(client, /correlationId/);
 

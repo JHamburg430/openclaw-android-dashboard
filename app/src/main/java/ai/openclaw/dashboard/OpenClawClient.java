@@ -32,7 +32,9 @@ final class OpenClawClient {
         JSONObject handle(String command, JSONObject params) throws Exception;
     }
 
-    private static final String CLIENT_ID = "openclaw-android-dashboard";
+    // Gateway protocol client IDs are a closed enum. Product identity stays in
+    // displayName/capabilities; Android nodes must use the canonical wire ID.
+    private static final String CLIENT_ID = "openclaw-android";
     private static final String CLIENT_VERSION = BuildConfig.VERSION_NAME;
     private final OkHttpClient http = new OkHttpClient.Builder()
             .pingInterval(20, TimeUnit.SECONDS)
