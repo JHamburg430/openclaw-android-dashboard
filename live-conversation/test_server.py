@@ -1186,6 +1186,9 @@ class RoutingTests(unittest.TestCase):
         self.assertNotIn("if(awaitingResponse){candidateSpeechMs=0;return}", page)
         self.assertIn("interruptedWait?'while_awaiting_response':'ready'", page)
         self.assertIn("candidateSpeechMs>=speechRequiredMs", page)
+        self.assertIn("ONSET_PREROLL_MS=900", page)
+        self.assertIn("PREBUFFER_FRAMES=Math.ceil((START_CONFIRM_MS+ONSET_PREROLL_MS)/AUDIO_FRAME_MS)", page)
+        self.assertIn("while(pre.length>PREBUFFER_FRAMES)pre.shift()", page)
         self.assertIn("responseActive=true", page)
         self.assertIn("first_pcm_enqueued", page)
         self.assertIn("pcm_delivery_done", page)
@@ -1284,7 +1287,7 @@ class RoutingTests(unittest.TestCase):
     def test_playback_vad_rejects_echo_and_covers_native_tail(self):
         page = render_page()
         self.assertIn("const speechThreshold=responseActive?.025:.012", page)
-        self.assertIn("const speechRequiredMs=responseActive?200:300", page)
+        self.assertIn("const speechRequiredMs=responseActive?200:START_CONFIRM_MS", page)
         self.assertIn("responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500)", page)
         self.assertIn("report('barge_in','confirmed_user_speech')", page)
         self.assertIn("}send({type:'input_audio_buffer.speech_started'});send({type:'start'})", page)

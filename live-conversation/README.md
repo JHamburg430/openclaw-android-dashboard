@@ -9,7 +9,10 @@ in the Android Dashboard plus menu.
 2. Browser-side VAD requires 300 ms of near-field audio above a 0.012 RMS
    threshold before opening a turn, then commits it after 600 ms of silence.
    This rejects the lower-level television/road speech that the former 0.006
-   start gate treated as if it came from the person holding the phone.
+   start gate treated as if it came from the person holding the phone. A 900 ms
+   onset pre-roll is retained in addition to the 300 ms confirmation window,
+   so quiet initial words and consonants still reach transcription after the
+   stricter foreground-speech gate opens.
 3. Pipecat's persistent `faster-whisper` `small.en` service transcribes locally
    with CUDA `float16` beam search on GPU 0 and falls back to CPU `int8` if CUDA
    initialization fails. Five-candidate beam search and a small vocabulary hint

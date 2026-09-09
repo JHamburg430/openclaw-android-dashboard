@@ -112,6 +112,19 @@ function harness() {
 
 {
   const app = harness();
+  // A near-field sentence can begin quietly before a later vowel crosses the
+  // conservative start gate.  Preserve 900 ms before the 300 ms confirmation
+  // window so those first words reach ASR instead of starting mid-sentence.
+  app.run(0.007, 45);
+  app.run(0.030, 15);
+  const captured = app.sent.filter((message) => message.type === "audio");
+  assert.equal(app.count("start"), 1, "confirmed foreground speech starts a turn");
+  assert.equal(captured.length, 60, "the full 900 ms quiet onset and confirmation window are retained");
+  assert.equal(captured[0].audioBase64, pcm(0.007), "capture begins at the quiet sentence onset");
+}
+
+{
+  const app = harness();
   app.run(0.030, 14);
   app.run(0.001, 10);
   assert.equal(app.count("start"), 0, "a sub-300 ms noise spike is rejected");
