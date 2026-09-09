@@ -14,6 +14,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import secrets
 import struct
 import time
 from typing import Any
@@ -632,6 +633,26 @@ def normalize_spoken_text(text: str) -> str:
         lambda match: " at " + replace_time(match),
         spoken,
     )
+    # Session keys, UUIDs, epoch values, and nanosecond counters are useful on
+    # screen but make local TTS recite long, meaningless digit sequences. Keep
+    # the original display text and replace only the speech rendering.
+    spoken = re.sub(
+        r"\bagent:[a-z0-9._-]+(?::[a-z0-9._-]+)+",
+        "the agent session",
+        spoken,
+        flags=re.IGNORECASE,
+    )
+    spoken = re.sub(
+        r"(?<![a-f0-9])[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}(?![a-f0-9])",
+        "the identifier",
+        spoken,
+        flags=re.IGNORECASE,
+    )
+
+    def replace_long_number(match: re.Match[str]) -> str:
+        return "the numeric identifier" if len(match.group(0).replace(",", "")) >= 10 else match.group(0)
+
+    spoken = re.sub(r"(?<![\w.])\d[\d,]*\d(?![\w.])", replace_long_number, spoken)
     spoken = re.sub(r"(?<!\w)(\d[\d,]*(?:\.\d+)?)\s*/\s*(\d[\d,]*(?:\.\d+)?)(?!\w)", r"\1 out of \2", spoken)
     spoken = re.sub(r"(\d(?:[\d,]*\d)?(?:\.\d+)?)\s*%", r"\1 percent", spoken)
     spoken = re.sub(r"\bv(?=\d+(?:\.\d+)+)", "version ", spoken, flags=re.IGNORECASE)
@@ -894,7 +915,10 @@ class LiveConversationService:
             "spawn", "start", "launch", "create",
         }
         slug = "-".join(word for word in words if word not in stop_words)[:48].strip("-")
-        return f"agent:main:live-conversation-{slug or 'task'}-{time.monotonic_ns()}"
+        # A monotonic nanosecond suffix was a 15-to-19 digit number which could
+        # leak into status speech and be dictated in full. A 48-bit opaque token
+        # remains collision-resistant without looking like a giant cardinal.
+        return f"agent:main:live-conversation-{slug or 'task'}-{secrets.token_hex(6)}"
 
     def register_agent_session(self, session_key: str, request: str) -> None:
         self.recent_agent_sessions = deque(

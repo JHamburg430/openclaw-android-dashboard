@@ -255,6 +255,16 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(second.latest_agent_session()["session_key"], key)
             self.assertIn("fix messages being cut off", second.voice_session_summary())
 
+    def test_voice_session_keys_do_not_use_long_numeric_suffixes(self):
+        service = LiveConversationService("agent:main:live-conversation", 1.15)
+
+        first = service.allocate_agent_session_key("launch an agent to inspect speech")
+        second = service.allocate_agent_session_key("launch an agent to inspect speech")
+
+        self.assertNotEqual(first, second)
+        self.assertRegex(first, r"^agent:main:live-conversation-inspect-speech-[a-f0-9]{12}$")
+        self.assertNotRegex(first, r"\d{10,}")
+
     def test_legacy_voice_session_is_recovered_from_history_and_gateway(self):
         service = LiveConversationService("agent:main:live-conversation", 1.15)
         service.remember("user", "Spawn a subagent to fix message cutoff.")
@@ -1242,6 +1252,24 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(
             normalize_spoken_text("Runs 9/4/26; published 2026-09-04T15:07:09Z."),
             "Runs September fourth, twenty twenty-six; published September fourth, twenty twenty-six at 3 oh seven P M and nine seconds.",
+        )
+
+    def test_machine_identifiers_are_not_read_as_long_numbers(self):
+        text = (
+            "Session agent:main:live-conversation-audio-459321222249681 finished at "
+            "timestamp 1788986623228 with run 39262386-1bb6-4571-98e1-13a30047ddb8."
+        )
+
+        self.assertEqual(
+            normalize_spoken_text(text),
+            "Session the agent session finished at timestamp the numeric identifier "
+            "with run the identifier.",
+        )
+
+    def test_normal_sized_numbers_remain_exact_in_speech(self):
+        self.assertEqual(
+            normalize_spoken_text("Version 2026.8.2 took 300 ms and passed 294/299 checks."),
+            "Version 2026 point 8 point 2 took 300 milliseconds and passed 294 out of 299 checks.",
         )
 
     def test_named_dates_and_older_years_are_spoken_naturally(self):
