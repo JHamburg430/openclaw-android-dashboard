@@ -10,9 +10,11 @@ import android.app.role.RoleManager;
 import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.ServiceConnection;
 import android.content.pm.ResolveInfo;
 import android.content.pm.PackageManager;
 import android.content.SharedPreferences;
@@ -33,6 +35,7 @@ import android.net.Uri;
 import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.IBinder;
 import android.text.InputType;
 import android.util.Log;
 import android.util.Base64;
@@ -77,6 +80,7 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.text.SimpleDateFormat;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -97,8 +101,8 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_PHONE_CAPABILITIES = 2007;
     public static final String ACTION_JARVIS_WAKE = "ai.openclaw.dashboard.action.JARVIS_WAKE";
     private static final String TAG = "OpenClawDashboard";
-    private static final int APP_VERSION_CODE = 63;
-    private static final String APP_VERSION_NAME = "1.0.63";
+    private static final int APP_VERSION_CODE = BuildConfig.VERSION_CODE;
+    private static final String APP_VERSION_NAME = BuildConfig.VERSION_NAME;
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final int LIVE_CONVERSATION_PORT = 8790;
@@ -120,9 +124,13 @@ public final class MainActivity extends Activity {
     private final SimpleDateFormat diagnosticsTimeFormat = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
     private final NativeAudioBridge nativeAudioBridge = new NativeAudioBridge();
     private final NativeAppBridge nativeAppBridge = new NativeAppBridge();
+    private final PhoneNodeService.ActivityCommandHandler nodeCommandHandler = this::handleNativeNodeCommand;
+    private final PhoneNodeService.StateListener nodeStateListener = this::renderConnectionCenter;
     private AndroidCapabilityBroker capabilityBroker;
+    private ConnectionAuditLog connectionAudit;
     private SharedPreferences prefs;
-    private OpenClawClient nodeClient;
+    private PhoneNodeService phoneNodeService;
+    private boolean phoneNodeBound;
     private PermissionRequest pendingPermissionRequest;
     private ValueCallback<Uri[]> pendingFilePathCallback;
 
@@ -134,6 +142,7 @@ public final class MainActivity extends Activity {
     private TextView hintText;
     private TextView nodeStatusText;
     private TextView diagnosticsText;
+    private TextView connectionCenterText;
     private LinearLayout chromeContainer;
     private LinearLayout topActions;
     private LinearLayout settingsPanel;
@@ -153,6 +162,21 @@ public final class MainActivity extends Activity {
     private boolean appsDrawerVisible = false;
     private int statusBarTopInset = 0;
     private boolean screenReceiverRegistered = false;
+    private final ServiceConnection phoneNodeConnection = new ServiceConnection() {
+        @Override public void onServiceConnected(ComponentName name, IBinder service) {
+            phoneNodeService = ((PhoneNodeService.LocalBinder) service).getService();
+            phoneNodeBound = true;
+            phoneNodeService.setActivityCommandHandler(nodeCommandHandler);
+            phoneNodeService.setStateListener(nodeStateListener);
+            renderConnectionCenter(phoneNodeService.snapshot());
+        }
+
+        @Override public void onServiceDisconnected(ComponentName name) {
+            phoneNodeBound = false;
+            phoneNodeService = null;
+            renderConnectionCenter(connectionAudit.connectionSnapshot());
+        }
+    };
     private final BroadcastReceiver screenOffReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
             if (Intent.ACTION_SCREEN_OFF.equals(intent.getAction())) stopLiveConversationForLock();
@@ -163,12 +187,14 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        connectionAudit = new ConnectionAuditLog(this);
         capabilityBroker = new AndroidCapabilityBroker(this);
         createNotificationChannel();
         configureSystemBars();
         buildUi();
         loadPrefs();
-        nodeClient = new OpenClawClient(new IdentityStore(this), new DashboardNodeListener(), this::handleNativeNodeCommand);
+        bindPhoneNodeService();
+        startPhoneNodeServiceIfConfigured();
         ensureNotificationPermission();
         registerScreenOffReceiver();
         boolean jarvisLaunch = getIntent() != null && ACTION_JARVIS_WAKE.equals(getIntent().getAction());
@@ -211,9 +237,14 @@ public final class MainActivity extends Activity {
             webView = null;
         }
         nativeAudioBridge.shutdown();
-        if (nodeClient != null) {
-            nodeClient.disconnect();
-            nodeClient = null;
+        if (phoneNodeBound) {
+            if (phoneNodeService != null) {
+                phoneNodeService.clearActivityCommandHandler(nodeCommandHandler);
+                phoneNodeService.clearStateListener(nodeStateListener);
+            }
+            unbindService(phoneNodeConnection);
+            phoneNodeBound = false;
+            phoneNodeService = null;
         }
         super.onDestroy();
     }
@@ -293,6 +324,31 @@ public final class MainActivity extends Activity {
         nodeStatusText.setPadding(dp(10), dp(8), dp(10), dp(8));
         nodeStatusText.setBackgroundColor(Color.rgb(10, 14, 20));
         controls.addView(nodeStatusText);
+
+        controls.addView(label("Connection Center"));
+        connectionCenterText = text("Loading browser, node, and session state…", 12, COLOR_TEXT_SECONDARY, false);
+        connectionCenterText.setTextIsSelectable(true);
+        connectionCenterText.setPadding(dp(10), dp(8), dp(10), dp(8));
+        connectionCenterText.setBackgroundColor(Color.rgb(10, 14, 20));
+        controls.addView(connectionCenterText);
+        LinearLayout connectionActions = new LinearLayout(this);
+        connectionActions.setOrientation(LinearLayout.HORIZONTAL);
+        connectionActions.setGravity(Gravity.CENTER_VERTICAL);
+        Button refreshConnections = button("Refresh");
+        Button copyConnectionAudit = button("Copy Audit");
+        Button clearConnectionAudit = button("Clear Audit");
+        connectionActions.addView(refreshConnections, new LinearLayout.LayoutParams(0, dp(42), 1));
+        connectionActions.addView(copyConnectionAudit, new LinearLayout.LayoutParams(0, dp(42), 1));
+        connectionActions.addView(clearConnectionAudit, new LinearLayout.LayoutParams(0, dp(42), 1));
+        controls.addView(connectionActions);
+        LinearLayout nodeLifecycleActions = new LinearLayout(this);
+        nodeLifecycleActions.setOrientation(LinearLayout.HORIZONTAL);
+        nodeLifecycleActions.setGravity(Gravity.CENTER_VERTICAL);
+        Button stopPhoneNode = button("Stop Phone Node");
+        Button repairPhoneNode = button("Re-pair Phone Node");
+        nodeLifecycleActions.addView(stopPhoneNode, new LinearLayout.LayoutParams(0, dp(42), 1));
+        nodeLifecycleActions.addView(repairPhoneNode, new LinearLayout.LayoutParams(0, dp(42), 1));
+        controls.addView(nodeLifecycleActions);
 
         LinearLayout appActions = new LinearLayout(this);
         appActions.setOrientation(LinearLayout.HORIZONTAL);
@@ -409,6 +465,7 @@ public final class MainActivity extends Activity {
 
             @Override
             public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                updateWebViewTrace("loading", url, "");
                 recordDiagnostic("page.started", url);
                 Log.d(TAG, "page started " + url);
                 setConnectedUiVisible(false);
@@ -417,6 +474,7 @@ public final class MainActivity extends Activity {
 
             @Override
             public void onPageFinished(WebView view, String url) {
+                updateWebViewTrace("loaded", url, "");
                 recordDiagnostic("page.finished", url);
                 injectRuntimeScripts(view, "page_finished");
                 Log.d(TAG, "page finished " + url);
@@ -427,6 +485,7 @@ public final class MainActivity extends Activity {
             public void onReceivedError(WebView view, android.webkit.WebResourceRequest request, android.webkit.WebResourceError error) {
                 if (request.isForMainFrame()) {
                     String description = error == null ? "unknown error" : String.valueOf(error.getDescription());
+                    updateWebViewTrace("error", String.valueOf(request.getUrl()), description);
                     recordDiagnostic("page.error", description);
                     Log.e(TAG, "page error " + request.getUrl() + " " + description);
                     setConnectedUiVisible(false);
@@ -438,6 +497,7 @@ public final class MainActivity extends Activity {
             public void onReceivedHttpError(WebView view, android.webkit.WebResourceRequest request, android.webkit.WebResourceResponse errorResponse) {
                 if (request.isForMainFrame()) {
                     int statusCode = errorResponse == null ? -1 : errorResponse.getStatusCode();
+                    updateWebViewTrace("http_error", String.valueOf(request.getUrl()), "HTTP " + statusCode);
                     recordDiagnostic("page.http_error", String.valueOf(statusCode));
                     Log.e(TAG, "http error " + request.getUrl() + " " + statusCode);
                     setConnectedUiVisible(false);
@@ -477,6 +537,11 @@ public final class MainActivity extends Activity {
         openButton.setOnClickListener(v -> openDashboard());
         reloadButton.setOnClickListener(v -> webView.reload());
         connectNodeButton.setOnClickListener(v -> connectDashboardNode());
+        refreshConnections.setOnClickListener(v -> refreshConnectionCenter());
+        copyConnectionAudit.setOnClickListener(v -> copyConnectionAudit());
+        clearConnectionAudit.setOnClickListener(v -> clearConnectionAudit());
+        stopPhoneNode.setOnClickListener(v -> stopPhoneNode());
+        repairPhoneNode.setOnClickListener(v -> repairPhoneNode());
         chromeToggleButton.setOnClickListener(v -> setChromeExpanded(!chromeExpanded));
         overlayToggleButton.setOnClickListener(v -> setAppsDrawerVisible(!appsDrawerVisible));
         appsButton.setOnClickListener(v -> setAppsDrawerVisible(true));
@@ -527,6 +592,10 @@ public final class MainActivity extends Activity {
         drawer.addView(row3);
 
         LinearLayout row4 = appButtonRow();
+        row4.addView(appButton("Portals", v -> {
+            setAppsDrawerVisible(false);
+            openControlUiPath("portals");
+        }), new LinearLayout.LayoutParams(0, dp(46), 1));
         row4.addView(appButton("Android Native", v -> {
             setAppsDrawerVisible(false);
             openNativeToolsPage();
@@ -577,6 +646,22 @@ public final class MainActivity extends Activity {
         } catch (Exception e) {
             statusText.setText("Could not open app: " + e.getMessage());
             recordDiagnostic("app.open.failed", e.getMessage());
+        }
+    }
+
+    private void openControlUiPath(String path) {
+        try {
+            String base = buildDashboardUrl();
+            String normalized = path == null ? "" : path.replaceFirst("^/+", "");
+            String url = java.net.URI.create(base).resolve(normalized).toString();
+            webView.stopLoading();
+            webView.loadUrl(url);
+            setConnectedUiVisible(true);
+            statusText.setText("Opening Control UI /" + normalized);
+            recordDiagnostic("control_ui.open", url);
+        } catch (Exception error) {
+            statusText.setText("Could not open Control UI page: " + error.getMessage());
+            recordDiagnostic("control_ui.open.failed", error.getMessage());
         }
     }
 
@@ -729,23 +814,32 @@ public final class MainActivity extends Activity {
     }
 
     private void connectDashboardNode() {
-        if (nodeClient == null) {
-            nodeClient = new OpenClawClient(new IdentityStore(this), new DashboardNodeListener(), this::handleNativeNodeCommand);
-        }
         try {
             savePrefs();
-            String gatewayWsUrl = toGatewayWebSocketUrl(value(urlInput));
+            toGatewayWebSocketUrl(value(urlInput));
             nodeStatusText.setText("Connecting custom dashboard node...");
-            nodeClient.connect(new OpenClawClient.Config(
-                    gatewayWsUrl,
-                    storedBootstrapToken(),
-                    value(tokenInput),
-                    value(passwordInput),
-                    "OpenClaw Dashboard " + Build.MODEL));
+            Intent service = new Intent(this, PhoneNodeService.class).setAction(PhoneNodeService.ACTION_RECONNECT);
+            startForegroundService(service);
+            if (!phoneNodeBound) bindPhoneNodeService();
+            connectionAudit.record("node", "connect_requested", new JSONObject()
+                    .put("source", "activity")
+                    .put("gateway", buildDashboardUrl()));
         } catch (Exception e) {
             nodeStatusText.setText("Node connect failed: " + e.getMessage());
             recordDiagnostic("node.connect.failed", e.getMessage());
         }
+    }
+
+    private void bindPhoneNodeService() {
+        if (phoneNodeBound) return;
+        bindService(new Intent(this, PhoneNodeService.class), phoneNodeConnection, Context.BIND_AUTO_CREATE);
+    }
+
+    private void startPhoneNodeServiceIfConfigured() {
+        String rawUrl = prefs.getString("url", "");
+        if (rawUrl == null || rawUrl.trim().isEmpty()) return;
+        Intent service = new Intent(this, PhoneNodeService.class).setAction(PhoneNodeService.ACTION_START);
+        startForegroundService(service);
     }
 
     private JSONObject handleNativeNodeCommand(String command, JSONObject params) throws Exception {
@@ -1070,6 +1164,8 @@ public final class MainActivity extends Activity {
         webView.restoreState(savedInstanceState);
         String restoredUrl = webView.getUrl();
         if (restoredUrl == null || restoredUrl.trim().isEmpty()) return false;
+        updateWebViewTrace("restored", restoredUrl, "");
+        startPhoneNodeServiceIfConfigured();
         recordDiagnostic("webview.restored", restoredUrl);
         setConnectedUiVisible(true);
         return true;
@@ -1613,6 +1709,7 @@ public final class MainActivity extends Activity {
                 + "var relayTextSequence=0;"
                 + "function parse(data){if(typeof data!=='string')return null;try{return JSON.parse(data);}catch(_){return null;}}"
                 + "function firstString(){for(var i=0;i<arguments.length;i++){var value=arguments[i];if(typeof value==='string'&&value.trim())return value.trim();}return '';}"
+                + "function traceSession(message){if(!message||typeof message!=='object')return;var found={};var stack=[message],seen=[],steps=0;while(stack.length&&steps++<80){var value=stack.pop();if(!value||typeof value!=='object'||seen.indexOf(value)>=0)continue;seen.push(value);var keys=Object.keys(value);for(var i=0;i<keys.length;i++){var key=keys[i],child=value[key];if((key==='sessionKey'||key==='sessionId'||key==='agentId')&&typeof child==='string'&&child.trim())found[key]=child.trim();else if((key==='title'||key==='displayName')&&typeof child==='string'&&child.trim()&&!found.title)found.title=child.trim();else if(child&&typeof child==='object')stack.push(child);}}if(found.sessionKey||found.sessionId){diag('session.context',found);}}"
                 + "function audioBase64(payload){if(!payload||typeof payload!=='object')return '';var nested=payload.payload&&typeof payload.payload==='object'?payload.payload:{};var audio=payload.audio&&typeof payload.audio==='object'?payload.audio:{};var value=firstString(payload.audioBase64,payload.base64,payload.delta,payload.audio,nested.audioBase64,nested.base64,nested.delta,audio.audioBase64,audio.base64,audio.delta,audio.data);if(value.indexOf('base64,')>=0)value=value.substring(value.indexOf('base64,')+7);return value;}"
                 + "function audioSampleRate(payload){if(!payload||typeof payload!=='object')return 24000;var nested=payload.payload&&typeof payload.payload==='object'?payload.payload:{};var audio=payload.audio&&typeof payload.audio==='object'?payload.audio:{};return payload.sampleRate||payload.sampleRateHz||nested.sampleRate||nested.sampleRateHz||audio.sampleRate||audio.sampleRateHz||24000;}"
                 + "function relayText(payload){if(!payload||typeof payload!=='object')return '';var nested=payload.payload&&typeof payload.payload==='object'?payload.payload:{};var response=payload.response&&typeof payload.response==='object'?payload.response:{};var output=payload.output&&typeof payload.output==='object'?payload.output:{};return firstString(payload.text,payload.transcript,payload.message,payload.delta,nested.text,nested.transcript,nested.message,nested.delta,response.text,response.output_text,output.text,output.transcript);}"
@@ -1661,11 +1758,12 @@ public final class MainActivity extends Activity {
                 + "}"
                 + "}"
                 + "function patchSocket(socket){"
-                + "try{socket.addEventListener('message',function(event){if(handleRelayMessage(event&&event.data)===true){try{event.stopImmediatePropagation&&event.stopImmediatePropagation();}catch(_){}}});}catch(_){ }"
+                + "try{socket.addEventListener('message',function(event){traceSession(parse(event&&event.data));if(handleRelayMessage(event&&event.data)===true){try{event.stopImmediatePropagation&&event.stopImmediatePropagation();}catch(_){}}});}catch(_){ }"
                 + "var originalSend=socket.send;"
                 + "socket.send=function(data){"
                 + "try{"
                 + "var message=parse(data);"
+                + "traceSession(message);"
                 + "if(message&&message.type==='req'&&message.method==='talk.client.create'){"
                 + "message.method='talk.session.create';"
                 + "message.params=cleanGatewayRelayParams(message.params);"
@@ -1805,6 +1903,149 @@ public final class MainActivity extends Activity {
         return "";
     }
 
+    private void updateWebViewTrace(String state, String url, String error) {
+        String safeUrl = url == null ? "" : url;
+        int query = safeUrl.indexOf('?');
+        if (query >= 0) safeUrl = safeUrl.substring(0, query);
+        SharedPreferences.Editor webTrace = prefs.edit()
+                .putString("trace.webview.state", state == null ? "unknown" : state)
+                .putString("trace.webview.surface", classifyWebSurface(safeUrl))
+                .putString("trace.webview.url", safeUrl)
+                .putLong("trace.webview.updatedAt", System.currentTimeMillis())
+                .putString("trace.webview.lastError", error == null ? "" : error);
+        String webViewConnectionId = prefs.getString("trace.webview.connectionId", "");
+        if ("loading".equals(state) || webViewConnectionId.isEmpty()) {
+            webViewConnectionId = UUID.randomUUID().toString();
+            webTrace.putString("trace.webview.connectionId", webViewConnectionId);
+        }
+        webTrace.apply();
+        JSONObject details = new JSONObject();
+        try {
+            details.put("url", safeUrl);
+            details.put("error", error == null ? "" : error);
+        } catch (Exception ignored) { }
+        connectionAudit.record("webview", state, details);
+        refreshConnectionCenter();
+    }
+
+    private void updateSessionTrace(String payload) {
+        try {
+            JSONObject session = new JSONObject(payload == null ? "{}" : payload);
+            String oldSignature = prefs.getString("trace.session.signature", "");
+            String newSignature = session.optString("sessionKey", prefs.getString("trace.session.key", "")) + "|"
+                    + session.optString("sessionId", prefs.getString("trace.session.id", "")) + "|"
+                    + session.optString("title", prefs.getString("trace.session.title", "")) + "|"
+                    + session.optString("agentId", prefs.getString("trace.session.agentId", ""));
+            if (newSignature.equals(oldSignature)) return;
+            SharedPreferences.Editor edit = prefs.edit();
+            if (session.has("sessionKey")) edit.putString("trace.session.key", session.optString("sessionKey", ""));
+            if (session.has("sessionId")) edit.putString("trace.session.id", session.optString("sessionId", ""));
+            if (session.has("title")) edit.putString("trace.session.title", session.optString("title", ""));
+            if (session.has("agentId")) edit.putString("trace.session.agentId", session.optString("agentId", ""));
+            edit.putString("trace.session.signature", newSignature);
+            edit.putLong("trace.session.updatedAt", System.currentTimeMillis());
+            edit.apply();
+            connectionAudit.record("session", "context_observed", session);
+            refreshConnectionCenter();
+        } catch (Exception error) {
+            recordDiagnostic("session.trace.error", error.getMessage());
+        }
+    }
+
+    private void refreshConnectionCenter() {
+        JSONObject snapshot = phoneNodeService == null ? connectionAudit.connectionSnapshot() : phoneNodeService.snapshot();
+        renderConnectionCenter(snapshot);
+    }
+
+    private void renderConnectionCenter(JSONObject state) {
+        if (connectionCenterText == null || state == null) return;
+        runOnUiThread(() -> {
+            StringBuilder text = new StringBuilder();
+            text.append("Control UI: ").append(state.optString("webViewState", "unknown"));
+            text.append(" · ").append(state.optString("webViewSurface", "unknown"));
+            String webConnectionId = state.optString("webViewConnectionId", "");
+            if (!webConnectionId.isEmpty()) text.append(" · connection ").append(shortId(webConnectionId));
+            String webUrl = state.optString("webViewUrl", "");
+            if (!webUrl.isEmpty()) text.append("\n  ").append(webUrl);
+            text.append("\nPhone node: ").append(state.optString("nodeState", "unknown"));
+            String nodeId = state.optString("nodeId", "");
+            if (!nodeId.isEmpty()) text.append("\n  node ").append(shortId(nodeId));
+            String connectionId = state.optString("nodeConnectionId", "");
+            if (!connectionId.isEmpty()) text.append(" · connection ").append(shortId(connectionId));
+            text.append("\n  client openclaw-android-dashboard/").append(state.optString("clientVersion", APP_VERSION_NAME));
+            int retry = state.optInt("nodeRetryAttempt", 0);
+            if (retry > 0) text.append(" · retry ").append(retry);
+            String sessionKey = state.optString("sessionKey", "");
+            text.append("\nSession: ").append(sessionKey.isEmpty() ? "not observed yet" : sessionKey);
+            String sessionId = state.optString("sessionId", "");
+            if (!sessionId.isEmpty()) text.append("\n  id ").append(shortId(sessionId));
+            String title = state.optString("sessionTitle", "");
+            if (!title.isEmpty()) text.append(" · ").append(title);
+            String agentId = state.optString("agentId", "");
+            if (!agentId.isEmpty()) text.append(" · agent ").append(agentId);
+            String lastError = state.optString("nodeLastError", "");
+            if (!lastError.isEmpty()) text.append("\nLast node error: ").append(lastError);
+            connectionCenterText.setText(text.toString());
+            if (nodeStatusText != null) nodeStatusText.setText("Phone node: " + state.optString("nodeState", "unknown"));
+        });
+    }
+
+    private void copyConnectionAudit() {
+        try {
+            JSONObject export = new JSONObject()
+                    .put("snapshot", phoneNodeService == null ? connectionAudit.connectionSnapshot() : phoneNodeService.snapshot())
+                    .put("events", phoneNodeService == null ? connectionAudit.recent(200) : phoneNodeService.recentAudit(200));
+            ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (clipboard != null) clipboard.setPrimaryClip(ClipData.newPlainText("OpenClaw connection audit", export.toString(2)));
+            statusText.setText("Redacted connection audit copied.");
+        } catch (Exception error) {
+            statusText.setText("Could not copy connection audit: " + error.getMessage());
+        }
+    }
+
+    private void clearConnectionAudit() {
+        if (phoneNodeService == null) connectionAudit.clear();
+        else phoneNodeService.clearAudit();
+        statusText.setText("Connection audit cleared.");
+        refreshConnectionCenter();
+    }
+
+    private void stopPhoneNode() {
+        startService(new Intent(this, PhoneNodeService.class).setAction(PhoneNodeService.ACTION_STOP));
+        statusText.setText("Phone node stopped. The Control UI remains available.");
+        connectionAudit.record("node", "stop_requested", new JSONObject());
+    }
+
+    private void repairPhoneNode() {
+        new IdentityStore(this).clearDeviceToken();
+        prefs.edit()
+                .remove("trace.node.lastError")
+                .remove("trace.node.connectionId")
+                .putString("trace.node.state", "pairing_required")
+                .apply();
+        connectionAudit.record("node", "repair_requested", new JSONObject());
+        connectDashboardNode();
+        statusText.setText("Stored node authorization cleared. Approve the stable dashboard node when pairing appears.");
+    }
+
+    private static String shortId(String value) {
+        if (value == null || value.length() <= 12) return value == null ? "" : value;
+        return value.substring(0, 8) + "…" + value.substring(value.length() - 4);
+    }
+
+    private static String classifyWebSurface(String url) {
+        if (url == null || url.isEmpty()) return "none";
+        if (url.contains("/portals")) return "portal_catalog";
+        if (url.contains(":" + LIVE_CONVERSATION_PORT)) return "live_conversation";
+        if (url.contains("/android-native/")) return "android_native";
+        try {
+            java.net.URI uri = java.net.URI.create(url);
+            int port = uri.getPort();
+            if (port > 0 && port != 18789 && port != 443 && port != 80) return "local_app";
+        } catch (Exception ignored) { }
+        return "control_ui";
+    }
+
     private void recordDiagnostic(String kind, String message) {
         String safeMessage = message == null ? "" : message;
         String line = diagnosticsTimeFormat.format(new Date()) + "  " + kind + "  " + safeMessage;
@@ -1904,6 +2145,7 @@ public final class MainActivity extends Activity {
     private final class DiagnosticsBridge {
         @JavascriptInterface
         public void emit(String kind, String payload) {
+            if ("session.context".equals(kind)) updateSessionTrace(payload);
             recordDiagnostic("js." + kind, payload);
         }
     }
@@ -2955,41 +3197,4 @@ public final class MainActivity extends Activity {
         return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
-    private final class DashboardNodeListener implements OpenClawClient.Listener {
-        @Override
-        public void onStatus(String status) {
-            runOnUiThread(() -> {
-                if (nodeStatusText != null) nodeStatusText.setText(status);
-                recordDiagnostic("node.status", status);
-            });
-        }
-
-        @Override
-        public void onConnected(JSONObject hello) {
-            runOnUiThread(() -> {
-                if (nodeStatusText != null) {
-                    nodeStatusText.setText("Custom dashboard node connected. Approve pairing if the gateway requested it.");
-                }
-                recordDiagnostic("node.connected", hello == null ? "{}" : hello.toString());
-            });
-        }
-
-        @Override
-        public void onDashboard(JSONObject dashboard) {
-            recordDiagnostic("node.dashboard", dashboard == null ? "{}" : dashboard.toString());
-        }
-
-        @Override
-        public void onLog(String message) {
-            recordDiagnostic("node.log", message);
-        }
-
-        @Override
-        public void onError(String message) {
-            runOnUiThread(() -> {
-                if (nodeStatusText != null) nodeStatusText.setText("Node: " + message);
-                recordDiagnostic("node.error", message);
-            });
-        }
-    }
 }

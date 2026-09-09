@@ -23,6 +23,9 @@ final class OpenClawClient {
         void onDashboard(JSONObject dashboard);
         void onLog(String message);
         void onError(String message);
+        default void onDisconnected(String reason) { }
+        default void onInvokeStarted(String invokeId, String correlationId, String command, JSONObject params) { }
+        default void onInvokeFinished(String invokeId, String correlationId, String command, boolean ok, long durationMs, JSONObject result) { }
     }
 
     interface CommandHandler {
@@ -30,7 +33,7 @@ final class OpenClawClient {
     }
 
     private static final String CLIENT_ID = "openclaw-android-dashboard";
-    private static final String CLIENT_VERSION = "1.0.44";
+    private static final String CLIENT_VERSION = BuildConfig.VERSION_NAME;
     private final OkHttpClient http = new OkHttpClient.Builder()
             .pingInterval(20, TimeUnit.SECONDS)
             .connectTimeout(10, TimeUnit.SECONDS)
@@ -44,6 +47,8 @@ final class OpenClawClient {
     private WebSocket socket;
     private Config config;
     private IdentityStore.Identity identity;
+    private volatile boolean connected;
+    private volatile String connectionId = "";
 
     OpenClawClient(IdentityStore identityStore, Listener listener, CommandHandler commandHandler) {
         this.identityStore = identityStore;
@@ -68,27 +73,49 @@ final class OpenClawClient {
                 }
 
                 @Override public void onClosed(WebSocket webSocket, int code, String reason) {
-                    listener.onStatus("Disconnected: " + code + " " + reason);
+                    synchronized (OpenClawClient.this) {
+                        if (socket != webSocket) return;
+                        socket = null;
+                        connected = false;
+                    }
+                    String detail = code + " " + reason;
+                    listener.onStatus("Disconnected: " + detail);
+                    listener.onDisconnected(detail);
                 }
 
                 @Override public void onFailure(WebSocket webSocket, Throwable t, Response response) {
-                    listener.onError(t.getMessage() == null ? t.toString() : t.getMessage());
+                    synchronized (OpenClawClient.this) {
+                        if (socket != webSocket) return;
+                        socket = null;
+                        connected = false;
+                    }
+                    String detail = t.getMessage() == null ? t.toString() : t.getMessage();
+                    listener.onError(detail);
                     listener.onStatus("Connection failed");
+                    listener.onDisconnected(detail);
                 }
             });
         } catch (Exception e) {
-            listener.onError(e.getMessage());
+            String detail = e.getMessage() == null ? e.toString() : e.getMessage();
+            listener.onError(detail);
+            listener.onDisconnected(detail);
         }
     }
 
     synchronized void disconnect() {
+        connected = false;
         for (Pending p : pending.values()) p.reject("Disconnected");
         pending.clear();
         if (socket != null) {
-            socket.close(1000, "user disconnect");
+            WebSocket closing = socket;
             socket = null;
+            closing.close(1000, "user disconnect");
         }
     }
+
+    boolean isConnected() { return connected; }
+    String connectionId() { return connectionId; }
+    String nodeId() { return identity == null ? "" : identity.deviceId; }
 
     void refreshDashboard() {
         if (socket == null) return;
@@ -205,11 +232,14 @@ final class OpenClawClient {
                 identityStore.saveDeviceToken(authInfo.optString("deviceToken"), authInfo.optJSONArray("scopes") == null ? "[]" : authInfo.optJSONArray("scopes").toString());
             }
             listener.onStatus("Connected as dashboard node");
+            connected = true;
+            connectionId = UUID.randomUUID().toString();
             listener.onConnected(payloadJson == null ? new JSONObject() : payloadJson);
             refreshDashboard();
         }, error -> {
             listener.onError("Connect rejected: " + error);
             listener.onStatus("Pairing or auth required");
+            webSocket.close(1000, "connect rejected");
         });
     }
 
@@ -218,12 +248,18 @@ final class OpenClawClient {
         String invokeId = payload.optString("invokeId", payload.optString("id", ""));
         String command = payload.optString("command", "");
         JSONObject requestParams = payload.optJSONObject("params");
+        if (requestParams == null) requestParams = new JSONObject();
+        JSONObject trace = requestParams.optJSONObject("_trace");
+        String correlationId = requestParams.optString("correlationId", trace == null ? "" : trace.optString("correlationId", ""));
+        if (correlationId.isEmpty()) correlationId = UUID.randomUUID().toString();
+        long startedAt = System.currentTimeMillis();
+        listener.onInvokeStarted(invokeId, correlationId, command, requestParams);
         JSONObject result;
         boolean ok = true;
         try {
             result = commandHandler == null
                     ? defaultResult(command)
-                    : commandHandler.handle(command, requestParams == null ? new JSONObject() : requestParams);
+                    : commandHandler.handle(command, requestParams);
             if (result == null) result = defaultResult(command);
         } catch (Exception e) {
             ok = false;
@@ -232,6 +268,13 @@ final class OpenClawClient {
                     .put("message", e.getMessage() == null ? e.toString() : e.getMessage())
                     .put("command", command);
         }
+        long durationMs = System.currentTimeMillis() - startedAt;
+        result.put("_trace", new JSONObject()
+                .put("invokeId", invokeId)
+                .put("correlationId", correlationId)
+                .put("nodeConnectionId", connectionId)
+                .put("durationMs", durationMs));
+        listener.onInvokeFinished(invokeId, correlationId, command, ok, durationMs, result);
         JSONObject params = new JSONObject()
                 .put("invokeId", invokeId)
                 .put("nodeId", identity.deviceId)
@@ -313,7 +356,10 @@ final class OpenClawClient {
                     .put("id", id)
                     .put("method", method)
                     .put("params", params == null ? new JSONObject() : params);
-            ws.send(frame.toString());
+            if (!ws.send(frame.toString())) {
+                pending.remove(id);
+                errorCallback.error("WebSocket rejected the request");
+            }
         } catch (Exception e) {
             errorCallback.error(e.getMessage());
         }

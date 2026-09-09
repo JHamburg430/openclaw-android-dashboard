@@ -25,9 +25,9 @@ import org.json.JSONObject;
 import java.util.ArrayList;
 
 final class AndroidCapabilityBroker {
-    private final Activity activity;
+    private final Context context;
 
-    AndroidCapabilityBroker(Activity activity) { this.activity = activity; }
+    AndroidCapabilityBroker(Context context) { this.context = context.getApplicationContext(); }
 
     JSONObject handle(String command, JSONObject params) throws Exception {
         switch (command) {
@@ -79,7 +79,7 @@ final class AndroidCapabilityBroker {
         String selection = query.isEmpty() ? null : ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY + " LIKE ? OR " + ContactsContract.CommonDataKinds.Phone.NUMBER + " LIKE ?";
         String[] args = query.isEmpty() ? null : new String[]{"%" + query + "%", "%" + query + "%"};
         JSONArray contacts = new JSONArray();
-        try (Cursor cursor = activity.getContentResolver().query(
+        try (Cursor cursor = context.getContentResolver().query(
                 ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
                 new String[]{ContactsContract.CommonDataKinds.Phone.CONTACT_ID, ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY, ContactsContract.CommonDataKinds.Phone.NUMBER, ContactsContract.CommonDataKinds.Phone.TYPE},
                 selection, args, ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY + " ASC")) {
@@ -109,7 +109,7 @@ final class AndroidCapabilityBroker {
         if (!email.isEmpty()) operations.add(ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI).withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, 0)
                 .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.Email.CONTENT_ITEM_TYPE)
                 .withValue(ContactsContract.CommonDataKinds.Email.ADDRESS, email).withValue(ContactsContract.CommonDataKinds.Email.TYPE, ContactsContract.CommonDataKinds.Email.TYPE_HOME).build());
-        activity.getContentResolver().applyBatch(ContactsContract.AUTHORITY, operations);
+        context.getContentResolver().applyBatch(ContactsContract.AUTHORITY, operations);
         return new JSONObject().put("created", true).put("name", name);
     }
 
@@ -121,7 +121,7 @@ final class AndroidCapabilityBroker {
         String selection = CalendarContract.Events.DTSTART + " >= ? AND " + CalendarContract.Events.DTSTART + " <= ?" + (query.isEmpty() ? "" : " AND " + CalendarContract.Events.TITLE + " LIKE ?");
         String[] args = query.isEmpty() ? new String[]{String.valueOf(from), String.valueOf(to)} : new String[]{String.valueOf(from), String.valueOf(to), "%" + query + "%"};
         JSONArray events = new JSONArray();
-        try (Cursor cursor = activity.getContentResolver().query(CalendarContract.Events.CONTENT_URI,
+        try (Cursor cursor = context.getContentResolver().query(CalendarContract.Events.CONTENT_URI,
                 new String[]{CalendarContract.Events._ID, CalendarContract.Events.TITLE, CalendarContract.Events.DESCRIPTION, CalendarContract.Events.EVENT_LOCATION, CalendarContract.Events.DTSTART, CalendarContract.Events.DTEND, CalendarContract.Events.ALL_DAY, CalendarContract.Events.CALENDAR_ID},
                 selection, args, CalendarContract.Events.DTSTART + " ASC")) {
             while (cursor != null && cursor.moveToNext() && events.length() < limit(params, 100)) {
@@ -145,14 +145,14 @@ final class AndroidCapabilityBroker {
         values.put(CalendarContract.Events.DESCRIPTION, params.optString("description", ""));
         values.put(CalendarContract.Events.EVENT_LOCATION, params.optString("location", ""));
         values.put(CalendarContract.Events.ALL_DAY, params.optBoolean("allDay", false) ? 1 : 0);
-        Uri uri = activity.getContentResolver().insert(CalendarContract.Events.CONTENT_URI, values);
+        Uri uri = context.getContentResolver().insert(CalendarContract.Events.CONTENT_URI, values);
         if (uri == null) throw new IllegalStateException("Calendar provider rejected the event.");
         return new JSONObject().put("created", true).put("eventId", uri.getLastPathSegment()).put("calendarId", calendarId);
     }
 
     private long findWritableCalendar() {
         requirePermission(Manifest.permission.READ_CALENDAR);
-        try (Cursor cursor = activity.getContentResolver().query(CalendarContract.Calendars.CONTENT_URI,
+        try (Cursor cursor = context.getContentResolver().query(CalendarContract.Calendars.CONTENT_URI,
                 new String[]{CalendarContract.Calendars._ID}, CalendarContract.Calendars.VISIBLE + "=1 AND " + CalendarContract.Calendars.CALENDAR_ACCESS_LEVEL + ">=?",
                 new String[]{String.valueOf(CalendarContract.Calendars.CAL_ACCESS_CONTRIBUTOR)}, CalendarContract.Calendars.IS_PRIMARY + " DESC")) {
             if (cursor != null && cursor.moveToFirst()) return cursor.getLong(0);
@@ -166,7 +166,7 @@ final class AndroidCapabilityBroker {
         JSONArray calls = new JSONArray();
         String selection = query.isEmpty() ? null : CallLog.Calls.NUMBER + " LIKE ? OR " + CallLog.Calls.CACHED_NAME + " LIKE ?";
         String[] args = query.isEmpty() ? null : new String[]{"%" + query + "%", "%" + query + "%"};
-        try (Cursor cursor = activity.getContentResolver().query(CallLog.Calls.CONTENT_URI,
+        try (Cursor cursor = context.getContentResolver().query(CallLog.Calls.CONTENT_URI,
                 new String[]{CallLog.Calls._ID, CallLog.Calls.NUMBER, CallLog.Calls.CACHED_NAME, CallLog.Calls.DATE, CallLog.Calls.DURATION, CallLog.Calls.TYPE},
                 selection, args, CallLog.Calls.DATE + " DESC")) {
             while (cursor != null && cursor.moveToNext() && calls.length() < limit(params, 100)) calls.put(new JSONObject()
@@ -182,7 +182,7 @@ final class AndroidCapabilityBroker {
         JSONArray messages = new JSONArray();
         String selection = query.isEmpty() ? null : Telephony.Sms.ADDRESS + " LIKE ? OR " + Telephony.Sms.BODY + " LIKE ?";
         String[] args = query.isEmpty() ? null : new String[]{"%" + query + "%", "%" + query + "%"};
-        try (Cursor cursor = activity.getContentResolver().query(Telephony.Sms.CONTENT_URI,
+        try (Cursor cursor = context.getContentResolver().query(Telephony.Sms.CONTENT_URI,
                 new String[]{Telephony.Sms._ID, Telephony.Sms.ADDRESS, Telephony.Sms.BODY, Telephony.Sms.DATE, Telephony.Sms.TYPE, Telephony.Sms.READ},
                 selection, args, Telephony.Sms.DATE + " DESC")) {
             while (cursor != null && cursor.moveToNext() && messages.length() < limit(params, 100)) messages.put(new JSONObject()
@@ -213,7 +213,7 @@ final class AndroidCapabilityBroker {
         JSONArray media = new JSONArray();
         String selection = query.isEmpty() ? null : MediaStore.MediaColumns.DISPLAY_NAME + " LIKE ?";
         String[] args = query.isEmpty() ? null : new String[]{"%" + query + "%"};
-        try (Cursor cursor = activity.getContentResolver().query(uri,
+        try (Cursor cursor = context.getContentResolver().query(uri,
                 new String[]{MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DISPLAY_NAME, MediaStore.MediaColumns.MIME_TYPE, MediaStore.MediaColumns.SIZE, MediaStore.MediaColumns.DATE_MODIFIED},
                 selection, args, MediaStore.MediaColumns.DATE_MODIFIED + " DESC")) {
             while (cursor != null && cursor.moveToNext() && media.length() < limit(params, 100)) media.put(new JSONObject()
@@ -265,15 +265,15 @@ final class AndroidCapabilityBroker {
     }
 
     private JSONObject openSettings(String action) throws Exception { return launch(new Intent(action), "opened"); }
-    private JSONObject openAppSettings() throws Exception { return launch(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + activity.getPackageName())), "opened"); }
+    private JSONObject openAppSettings() throws Exception { return launch(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + context.getPackageName())), "opened"); }
 
     private JSONObject launch(Intent intent, String resultKey) throws Exception {
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        activity.runOnUiThread(() -> activity.startActivity(intent));
+        context.startActivity(intent);
         return new JSONObject().put(resultKey, true);
     }
 
-    private boolean granted(String permission) { return activity.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED; }
+    private boolean granted(String permission) { return context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED; }
     private void requirePermission(String permission) {
         if (!granted(permission)) throw new SecurityException("Android permission is required: " + permission);
     }
