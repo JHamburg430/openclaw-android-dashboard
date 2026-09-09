@@ -1609,6 +1609,7 @@ public final class MainActivity extends Activity {
                 + "var WebSocketCtor=window.WebSocket;"
                 + "if(typeof WebSocketCtor!=='function')return;"
                 + "var relayAudioChunks=0;"
+                + "var relayResponseActive=false;"
                 + "var relayTextSequence=0;"
                 + "function parse(data){if(typeof data!=='string')return null;try{return JSON.parse(data);}catch(_){return null;}}"
                 + "function firstString(){for(var i=0;i<arguments.length;i++){var value=arguments[i];if(typeof value==='string'&&value.trim())return value.trim();}return '';}"
@@ -1637,7 +1638,16 @@ public final class MainActivity extends Activity {
                 + "if(shouldSuppressRelayMessage(payload)){diag('talk.relay.suppressed',{'type':String(payload.type||''),'reason':'empty_or_no_reply'});return true;}"
                 + "var kind=String(payload.type||'');"
                 + "var base64=audioBase64(payload);"
-                + "if(base64&&(kind==='audio'||kind==='output.audio.delta'||kind.indexOf('audio')>=0)){"
+                + "var isAudioStarted=kind==='output.audio.started'||kind==='output_audio_buffer.started'||kind==='response.output_audio.started';"
+                + "var isAudioDone=kind==='output.audio.done'||kind==='output_audio_buffer.done'||kind==='response.output_audio.done'||kind==='local_realtime.output_audio.done';"
+                + "if(isAudioStarted){"
+                + "relayAudioChunks=0;relayResponseActive=true;"
+                + "try{if(nativeAudio&&typeof nativeAudio.prepareAgentResponsePlayback==='function')nativeAudio.prepareAgentResponsePlayback();}catch(error){diag('talk.relay.native_prepare.error',{'message':String(error)});}"
+                + "diag('talk.relay.audio_started',{'type':kind});"
+                + "}else if(isAudioDone){"
+                + "if(relayResponseActive){relayResponseActive=false;try{if(nativeAudio&&typeof nativeAudio.finishAgentResponsePlayback==='function')nativeAudio.finishAgentResponsePlayback();}catch(error){diag('talk.relay.native_finish.error',{'message':String(error)});}diag('talk.relay.audio_done',{'type':kind,'chunks':relayAudioChunks});}else{diag('talk.relay.audio_done_duplicate',{'type':kind});}"
+                + "}else if(base64&&(kind==='audio'||kind==='output.audio.delta'||kind.indexOf('audio')>=0)){"
+                + "if(!relayResponseActive){relayResponseActive=true;relayAudioChunks=0;try{if(nativeAudio&&typeof nativeAudio.prepareAgentResponsePlayback==='function')nativeAudio.prepareAgentResponsePlayback();}catch(error){diag('talk.relay.native_prepare.error',{'message':String(error)});}}"
                 + "relayAudioChunks++;"
                 + "var sampleRate=audioSampleRate(payload);"
                 + "if(relayAudioChunks===1||relayAudioChunks%20===0){diag('talk.relay.audio',{'type':kind,'chunks':relayAudioChunks,'sampleRate':sampleRate,'bytes':String(base64).length});}"
@@ -2071,6 +2081,7 @@ public final class MainActivity extends Activity {
         private final AtomicBoolean running = new AtomicBoolean(false);
         private final AtomicBoolean outputRunning = new AtomicBoolean(false);
         private final AtomicBoolean outputInterrupted = new AtomicBoolean(false);
+        private final AtomicBoolean outputComplete = new AtomicBoolean(false);
         private AudioRecord recorder;
         private Thread readerThread;
         private Thread outputThread;
@@ -2161,6 +2172,7 @@ public final class MainActivity extends Activity {
         @JavascriptInterface
         public void prepareAgentResponsePlayback() {
             outputInterrupted.set(false);
+            outputComplete.set(false);
             AudioDeviceInfo bluetoothOutput = preferBluetoothAudioRoute(false, "response_prepare");
             AudioManager audioManager = getAudioManager();
             if (audioManager != null && bluetoothOutput == null) {
@@ -2182,6 +2194,15 @@ public final class MainActivity extends Activity {
                 outputLock.notifyAll();
             }
             recordDiagnostic("native_audio_output.cleared", "speech_started");
+        }
+
+        @JavascriptInterface
+        public void finishAgentResponsePlayback() {
+            outputComplete.set(true);
+            synchronized (outputLock) {
+                outputLock.notifyAll();
+            }
+            recordDiagnostic("native_audio_output.delivery_done", "queue=" + outputQueue.size());
         }
 
         @JavascriptInterface
@@ -2353,7 +2374,7 @@ public final class MainActivity extends Activity {
                     byte[] chunk;
                     synchronized (outputLock) {
                         chunk = outputQueue.pollFirst();
-                        if (chunk == null) {
+                        if (chunk == null && !outputComplete.get()) {
                             try {
                                 outputLock.wait(OUTPUT_TAIL_WAIT_MS);
                             } catch (InterruptedException e) {
@@ -2363,6 +2384,7 @@ public final class MainActivity extends Activity {
                             chunk = outputQueue.pollFirst();
                             if (chunk == null) break;
                         }
+                        if (chunk == null && outputComplete.get()) break;
                     }
                     int offset = 0;
                     while (offset < chunk.length) {

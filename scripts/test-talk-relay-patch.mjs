@@ -31,6 +31,8 @@ const spoken = [];
 const sent = [];
 const sockets = [];
 const timers = [];
+let prepared = 0;
+let finished = 0;
 
 class FakeSocket {
   constructor(url, protocols) {
@@ -73,6 +75,12 @@ FakeSocket.CLOSED = 3;
 
 const window = {
   OpenClawNativeAudio: {
+    prepareAgentResponsePlayback() {
+      prepared += 1;
+    },
+    finishAgentResponsePlayback() {
+      finished += 1;
+    },
     playAgentResponsePcm16Base64(base64, sampleRate) {
       played.push({ base64, sampleRate, agent: true });
     },
@@ -135,10 +143,15 @@ const emitTalk = (payload) => socket.emit("message", JSON.stringify({
   payload,
 }));
 
+emitTalk({ type: "output.audio.started" });
 emitTalk({ type: "audio", audioBase64: "AAAA", sampleRate: 24000 });
 emitTalk({ type: "output.audio.delta", delta: "BBBB", sampleRateHz: 16000 });
 emitTalk({ type: "output.audio.delta", payload: { audioBase64: "CCCC", sampleRateHz: 22050 } });
 emitTalk({ type: "response.audio.delta", audio: { data: "data:audio/pcm;base64,DDDD", sampleRateHz: 8000 } });
+emitTalk({ type: "output.audio.done" });
+// A provider without explicit started still establishes a fresh boundary.
+emitTalk({ type: "audio", audioBase64: "EEEE", sampleRate: 24000 });
+emitTalk({ type: "local_realtime.output_audio.done" });
 emitTalk({ type: "output.audio.delta" });
 emitTalk({ type: "output.text.done", text: "This text already has relay audio." });
 const noReplyStopped = emitTalk({ type: "output.text.done", text: "NO_REPLY" });
@@ -151,7 +164,10 @@ assert.deepEqual(played, [
   { base64: "BBBB", sampleRate: 16000, agent: true },
   { base64: "CCCC", sampleRate: 22050, agent: true },
   { base64: "DDDD", sampleRate: 8000, agent: true },
+  { base64: "EEEE", sampleRate: 24000, agent: true },
 ]);
+assert.equal(prepared, 2, "explicit and lazy response starts both prepare native playback");
+assert.equal(finished, 2, "each response completion drains its native playback boundary");
 assert.equal(noReplyStopped, true);
 assert.equal(emptyTextStopped, true);
 assert.deepEqual(spoken, []);
