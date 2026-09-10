@@ -175,26 +175,25 @@ final class OpenClawClient {
 
     private void sendConnect(WebSocket webSocket, String nonce) throws Exception {
         String role = "node";
-        JSONArray scopes = scopesArray();
-        String authToken = emptyToNull(config.gatewayToken);
-        String bootstrapToken = authToken == null && emptyToNull(config.password) == null ? emptyToNull(config.bootstrapToken) : null;
-        String deviceToken = identityStore.getDeviceToken();
-        if (authToken == null && bootstrapToken == null && emptyToNull(config.password) == null && deviceToken != null) {
-            authToken = deviceToken;
-        }
+        GatewayConnectAuth.Selection selectedAuth = GatewayConnectAuth.select(
+                config.gatewayToken,
+                config.bootstrapToken,
+                identityStore.getDeviceToken(),
+                config.password);
+        JSONArray scopes = scopesArray(selectedAuth.usesStoredDeviceToken());
         long signedAtMs = System.currentTimeMillis();
-        String signatureToken = firstNonEmpty(authToken, deviceToken, bootstrapToken);
         String platform = normalizeMetadata("android");
         String family = normalizeMetadata(deviceFamily());
         String payload = "v3|" + identity.deviceId + "|" + CLIENT_ID + "|node|" + role + "|" +
-                join(scopes) + "|" + signedAtMs + "|" + (signatureToken == null ? "" : signatureToken) + "|" +
+                join(scopes) + "|" + signedAtMs + "|" + (selectedAuth.signatureToken == null ? "" : selectedAuth.signatureToken) + "|" +
                 nonce + "|" + platform + "|" + family;
         String signature = IdentityStore.sign(identity.privateKey, payload);
 
         JSONObject auth = new JSONObject();
-        if (authToken != null) auth.put("token", authToken);
-        if (bootstrapToken != null) auth.put("bootstrapToken", bootstrapToken);
-        if (emptyToNull(config.password) != null) auth.put("password", config.password.trim());
+        if (selectedAuth.token != null) auth.put("token", selectedAuth.token);
+        if (selectedAuth.bootstrapToken != null) auth.put("bootstrapToken", selectedAuth.bootstrapToken);
+        if (selectedAuth.deviceToken != null) auth.put("deviceToken", selectedAuth.deviceToken);
+        if (selectedAuth.password != null) auth.put("password", selectedAuth.password);
 
         JSONObject client = new JSONObject()
                 .put("id", CLIENT_ID)
@@ -239,7 +238,13 @@ final class OpenClawClient {
             listener.onConnected(payloadJson == null ? new JSONObject() : payloadJson);
             refreshDashboard();
         }, error -> {
-            if (isStaleDeviceTokenError(error) && identityStore.getDeviceToken() != null) {
+            boolean hasFallbackCredential = emptyToNull(config.gatewayToken) != null
+                    || emptyToNull(config.password) != null
+                    || emptyToNull(config.bootstrapToken) != null;
+            if (GatewayConnectAuth.shouldClearStoredDeviceToken(
+                    error,
+                    identityStore.getDeviceToken() != null,
+                    hasFallbackCredential)) {
                 identityStore.clearDeviceToken();
                 listener.onLog("Cleared stale node authorization; retrying with the configured gateway authentication");
                 listener.onStatus("Refreshing node authorization");
@@ -248,15 +253,6 @@ final class OpenClawClient {
             listener.onStatus("Pairing or auth required");
             webSocket.close(1000, "connect rejected");
         });
-    }
-
-    private static boolean isStaleDeviceTokenError(String error) {
-        if (error == null) return false;
-        String normalized = error.toLowerCase(java.util.Locale.ROOT);
-        return normalized.contains("device token mismatch")
-                || normalized.contains("rotate/reissue device token")
-                || normalized.contains("invalid device token")
-                || normalized.contains("expired device token");
     }
 
     private void handleNodeInvoke(JSONObject payload) throws Exception {
@@ -404,9 +400,9 @@ final class OpenClawClient {
         }
     }
 
-    private JSONArray scopesArray() throws Exception {
+    private JSONArray scopesArray(boolean usingStoredDeviceToken) throws Exception {
         String storedScopes = identityStore.getDeviceTokenScopesJson();
-        if (identityStore.getDeviceToken() != null && storedScopes != null && storedScopes.length() > 2) {
+        if (usingStoredDeviceToken && storedScopes != null && storedScopes.length() > 2) {
             return new JSONArray(storedScopes);
         }
         return new JSONArray();
@@ -426,14 +422,6 @@ final class OpenClawClient {
             object.put(key, value == null ? JSONObject.NULL : value);
         } catch (Exception ignored) {
         }
-    }
-
-    private static String firstNonEmpty(String... values) {
-        for (String value : values) {
-            String normalized = emptyToNull(value);
-            if (normalized != null) return normalized;
-        }
-        return null;
     }
 
     private static String emptyToNull(String value) {

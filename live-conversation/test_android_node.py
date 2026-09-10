@@ -10,6 +10,7 @@ class AndroidPhoneNodeReconnectTests(unittest.TestCase):
     def setUpClass(cls):
         cls.service = (ROOT / "app/src/main/java/ai/openclaw/dashboard/PhoneNodeService.java").read_text()
         cls.client = (ROOT / "app/src/main/java/ai/openclaw/dashboard/OpenClawClient.java").read_text()
+        cls.auth = (ROOT / "app/src/main/java/ai/openclaw/dashboard/GatewayConnectAuth.java").read_text()
         cls.receiver = (ROOT / "app/src/main/java/ai/openclaw/dashboard/PhoneNodeBootReceiver.java").read_text()
         cls.manifest = (ROOT / "app/src/main/AndroidManifest.xml").read_text()
 
@@ -35,10 +36,16 @@ class AndroidPhoneNodeReconnectTests(unittest.TestCase):
         self.assertIn("hasUsableNetwork()", self.service)
 
     def test_stale_device_authorization_self_repairs_before_reconnect(self):
-        self.assertIn("isStaleDeviceTokenError(error)", self.client)
+        self.assertIn("GatewayConnectAuth.shouldClearStoredDeviceToken(", self.client)
         self.assertIn("identityStore.clearDeviceToken();", self.client)
         self.assertIn("Refreshing node authorization", self.client)
+        self.assertIn('normalized.contains("device signature invalid")', self.auth)
         self.assertNotIn("clearIdentity", self.client)
+
+    def test_explicit_password_does_not_sign_with_stored_device_token(self):
+        self.assertIn("token == null && normalizedPassword == null && deviceToken != null", self.auth)
+        self.assertIn('auth.put("deviceToken", selectedAuth.deviceToken)', self.client)
+        self.assertNotIn('auth.put("token", authToken)', self.client)
 
 
 if __name__ == "__main__":
