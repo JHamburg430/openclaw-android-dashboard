@@ -44,7 +44,7 @@ openclaw devices approve <requestId>
 
 ## Hybrid Control UI and phone node
 
-Version 1.0.67 deliberately keeps two independent OpenClaw connections:
+Version 1.0.68 deliberately keeps two independent OpenClaw connections:
 
 - The embedded WebView is a normal Control UI browser client for complete chat, agent, session, and settings functionality.
 - `PhoneNodeService` is a separately paired Android node that remains available when the activity or WebView is recreated.

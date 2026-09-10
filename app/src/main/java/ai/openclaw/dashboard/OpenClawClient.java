@@ -278,10 +278,16 @@ final class OpenClawClient {
                 .put("durationMs", durationMs));
         listener.onInvokeFinished(invokeId, correlationId, command, ok, durationMs, result);
         JSONObject params = new JSONObject()
-                .put("invokeId", invokeId)
+                .put("id", invokeId)
                 .put("nodeId", identity.deviceId)
-                .put("ok", ok)
-                .put("result", result);
+                .put("ok", ok);
+        if (ok) {
+            params.put("payload", result);
+        } else {
+            params.put("error", new JSONObject()
+                    .put("code", result.optString("code", "ANDROID_COMMAND_FAILED"))
+                    .put("message", result.optString("message", "Android command failed")));
+        }
         request("node.invoke.result", params, ignored -> listener.onLog("Handled " + command), error -> listener.onError("Invoke reply failed: " + error));
     }
 

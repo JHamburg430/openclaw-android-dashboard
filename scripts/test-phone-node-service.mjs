@@ -37,6 +37,11 @@ assert.match(client, /CLIENT_ID = "openclaw-android"/);
 assert.doesNotMatch(client, /CLIENT_ID = "openclaw-android-dashboard"/);
 assert.match(client, /nodeConnectionId/);
 assert.match(client, /correlationId/);
+assert.match(client, /\.put\("id", invokeId\)/);
+assert.match(client, /params\.put\("payload", result\)/);
+assert.match(client, /params\.put\("error", new JSONObject\(\)/);
+assert.doesNotMatch(client, /\.put\("invokeId", invokeId\)\s*\.put\("nodeId"/);
+assert.doesNotMatch(client, /\.put\("result", result\)/);
 
 for (const sensitive of ["token", "password", "secret", "body", "reply", "phone"]) {
   assert.ok(audit.includes(`lower.contains(\"${sensitive}\")`) || audit.includes(`lower.equals(\"${sensitive}\")`), `audit redacts ${sensitive}`);
