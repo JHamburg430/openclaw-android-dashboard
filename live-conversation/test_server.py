@@ -64,6 +64,9 @@ class RoutingTests(unittest.TestCase):
         self.assertNotIn("I'll check and let you know", prompt)
         self.assertIn("Jarvis and the Live Conversation model are the same speaker", prompt)
         self.assertIn("never ask an agent to verify whether you can hear John", prompt)
+        self.assertIn("Conversation history is memory for continuity", prompt)
+        self.assertIn("Refresh the authoritative source", prompt)
+        self.assertIn("acknowledgment spoken before any work starts", prompt)
 
     def test_hearing_and_identity_checks_are_deterministic(self):
         self.assertEqual(
@@ -285,15 +288,56 @@ class RoutingTests(unittest.TestCase):
 
     def test_page_displays_and_updates_the_rolling_history(self):
         page = render_page()
-        self.assertIn("Conversation history · last 80 messages", page)
+        self.assertIn("Recent messages · newest first · last 120", page)
         self.assertIn("m.type==='history'", page)
-        self.assertIn("historyMessages.slice(-80)", page)
+        self.assertIn("historyMessages.slice(-120).reverse()", page)
         self.assertIn("addHistory('user',m.text)", page)
         self.assertIn("addHistory('assistant',m.text)", page)
         self.assertIn("get('autostart')==='1'", page)
         self.assertIn("liveConversationStopped", page)
         self.assertIn("Action confirmation: loading", page)
         self.assertIn("m.type==='settings'", page)
+
+    def test_action_handoff_occurs_only_after_acknowledgment_delivery(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.transcribe = AsyncMock(return_value="Please fix the routing bug.")
+            service.speech_reply = AsyncMock(
+                return_value=("agent", "I'll inspect and fix the routing bug.", None)
+            )
+            events = []
+
+            async def send_spoken(*_args, **_kwargs):
+                events.append("acknowledgment_delivered")
+                return 12
+
+            service.send_spoken_response = AsyncMock(side_effect=send_spoken)
+            socket = AsyncMock()
+
+            handoff = await service.process_turn(socket, b"audio")
+            events.append("action_handoff_returned")
+
+            self.assertEqual(events, [
+                "acknowledgment_delivered", "action_handoff_returned",
+            ])
+            self.assertEqual(handoff, (
+                "Please fix the routing bug.",
+                "I'll inspect and fix the routing bug.",
+                service.session_key,
+            ))
+            messages = [call.args[0] for call in socket.send_json.await_args_list]
+            action_status = next(
+                index for index, message in enumerate(messages)
+                if message.get("type") == "action_status"
+            )
+            metrics = next(
+                index for index, message in enumerate(messages)
+                if message.get("type") == "metrics"
+            )
+            self.assertGreater(action_status, metrics)
+
+        import asyncio
+        asyncio.run(run_test())
 
     def test_ignore_token_produces_no_spoken_text(self):
         self.assertEqual(parse_speech_model_output(IGNORE_SENTINEL), ("ignore", "", None))
@@ -650,6 +694,7 @@ class RoutingTests(unittest.TestCase):
         self.assertGreater(len(service.recent_history()), 24)
         self.assertLessEqual(sum(len(item["content"]) for item in prompt_history), PROMPT_HISTORY_CHARS)
         self.assertEqual(prompt_history[-1]["content"], service.recent_history()[-1]["content"])
+        self.assertNotEqual(prompt_history[0]["role"], "assistant")
 
     def test_completed_agent_reply_can_be_spoken_after_reconnect(self):
         service = LiveConversationService("agent:main:live-conversation", 1.15)

@@ -44,7 +44,7 @@ openclaw devices approve <requestId>
 
 ## Hybrid Control UI and phone node
 
-Version 1.0.68 deliberately keeps two independent OpenClaw connections:
+Version 1.0.69 deliberately keeps two independent OpenClaw connections:
 
 - The embedded WebView is a normal Control UI browser client for complete chat, agent, session, and settings functionality.
 - `PhoneNodeService` is a separately paired Android node that remains available when the activity or WebView is recreated.
@@ -73,6 +73,12 @@ The native node exposes narrow commands for personal phone automation:
 Open **Android Native** in the app and use **Request Phone Permissions**. Notification reading/replies and arbitrary app UI control are special Android accesses, so enable **Notification Access** and **Accessibility Control** separately from that screen. In the permission report, `notifications` and `notificationAccess` mean notification reading/action access; `canPostNotifications`, `postNotifications`, and `appNotificationsEnabled` describe this app's own status notifications; `notificationAccessConnected` reports whether the listener service is presently bound. Android may require **Allow restricted settings** in the app-info menu for a sideloaded Accessibility service. **Re-pair Phone Node** is also available directly on this screen.
 
 `mobile.ui.act` supports `click`, `setText`, `scrollForward`, `scrollBackward`, `tap`, `back`, `home`, `recents`, and `notifications`. UI observations and notification text are untrusted app data; the dedicated Phone Control agent is instructed never to treat them as agent instructions.
+
+## Live Conversation behavior
+
+Live Conversation shows the newest messages first and retains up to 120 messages, with a bounded 32-message context window for natural follow-ups. Remembered conversation supplies continuity, preferences, names, and referents only; changing facts must be refreshed from live tools or the authoritative session catalog before they are answered.
+
+Tool-backed requests use an explicit acknowledgment-first handoff. Jarvis finishes delivering a short spoken acknowledgment before the bridge dispatches any agent or session action. Immediate silent playback-stop commands remain the intentional exception.
 
 ## Build
 

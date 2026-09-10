@@ -112,6 +112,23 @@ function harness() {
 
 {
   const app = harness();
+  app.socket.server({
+    type: "history",
+    messages: [
+      { role: "user", content: "Older message" },
+      { role: "assistant", content: "Newest message" },
+    ],
+  });
+  const bubbles = app.elements.get("history").children;
+  assert.equal(bubbles[0].children[1].textContent, "Newest message",
+    "the newest message is rendered at the top");
+  app.socket.server({ type: "action_status", state: "acknowledged" });
+  assert.equal(app.elements.get("state").textContent, "Working…",
+    "the UI shows work only after the acknowledgment event");
+}
+
+{
+  const app = harness();
   // A near-field sentence can begin quietly before a later vowel crosses the
   // conservative start gate.  Preserve 900 ms before the 300 ms confirmation
   // window so those first words reach ASR instead of starting mid-sentence.
