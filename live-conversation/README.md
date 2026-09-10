@@ -37,22 +37,24 @@ in the Android Dashboard plus menu.
    audio before decoding, with a stricter threshold for normal turns than for
    the wake word, reducing false transcripts from road and ambient noise.
 4. The local `qwen3.5:4b` speech supervisor is installed under the dedicated
-   Ollama identity `openclaw-live-conversation:4b` and returns either a short
-   speakable response or the hidden `[[OPENCLAW_AGENT]]` control token. This model is the
+   Ollama identity `openclaw-live-conversation:4b` and returns one constrained
+   semantic decision containing completeness, speech act, conversational
+   relation, actionability, grounding need, supersession, assembled meaning,
+   route, and spoken reply. This model is the
    local latency/quality balance: materially stronger than the former 0.8B
-   supervisor while remaining sub-second once warm on the installed GPUs. Its
+   supervisor while remaining responsive once warm on the installed GPUs. Its
    fixed 8k context and dedicated identity prevent unrelated qwen3.5 callers
    with 16k or 32k contexts from repeatedly replacing and reloading its runner.
    A loopback-only companion Ollama process on port 11439 isolates the live
    runner from the shared system Ollama scheduler, which otherwise evicted it
    even while its 30-minute keep-alive was active.
-   Only the newest 24 routing-relevant history messages are included, while all
-   80 messages remain persisted and visible. The
+   Only the newest 32 routing-relevant history messages are included, while up
+   to 120 messages remain persisted and visible. The
    Ollama request keeps it warm for 30 minutes to avoid repeated cold starts
    during a conversation. The model is also warmed when the service starts.
-   The reply budget is 256 tokens rather than the former 80-token ceiling. If
+   The decision/reply budget is 384 tokens rather than the former 80-token ceiling. If
    Ollama reports that the budget was exhausted (or returns exactly the capped
-   token count), the request is retried once with 512 tokens instead of showing
+   token count), the request is retried once with 640 tokens instead of showing
    and speaking a syntactically valid JSON response whose `reply` ends midway
    through a sentence.
 5. A bounded conversation history supplies the previous user and assistant
@@ -61,18 +63,18 @@ in the Android Dashboard plus menu.
    routing metadata, interruptions, tool receipts, and exact session identity.
    It is persisted at
    `~/.openclaw/state/live-conversation-history.json`, so context survives a
-   WebView reconnect or service restart. Up to 80 messages and 48,000
+   WebView reconnect or service restart. Up to 120 messages and 72,000
    characters are retained; the newest context that fits the local model's
    prompt budget is selected dynamically. The page displays the same rolling
-   80-message history as user and assistant bubbles.
+   120-message history as user and assistant bubbles.
 6. The supervisor receives a compact, continuously background-refreshed summary of the
    last seven days of gateway sessions, including the exact session key,
    title, latest message, and authoritative `hasActiveRun` state. It can answer
    status questions deterministically without launching an agent or waiting for
    the local language model.
-7. The service intercepts control tokens before display/TTS. Ordinary tool work
-   continues in `agent:main:live-conversation`; explicit requests for another
-   agent get an independent session; and follow-ups can be sent to an exact
+7. The service intercepts control tokens before display/TTS. Every newly
+   delegated task gets an independent session; sessions are reused only for an
+   explicit semantic follow-up to an exact
    active or recent gateway session. Concurrent agents are supported, and each
    final CLI result is returned to the bridge and spoken when it completes.
    Tool-only `sessions_yield` handoffs are recognized as delegated work rather
@@ -80,8 +82,9 @@ in the Android Dashboard plus menu.
    eventual visible result. If the WebView disconnects while an agent works,
    the task continues and its final reply is queued for speech on the next Live
    Conversation connection.
-8. Ollama's NDJSON stream is decoded incrementally. Once a direct route and a
-   stable spoken clause are available, Kokoro starts synthesizing that clause
+8. Ollama's NDJSON stream is decoded incrementally. Once the same decision has
+   marked the thought complete and a direct route and stable spoken clause are
+   available, Kokoro starts synthesizing that clause
    while later model tokens are still arriving. New confirmed speech cancels
    the in-flight HTTP generation as well as pending synthesis and playback.
    Authorized tool work starts as soon as routing is final and runs concurrently
@@ -118,10 +121,14 @@ uncertain.
 
 Declarative remarks such as “testing out the latest Live Conversation updates”
 are handled as conversation and never treated as permission to invent monitoring
-or other agent work. A reply postcondition removes unrequested promises to
+or other agent work. Freshness words do not route anything by themselves: the
+semantic decision distinguishes factual lookup requests from meta-questions,
+corrections, continuations, and observations. Incomplete thoughts are retained
+without a reply or side effect and are assembled with a later continuation only
+when the complete meaning is coherent. A reply postcondition removes unrequested promises to
 monitor, verify, investigate, or keep sessions active while preserving factual
-conversation around them. Common testing statements bypass the local routing
-model, which also removes routing-model latency from those turns.
+conversation around them. Testing statements use the same semantic contract as
+other natural speech rather than a dedicated phrase or keyword shortcut.
 
 Action confirmation is a persistent voice-controlled setting stored in
 `~/.openclaw/state/live-conversation-settings.json`. Say “Always ask me before

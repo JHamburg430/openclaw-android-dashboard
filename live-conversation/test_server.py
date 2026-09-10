@@ -42,6 +42,7 @@ from server import (
     is_silent_stop_command,
     is_wake_word,
     parse_speech_model_output,
+    parse_turn_understanding,
     partial_structured_reply,
     repair_known_transcription_errors,
     normalize_spoken_text,
@@ -55,6 +56,44 @@ from server import (
     summarize_tracked_agent,
     tts_speed_for,
 )
+
+
+def semantic_decision(
+    route="direct", reply="I understand.", *, actionable=False,
+    grounding=False, complete=True, confidence=0.98, speech_act="statement",
+    relation="new", supersedes=False, assembled_text="", session_key="",
+):
+    return {
+        "route": route,
+        "reply": reply,
+        "session_key": session_key,
+        "complete": complete,
+        "confidence": confidence,
+        "speech_act": speech_act,
+        "relation": relation,
+        "actionable": actionable,
+        "requires_grounding": grounding,
+        "supersedes_previous": supersedes,
+        "assembled_text": assembled_text or "Complete turn.",
+        "reason": "Contextual semantic classification.",
+    }
+
+
+def mock_semantic_model(*decisions):
+    response = AsyncMock()
+    response.raise_for_status = lambda: None
+    payloads = [{"message": {"content": json.dumps(item)}} for item in decisions]
+    if len(payloads) == 1:
+        response.json = AsyncMock(return_value=payloads[0])
+    else:
+        response.json = AsyncMock(side_effect=payloads)
+    response_context = MagicMock()
+    response_context.__aenter__.return_value = response
+    session = MagicMock()
+    session.post.return_value = response_context
+    session_context = MagicMock()
+    session_context.__aenter__.return_value = session
+    return session_context, session
 
 
 class RoutingTests(unittest.TestCase):
@@ -148,14 +187,12 @@ class RoutingTests(unittest.TestCase):
         self.assertFalse(is_silent_stop_command("Jarvis, stop the agent."))
         self.assertFalse(is_silent_stop_command("Why did you stop talking?"))
 
-    def test_testing_statements_do_not_invent_agent_work(self):
-        self.assertEqual(
-            direct_voice_surface_reply("Testing out the latest live conversation updates."),
-            "I hear you. Go ahead with the test.",
+    def test_testing_statements_are_left_to_semantic_controller(self):
+        self.assertIsNone(
+            direct_voice_surface_reply("Testing out the latest live conversation updates.")
         )
-        self.assertEqual(
-            direct_voice_surface_reply("I'm just trying out the new audio behavior."),
-            "I hear you. Go ahead with the test.",
+        self.assertIsNone(
+            direct_voice_surface_reply("I'm just trying out the new audio behavior.")
         )
         self.assertIsNone(
             direct_voice_surface_reply("I'm testing the update; have an agent monitor the logs.")
@@ -377,6 +414,206 @@ class RoutingTests(unittest.TestCase):
         ):
             self.assertFalse(requires_authoritative_lookup(transcript), transcript)
 
+    def test_semantic_controller_vetoes_incomplete_freshness_question(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.sessions_updated_at = time.monotonic()
+            service.capabilities_updated_at = time.monotonic()
+            decision = semantic_decision(
+                "agent", "I'll verify that.", complete=False,
+                speech_act="question", actionable=False, grounding=False,
+                assembled_text="What are the latest updates for the",
+            )
+            client, _ = mock_semantic_model(decision)
+            with patch("server.aiohttp.ClientSession", return_value=client):
+                self.assertEqual(
+                    await service.speech_reply("What are the latest updates for the"),
+                    ("wait", "", None),
+                )
+            self.assertEqual(
+                service.pending_fragment, "What are the latest updates for the"
+            )
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_semantic_controller_distinguishes_meta_verify_from_lookup(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.sessions_updated_at = time.monotonic()
+            service.capabilities_updated_at = time.monotonic()
+            decision = semantic_decision(
+                "direct", "I was referring to your unfinished question.",
+                speech_act="meta", relation="meta", actionable=False,
+                grounding=False, supersedes=True,
+                assembled_text="What are you going to verify?",
+            )
+            client, _ = mock_semantic_model(decision)
+            with patch("server.aiohttp.ClientSession", return_value=client):
+                self.assertEqual(
+                    await service.speech_reply("What are you going to verify?"),
+                    ("direct", "I was referring to your unfinished question.", None),
+                )
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_semantic_correction_supersedes_only_its_originating_callback(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.sessions_updated_at = time.monotonic()
+            service.capabilities_updated_at = time.monotonic()
+            service.register_agent_session(
+                "agent:main:first", "verify the first claim", "turn-first"
+            )
+            service.register_agent_session(
+                "agent:main:second", "verify the second claim", "turn-second"
+            )
+            decision = semantic_decision(
+                "direct", "Understood; I won't use that second plan.",
+                speech_act="correction", relation="correction", supersedes=True,
+                assembled_text="No, I meant the first one.",
+            )
+            client, _ = mock_semantic_model(decision)
+            with patch("server.aiohttp.ClientSession", return_value=client):
+                await service.speech_reply("No, I meant the first one.")
+            self.assertNotIn("turn-first", service.superseded_turn_ids)
+            self.assertIn("turn-second", service.superseded_turn_ids)
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_exact_cutoff_exchange_starts_no_agent_and_speaks_once(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.sessions_updated_at = time.monotonic()
+            service.capabilities_updated_at = time.monotonic()
+            service.tts.synthesize = AsyncMock(return_value=b"")
+            socket = AsyncMock()
+            handoffs = []
+
+            async def handoff(request, session_key, turn_id):
+                handoffs.append((request, session_key, turn_id))
+
+            decisions = [
+                (
+                    semantic_decision(
+                        "agent", "I'll verify that.", complete=False,
+                        speech_act="question",
+                        assembled_text="What are the latest updates for the",
+                    ),
+                    ("wait", "", None),
+                ),
+                (
+                    semantic_decision(
+                        "direct", "I don't have a complete subject to verify yet.",
+                        speech_act="meta", relation="meta", supersedes=True,
+                        assembled_text=(
+                            "It looks like my sentence was cut off. What are you going to verify?"
+                        ),
+                    ),
+                    ("direct", "I don't have a complete subject to verify yet.", None),
+                ),
+            ]
+
+            async def semantic_reply(*_args, **_kwargs):
+                payload, result = decisions.pop(0)
+                service.last_turn_understanding = parse_turn_understanding(
+                    json.dumps(payload), payload["assembled_text"]
+                )
+                if not service.last_turn_understanding.complete:
+                    service.pending_fragment = payload["assembled_text"]
+                else:
+                    service.pending_fragment = ""
+                return result
+
+            service.speech_reply = AsyncMock(side_effect=semantic_reply)
+            await service.process_turn(
+                socket, b"", transcript_override="What are the latest updates for the",
+                handoff_callback=handoff,
+            )
+            await service.process_turn(
+                socket, b"", transcript_override=(
+                    "It looks like my sentence was cut off. What are you going to verify?"
+                ), handoff_callback=handoff,
+            )
+
+            replies = [
+                call.args[0] for call in socket.send_json.await_args_list
+                if call.args[0].get("type") == "reply"
+            ]
+            self.assertEqual(handoffs, [])
+            self.assertEqual(len(replies), 1)
+            self.assertEqual(replies[0]["route"], "direct")
+            self.assertEqual(
+                replies[0]["text"], "I don't have a complete subject to verify yet."
+            )
+            fragments = [
+                event for event in service.recent_events()
+                if event.get("type") == "fragment"
+            ]
+            self.assertEqual(len(fragments), 1)
+            self.assertEqual(fragments[0]["status"], "awaiting_continuation")
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_semantic_continuation_assembles_then_routes_once(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.sessions_updated_at = time.monotonic()
+            service.capabilities_updated_at = time.monotonic()
+            first = semantic_decision(
+                "direct", "", complete=False, speech_act="question",
+                assembled_text="What are the latest updates for the",
+            )
+            second = semantic_decision(
+                "agent", "I'll check the latest Live Conversation updates.",
+                speech_act="question", relation="continuation", grounding=True,
+                assembled_text="What are the latest updates for the Live Conversation project?",
+            )
+            client, _ = mock_semantic_model(first, second)
+            with patch("server.aiohttp.ClientSession", return_value=client):
+                self.assertEqual(
+                    await service.speech_reply("What are the latest updates for the"),
+                    ("wait", "", None),
+                )
+                self.assertEqual(
+                    await service.speech_reply("Live Conversation project?"),
+                    ("agent", "I'll check the latest Live Conversation updates.", None),
+                )
+            self.assertEqual(service.pending_fragment, "")
+            self.assertEqual(
+                service.last_turn_understanding.assembled_text,
+                "What are the latest updates for the Live Conversation project?",
+            )
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_closed_app_hearing_question_does_not_use_presence_shortcut(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.sessions_updated_at = time.monotonic()
+            service.capabilities_updated_at = time.monotonic()
+            decision = semantic_decision(
+                "agent", "I'll verify the background listening behavior.",
+                speech_act="question", grounding=True,
+                assembled_text="Can you hear me when the app is closed?",
+            )
+            client, session = mock_semantic_model(decision)
+            with patch("server.aiohttp.ClientSession", return_value=client):
+                result = await service.speech_reply(
+                    "Can you hear me when the app is closed?"
+                )
+            self.assertEqual(result, (
+                "agent", "I'll verify the background listening behavior.", None
+            ))
+            self.assertEqual(session.post.call_count, 1)
+
+        import asyncio
+        asyncio.run(run_test())
+
     def test_prompt_ignores_background_speech_and_exposes_capabilities(self):
         prompt = speech_model_prompt(self.now, capabilities="agent research: Research\nskill weather: Forecasts")
         self.assertIn("`ignore`", prompt)
@@ -484,10 +721,13 @@ class RoutingTests(unittest.TestCase):
                 socket, b"audio", handoff_callback=start_handoff
             )
 
-            self.assertEqual(events, [
-                ("action_started", "Please fix the routing bug.", service.session_key),
-                "acknowledgment_delivered",
-            ])
+            self.assertEqual(events[0][0:2], (
+                "action_started", "Please fix the routing bug."
+            ))
+            self.assertTrue(events[0][2].startswith(
+                "agent:main:live-conversation-please-fix-routing-bug-"
+            ))
+            self.assertEqual(events[1], "acknowledgment_delivered")
             self.assertIsNone(handoff)
             messages = [call.args[0] for call in socket.send_json.await_args_list]
             action_status = next(
@@ -549,19 +789,23 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(SPEECH_MODEL_CONTEXT, 8192)
         self.assertEqual(SPEECH_MODEL_URL, "http://127.0.0.1:11439/api/chat")
         self.assertEqual(SPEECH_MODEL_KEEP_ALIVE, "30m")
-        self.assertEqual(SPEECH_NUM_PREDICT, 256)
-        self.assertEqual(SPEECH_RETRY_NUM_PREDICT, 512)
+        self.assertEqual(SPEECH_NUM_PREDICT, 384)
+        self.assertEqual(SPEECH_RETRY_NUM_PREDICT, 640)
 
     def test_partial_structured_reply_decodes_streamed_json_safely(self):
         self.assertEqual(
             partial_structured_reply(
-                '{"route":"direct","reply":"Hello\\nJohn. Next'
+                '{"route":"direct","complete":true,"reply":"Hello\\nJohn. Next'
             ),
             ("direct", "Hello\nJohn. Next"),
         )
         self.assertEqual(
-            partial_structured_reply('{"route":"agent","reply":"I will'),
+            partial_structured_reply('{"route":"agent","complete":true,"reply":"I will'),
             ("agent", "I will"),
+        )
+        self.assertEqual(
+            partial_structured_reply('{"route":"direct","reply":"Premature'),
+            ("direct", ""),
         )
 
     def test_incremental_direct_reply_starts_audio_before_final_text(self):
@@ -572,7 +816,7 @@ class RoutingTests(unittest.TestCase):
             stream = IncrementalSpeechStream(service, socket, "response-stream", 0)
 
             await stream.feed(
-                '{"route":"direct","reply":"This first sentence is ready. The next'
+                '{"route":"direct","complete":true,"reply":"This first sentence is ready. The next'
             )
             await asyncio.sleep(0)
             self.assertTrue(stream.started)
@@ -864,15 +1108,31 @@ class RoutingTests(unittest.TestCase):
         import asyncio
         asyncio.run(run_test())
 
-    def test_speech_reply_bypasses_model_for_explicit_new_agent(self):
+    def test_speech_reply_semantically_routes_explicit_new_agent(self):
         async def run_test():
             service = LiveConversationService("agent:main:live-conversation", 1.15)
-            with patch("server.aiohttp.ClientSession") as client_session:
+            service.sessions_updated_at = time.monotonic()
+            service.capabilities_updated_at = time.monotonic()
+            response = AsyncMock()
+            response.raise_for_status = lambda: None
+            response.json = AsyncMock(return_value={"message": {"content": json.dumps(
+                semantic_decision(
+                    "new_agent", "I'll start a separate agent for that.",
+                    actionable=True, speech_act="request",
+                    assembled_text="Spawn another agent to inspect transcription.",
+                )
+            )}})
+            context = MagicMock()
+            context.__aenter__.return_value = response
+            session = MagicMock()
+            session.post.return_value = context
+            session_context = MagicMock()
+            session_context.__aenter__.return_value = session
+            with patch("server.aiohttp.ClientSession", return_value=session_context):
                 self.assertEqual(
                     await service.speech_reply("Spawn another agent to inspect transcription."),
                     ("new_agent", "I'll start a separate agent for that.", None),
                 )
-                client_session.assert_not_called()
 
         import asyncio
         asyncio.run(run_test())
@@ -1022,11 +1282,27 @@ class RoutingTests(unittest.TestCase):
             service.register_agent_session(key, "fix message cutoff")
             service.sessions_updated_at = time.monotonic()
             service.capabilities_updated_at = time.monotonic()
-
-            self.assertEqual(
-                await service.speech_reply("Tell that agent to also check long replies."),
-                ("session", "I'll add that to the same agent.", key),
-            )
+            response = AsyncMock()
+            response.raise_for_status = lambda: None
+            response.json = AsyncMock(return_value={"message": {"content": json.dumps(
+                semantic_decision(
+                    "session", "I'll add that to the same agent.",
+                    actionable=True, speech_act="request",
+                    assembled_text="Tell that agent to also check long replies.",
+                    session_key=key,
+                )
+            )}})
+            context = MagicMock()
+            context.__aenter__.return_value = response
+            session = MagicMock()
+            session.post.return_value = context
+            session_context = MagicMock()
+            session_context.__aenter__.return_value = session
+            with patch("server.aiohttp.ClientSession", return_value=session_context):
+                self.assertEqual(
+                    await service.speech_reply("Tell that agent to also check long replies."),
+                    ("session", "I'll add that to the same agent.", key),
+                )
 
         import asyncio
         asyncio.run(run_test())
@@ -1084,21 +1360,18 @@ class RoutingTests(unittest.TestCase):
                 return await service.speech_reply(transcript)
 
         import asyncio
-        invented = {
-            "route": "agent",
-            "reply": "I'll have the agent monitor that.",
-            "session_key": "",
-        }
-        missing_route = {
-            "route": "direct",
-            "reply": "I'll have the agent fix that.",
-            "session_key": "",
-        }
-        empty_ack = {
-            "route": "direct",
-            "reply": "I understand.",
-            "session_key": "",
-        }
+        invented = semantic_decision(
+            "agent", "I'll have the agent monitor that.",
+            actionable=False, assembled_text="The response feels the same.",
+        )
+        missing_route = semantic_decision(
+            "direct", "I'll have the agent fix that.", actionable=True,
+            speech_act="request", assembled_text="Please fix the response latency.",
+        )
+        empty_ack = semantic_decision(
+            "direct", "I understand.", actionable=True, speech_act="request",
+            assembled_text="Assign an agent to review this conversation and make improvements.",
+        )
         self.assertEqual(
             asyncio.run(decide("The response feels the same.", invented)),
             ("direct", "I understand.", None),
@@ -1179,14 +1452,13 @@ class RoutingTests(unittest.TestCase):
             self.assertFalse(any(message["type"] == "acknowledgment" for message in messages))
             self.assertFalse(any(AGENT_SENTINEL in str(message) for message in messages))
             self.assertEqual(service.tts.synthesize.await_args_list[0].args[0], "I’ll ask the agent to check that.")
-            self.assertEqual(
-                handoff,
-                (
-                    "Check the RAG app and report progress.",
-                    "I’ll ask the agent to check that.",
-                    "agent:main:live-conversation",
-                ),
-            )
+            self.assertEqual(handoff[:2], (
+                "Check the RAG app and report progress.",
+                "I’ll ask the agent to check that.",
+            ))
+            self.assertTrue(handoff[2].startswith(
+                "agent:main:live-conversation-check-rag-app-report-progress-"
+            ))
 
         import asyncio
         asyncio.run(run_test())
@@ -1211,10 +1483,11 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(replies[-1]["route"], "confirmation")
             self.assertIn("should I proceed", replies[-1]["text"])
 
+            pending_key = service.pending_confirmation[1]
             handoff = await service.process_turn(socket, b"second")
             self.assertEqual(
                 handoff,
-                ("Fix the routing bug.", "Okay, proceeding.", service.session_key),
+                ("Fix the routing bug.", "Okay, proceeding.", pending_key),
             )
             self.assertIsNone(service.pending_confirmation)
             self.assertEqual(service.speech_reply.await_count, 1)

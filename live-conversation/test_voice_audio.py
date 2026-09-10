@@ -27,6 +27,7 @@ from server import (
     PersistentTtsWorker,
     SAMPLE_RATE,
     SMART_TURN_MODEL_PATH,
+    TurnUnderstanding,
 )
 from semantic_turn import SemanticTurnDetector
 
@@ -43,6 +44,8 @@ PHRASES = {
     "echo": "I am still speaking an older assistant response.",
     "unfinished": "I think the important thing is because",
     "finished": "Please review the voice logs now.",
+    "cutoff": "What are the latest updates for the",
+    "meta_verify": "My sentence was cut off. What are you going to verify?",
 }
 
 
@@ -234,6 +237,63 @@ class VoiceModelAudioIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assert_words_heard(user_turns[1], "second", "weather")
         self.assert_words_heard(user_turns[2], "third", "tomorrow")
         self.assertEqual(service.speech_reply.await_count, 3)
+
+    async def test_generated_cutoff_exchange_never_launches_an_agent(self) -> None:
+        service = self.service()
+        service.tts.synthesize = AsyncMock(return_value=b"")
+        socket = AsyncMock()
+        handoffs = []
+        decisions = [
+            (
+                TurnUnderstanding(
+                    False, 0.99, "question", "new", False, False, False,
+                    "What are the latest updates for the", "missing requested subject",
+                ),
+                ("wait", "", None),
+            ),
+            (
+                TurnUnderstanding(
+                    True, 0.99, "meta", "meta", False, False, True,
+                    "My sentence was cut off. What are you going to verify?",
+                    "question about the assistant's prior plan",
+                ),
+                ("direct", "I don't have a complete subject to verify yet.", None),
+            ),
+        ]
+
+        async def semantic_reply(*_args, **_kwargs):
+            understanding, result = decisions.pop(0)
+            service.last_turn_understanding = understanding
+            service.pending_fragment = (
+                understanding.assembled_text if not understanding.complete else ""
+            )
+            return result
+
+        async def handoff(request, session_key, turn_id):
+            handoffs.append((request, session_key, turn_id))
+
+        service.speech_reply = AsyncMock(side_effect=semantic_reply)
+        await service.process_turn(
+            socket, self.audio["cutoff"], handoff_callback=handoff
+        )
+        await service.process_turn(
+            socket, self.audio["meta_verify"], handoff_callback=handoff
+        )
+
+        transcripts = [
+            call.args[0]["text"] for call in socket.send_json.await_args_list
+            if call.args[0].get("type") == "transcript"
+        ]
+        self.assertEqual(len(transcripts), 2)
+        self.assert_words_heard(transcripts[0], "latest", "updates")
+        self.assert_words_heard(transcripts[1], "sentence", "verify")
+        replies = [
+            call.args[0] for call in socket.send_json.await_args_list
+            if call.args[0].get("type") == "reply"
+        ]
+        self.assertEqual(handoffs, [])
+        self.assertEqual(len(replies), 1)
+        self.assertEqual(replies[0]["route"], "direct")
 
     async def test_synthesized_stop_interrupts_silently(self) -> None:
         service = self.service()

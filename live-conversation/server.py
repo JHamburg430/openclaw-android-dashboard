@@ -10,6 +10,7 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime
 import json
+import inspect
 import logging
 import os
 from pathlib import Path
@@ -49,8 +50,8 @@ SPEECH_MODEL_URL = "http://127.0.0.1:11439/api/chat"
 SPEECH_MODEL = "openclaw-live-conversation:4b"
 SPEECH_MODEL_KEEP_ALIVE = "30m"
 SPEECH_MODEL_CONTEXT = 8_192
-SPEECH_NUM_PREDICT = 256
-SPEECH_RETRY_NUM_PREDICT = 512
+SPEECH_NUM_PREDICT = 384
+SPEECH_RETRY_NUM_PREDICT = 640
 AGENT_SENTINEL = "[[OPENCLAW_AGENT]]"
 NEW_AGENT_SENTINEL = "[[OPENCLAW_NEW]]"
 SAY_SENTINEL = "[[SAY]]"
@@ -68,6 +69,36 @@ SPEECH_OUTPUT_SCHEMA = {
     "required": ["route", "reply", "session_key"],
     "additionalProperties": False,
 }
+TURN_UNDERSTANDING_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "complete": {"type": "boolean"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "speech_act": {
+            "type": "string",
+            "enum": [
+                "request", "question", "answer", "statement", "correction",
+                "continuation", "meta", "control", "ambient",
+            ],
+        },
+        "relation": {
+            "type": "string",
+            "enum": ["new", "continuation", "correction", "meta"],
+        },
+        "actionable": {"type": "boolean"},
+        "requires_grounding": {"type": "boolean"},
+        "supersedes_previous": {"type": "boolean"},
+        "assembled_text": {"type": "string"},
+        "reason": {"type": "string"},
+    },
+    "required": [
+        "complete", "confidence", "speech_act", "relation", "actionable",
+        "requires_grounding", "supersedes_previous", "assembled_text", "reason",
+    ],
+    "additionalProperties": False,
+}
+SPEECH_OUTPUT_SCHEMA["properties"].update(TURN_UNDERSTANDING_SCHEMA["properties"])
+SPEECH_OUTPUT_SCHEMA["required"].extend(TURN_UNDERSTANDING_SCHEMA["required"])
 CAPABILITY_CACHE_SECONDS = 60
 SESSION_CACHE_SECONDS = 3
 SESSION_POLL_SECONDS = 10
@@ -213,7 +244,11 @@ def direct_voice_surface_reply(transcript: str) -> str | None:
         r"\b(?:can|could|do|did|are) you (?:actually )?(?:able to )?hear(?:ing)? me\b",
         normalized,
     )
-    if hearing_check:
+    environmental_state = re.search(
+        r"\b(?:closed|minimized|minimised|background|locked|screen off|app off)\b",
+        normalized,
+    )
+    if hearing_check and not environmental_state:
         return "Yes, I can hear you clearly."
     if normalized in {
         "who are you",
@@ -226,19 +261,6 @@ def direct_voice_surface_reply(transcript: str) -> str | None:
             "I'm Jarvis, the model operating Live Conversation. "
             "I answer here directly and use gateway agents when tool-backed work is needed."
         )
-    testing_statement = re.match(
-        r"^(?:(?:i am|i'm) )?(?:just )?(?:testing|testing out|trying|trying out|"
-        r"checking|checking out)\b",
-        normalized,
-    )
-    explicit_request = re.search(
-        r"\b(?:can|could|would|will) you\b|\bplease\b|"
-        r"\b(?:have|ask|tell)\b.*\bagent\b|"
-        r"\band (?:fix|change|update|monitor|verify|review|inspect|start|spawn|launch)\b",
-        normalized,
-    )
-    if testing_statement and not explicit_request:
-        return "I hear you. Go ahead with the test."
     return None
 
 
@@ -453,6 +475,66 @@ class TurnMetrics:
     route: str = ""
 
 
+@dataclass(frozen=True)
+class TurnUnderstanding:
+    """One semantic contract shared by endpointing, routing, and recovery."""
+
+    complete: bool
+    confidence: float
+    speech_act: str
+    relation: str
+    actionable: bool
+    requires_grounding: bool
+    supersedes_previous: bool
+    assembled_text: str
+    reason: str
+
+
+def turn_understanding_prompt(
+    transcript: str,
+    pending_fragment: str = "",
+    recent_context: list[dict[str, str]] | None = None,
+) -> str:
+    context = json.dumps((recent_context or [])[-6:], ensure_ascii=False)
+    return f"""You are the semantic turn controller for a realtime voice assistant.
+Classify meaning, not isolated words. Your output controls endpointing and whether tools may run.
+
+Current transcript: {json.dumps(transcript, ensure_ascii=False)}
+Unresolved earlier fragment: {json.dumps(pending_fragment, ensure_ascii=False)}
+Recent dialogue: {context}
+
+Return exactly one JSON object containing every one of these keys, even when a value is empty:
+`route`, `reply`, `session_key`, `complete`, `confidence`, `speech_act`, `relation`,
+`actionable`, `requires_grounding`, `supersedes_previous`, `assembled_text`, and `reason`.
+Never omit a key. `confidence` must be a JSON number from 0 through 1. `relation` must be exactly
+one of `new`, `continuation`, `correction`, or `meta`; incompleteness belongs only in `complete`.
+- `complete` is true only when the speaker has expressed a complete communicative act. A fluent-sounding clause can still be incomplete. "What are the latest updates for the" is incomplete because its object is missing. Do not let punctuation, silence, or acoustic endpoint confidence override missing meaning.
+- `speech_act` describes the whole utterance. `meta` means the speaker is asking about or correcting the assistant's immediately preceding behavior, plan, wording, or claim.
+- `relation` describes how this transcript relates to the unresolved fragment or recent dialogue. Use `continuation` when it completes the unresolved thought, `correction` when it replaces/repairs it, and `meta` for questions such as "What are you going to verify?"
+- `actionable` is true only for an actual request, command, or unmistakable instruction to do work. Mentioning words such as latest, verify, agent, update, test, or fix is not authorization by itself.
+- `requires_grounding` is true only when answering the complete communicative act requires current/private/tool-backed evidence. A meta-question about what the assistant just said does not require grounding merely because it repeats "verify" or "latest".
+- `supersedes_previous` is true when this turn corrects, retracts, or replaces the prior turn or its planned response.
+- `assembled_text` is the exact complete meaning to route. Combine the unresolved fragment with this transcript only when they form one coherent thought. If the current transcript is incomplete, preserve it verbatim. If it is a new unrelated turn, use only the current transcript.
+- `reason` is a short semantic explanation, never a keyword citation.
+
+Complete examples (the reply wording may vary, but all keys are mandatory):
+Current: "What are the latest updates for the"
+{{"route":"direct","reply":"","session_key":null,"complete":false,"confidence":0.98,"speech_act":"question","relation":"new","actionable":false,"requires_grounding":false,"supersedes_previous":false,"assembled_text":"What are the latest updates for the","reason":"The requested subject is missing, so the thought is unfinished."}}
+
+Pending: "What are the latest updates for the"; current: "Live Conversation project?"
+{{"route":"agent","reply":"I'll check the latest Live Conversation project updates.","session_key":null,"complete":true,"confidence":0.97,"speech_act":"question","relation":"continuation","actionable":true,"requires_grounding":true,"supersedes_previous":false,"assembled_text":"What are the latest updates for the Live Conversation project?","reason":"The second fragment supplies the missing subject and asks for current information."}}
+
+Recent assistant: "I'll verify that"; current: "What are you going to verify?"
+{{"route":"direct","reply":"I was referring to the subject of your previous request, but that request was cut off before you named it.","session_key":null,"complete":true,"confidence":0.99,"speech_act":"meta","relation":"meta","actionable":false,"requires_grounding":false,"supersedes_previous":true,"assembled_text":"What are you going to verify?","reason":"This asks about the assistant's stated plan rather than requesting a new verification."}}
+
+Current: "I'm testing the latest update"
+{{"route":"direct","reply":"Understood.","session_key":null,"complete":true,"confidence":0.99,"speech_act":"statement","relation":"new","actionable":false,"requires_grounding":false,"supersedes_previous":false,"assembled_text":"I'm testing the latest update","reason":"This reports the speaker's activity and does not request work."}}
+
+Current: "Please verify the latest release"
+{{"route":"agent","reply":"I'll verify the latest release.","session_key":null,"complete":true,"confidence":0.99,"speech_act":"request","relation":"new","actionable":true,"requires_grounding":true,"supersedes_previous":false,"assembled_text":"Please verify the latest release","reason":"This explicitly requests a current, tool-backed verification."}}
+"""
+
+
 def speech_model_prompt(
     now: datetime | None = None,
     agent_pending: bool = False,
@@ -488,7 +570,7 @@ Return one JSON object matching the required schema. Choose `route` before writi
 - `session`: only for a follow-up clearly aimed at one listed session. Copy its exact key into `session_key`; never invent one.
 - `ignore`: only speech clearly not addressed to you and having no plausible conversational meaning. Use an empty reply.
 For every action route (`agent`, `new_agent`, or `session`), `reply` is a brief, natural acknowledgment. Say what you are about to do; never imply the action already happened or include an unverified result. Once routing and authorization are final, the bridge dispatches the action while the acknowledgment is spoken. A silent stop command is the sole exception because its purpose is to stop speech immediately.
-Use an empty `session_key` for every route except `session`. A question about status or currently running work is `direct`; answer it from the session summary. If a transcript is visibly unfinished, ask John to finish it with `direct`. Imperfect grammar alone is not grounds to ignore a turn.
+Use an empty `session_key` for every route except `session`. A question about status or currently running work is `direct`; answer it from the session summary. If a transcript is semantically unfinished, set `complete` false, use `direct` with an empty reply, and take no action; the bridge will keep listening for the continuation. Imperfect grammar alone is not grounds to ignore a turn.
 The current local date and time is {clock.strftime('%A, %B %-d, %Y, %-I:%M %p')} America/Detroit; time and date questions can be answered directly.
 Available OpenClaw capabilities (cached and refreshed automatically):
 {capabilities or 'Capability catalog is temporarily unavailable; delegate capability questions to the agent.'}
@@ -558,6 +640,61 @@ def parse_speech_model_output(text: str) -> tuple[str, str, str | None]:
     if SAY_SENTINEL in cleaned:
         cleaned = cleaned.split(SAY_SENTINEL, 1)[1].strip()
     return "direct", cleaned, None
+
+
+def parse_turn_understanding(text: str, transcript: str) -> TurnUnderstanding:
+    """Parse the semantic controller strictly; fail closed on malformed output."""
+    try:
+        payload = json.loads(text.strip())
+    except (TypeError, ValueError) as error:
+        # Preserve the legacy sentinel protocol during rolling upgrades. The
+        # current JSON-schema path always supplies the semantic fields.
+        route, _, _ = parse_speech_model_output(text)
+        if not any(marker in text for marker in (
+            AGENT_SENTINEL, NEW_AGENT_SENTINEL, SAY_SENTINEL, IGNORE_SENTINEL,
+            "[[OPENCLAW_SESSION:",
+        )):
+            raise ValueError("semantic controller returned invalid JSON") from error
+        action = route in {"agent", "new_agent", "session"}
+        return TurnUnderstanding(
+            True, 1.0, "request" if action else "statement", "new",
+            action, False, False, transcript, "legacy sentinel decision",
+        )
+    if not isinstance(payload, dict):
+        raise ValueError("semantic controller returned a non-object")
+    if "speech_act" not in payload and {"route", "reply", "session_key"} <= payload.keys():
+        route = payload.get("route")
+        action = route in {"agent", "new_agent", "session"}
+        return TurnUnderstanding(
+            True, 1.0, "request" if action else "statement", "new",
+            action, False, False, transcript, "legacy structured decision",
+        )
+    speech_act = payload.get("speech_act")
+    relation = payload.get("relation")
+    if speech_act not in {
+        "request", "question", "answer", "statement", "correction",
+        "continuation", "meta", "control", "ambient",
+    }:
+        raise ValueError("semantic controller returned an invalid speech act")
+    if relation not in {"new", "continuation", "correction", "meta"}:
+        raise ValueError("semantic controller returned an invalid relation")
+    confidence = payload.get("confidence")
+    if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+        raise ValueError("semantic controller returned invalid confidence")
+    assembled = payload.get("assembled_text")
+    if not isinstance(assembled, str) or not assembled.strip():
+        assembled = transcript
+    return TurnUnderstanding(
+        complete=payload.get("complete") is True,
+        confidence=max(0.0, min(1.0, float(confidence))),
+        speech_act=speech_act,
+        relation=relation,
+        actionable=payload.get("actionable") is True,
+        requires_grounding=payload.get("requires_grounding") is True,
+        supersedes_previous=payload.get("supersedes_previous") is True,
+        assembled_text=re.sub(r"\s+", " ", assembled).strip(),
+        reason=str(payload.get("reason") or "semantic classification").strip()[:240],
+    )
 
 
 def extract_agent_text(payload: Any) -> str:
@@ -853,6 +990,10 @@ def split_spoken_text(text: str, max_chars: int = 90) -> list[str]:
 def partial_structured_reply(text: str) -> tuple[str | None, str]:
     """Extract the route and currently decoded reply from partial JSON."""
     route_match = re.search(r'"route"\s*:\s*"([^"\\]*)"', text)
+    # Never synthesize a provisional reply before the same semantic decision
+    # has affirmatively classified the user's thought as complete.
+    if not re.search(r'"complete"\s*:\s*true\b', text):
+        return route_match.group(1) if route_match else None, ""
     reply_match = re.search(r'"reply"\s*:\s*"', text)
     if not reply_match:
         return route_match.group(1) if route_match else None, ""
@@ -1104,6 +1245,10 @@ class LiveConversationService:
         self.pending_spoken_replies: deque[str] = deque(maxlen=10)
         self.confirmation_required = False
         self.pending_confirmation: tuple[str, str | None, str] | None = None
+        self.pending_fragment = ""
+        self.pending_fragment_turn_id: str | None = None
+        self.last_turn_understanding: TurnUnderstanding | None = None
+        self.superseded_turn_ids: set[str] = set()
         self.recent_agent_sessions: deque[dict[str, Any]] = deque(maxlen=12)
         self.history_path = Path(history_path) if history_path else None
         self.settings_path = Path(settings_path) if settings_path else None
@@ -1288,7 +1433,10 @@ class LiveConversationService:
         # remains collision-resistant without looking like a giant cardinal.
         return f"agent:main:live-conversation-{slug or 'task'}-{secrets.token_hex(6)}"
 
-    def register_agent_session(self, session_key: str, request: str) -> None:
+    def register_agent_session(
+        self, session_key: str, request: str, origin_turn_id: str | None = None
+    ) -> None:
+        self.session_keys.add(session_key)
         self.recent_agent_sessions = deque(
             (item for item in self.recent_agent_sessions if item.get("session_key") != session_key),
             maxlen=12,
@@ -1299,6 +1447,7 @@ class LiveConversationService:
             "request": re.sub(r"\s+", " ", request).strip(),
             "state": "running",
             "started_at": int(time.time()),
+            "origin_turn_id": origin_turn_id,
             **entity_state,
             "result": "",
         })
@@ -1306,6 +1455,7 @@ class LiveConversationService:
         self.record_event(
             "tool", tool="gateway_agent", action="start", status="running",
             session_key=session_key, request=re.sub(r"\s+", " ", request).strip(),
+            turn_id=origin_turn_id,
         )
         self._save_settings()
         self._save_history()
@@ -1329,6 +1479,19 @@ class LiveConversationService:
 
     def latest_agent_session(self) -> dict[str, Any] | None:
         return dict(self.recent_agent_sessions[-1]) if self.recent_agent_sessions else None
+
+    def supersede_previous_agent_turn(self) -> None:
+        """Suppress only the callback owned by the immediately corrected plan."""
+        for item in reversed(self.recent_agent_sessions):
+            origin = item.get("origin_turn_id")
+            if origin and item.get("state") == "running":
+                self.superseded_turn_ids.add(str(origin))
+                self.record_event(
+                    "interruption", turn_id=origin,
+                    status="agent_callback_superseded_by_correction",
+                )
+                self._save_history()
+                return
 
     def resolve_agent_session(self, transcript: str) -> dict[str, Any] | None:
         """Resolve a referenced voice session by topic, falling back to recency."""
@@ -1517,9 +1680,6 @@ class LiveConversationService:
             "options": {
                 "temperature": 0,
                 "num_predict": 3,
-                # Match real requests. Ollama keys runners by context size, so
-                # warming a 512-token context still made the first live turn
-                # rebuild the runner for 8k.
                 "num_ctx": SPEECH_MODEL_CONTEXT,
             },
         }
@@ -1817,29 +1977,17 @@ class LiveConversationService:
         self, text: str, agent_pending: bool = False,
         stream_callback: Callable[[str], Awaitable[None]] | None = None,
     ) -> tuple[str, str, str | None]:
+        # Safety/presence controls remain deterministic. They do not authorize
+        # work and cannot be confused with the semantic routing problem.
         direct_reply = direct_voice_surface_reply(text)
         if direct_reply:
             return "direct", direct_reply, None
-        if is_explicit_new_agent_request(text):
-            return "new_agent", "I'll start a separate agent for that.", None
         status_question = is_gateway_status_question(text)
-        if time.monotonic() - self.capabilities_updated_at >= CAPABILITY_CACHE_SECONDS:
-            if not self.capability_refresh_task or self.capability_refresh_task.done():
-                self.capability_refresh_task = asyncio.create_task(self.refresh_capabilities())
         if status_question:
             await self.refresh_sessions(force=True)
             freshness_reply = self.session_freshness_reply()
             if freshness_reply:
                 return "direct", freshness_reply, None
-        elif time.monotonic() - self.sessions_updated_at >= SESSION_CACHE_SECONDS:
-            if not self.session_refresh_task or self.session_refresh_task.done():
-                self.session_refresh_task = asyncio.create_task(self.refresh_sessions())
-            if not self.sessions:
-                try:
-                    await asyncio.wait_for(asyncio.shield(self.session_refresh_task), timeout=2.5)
-                except asyncio.TimeoutError:
-                    pass
-        if status_question:
             if is_referential_agent_question(text):
                 tracked = self.resolve_agent_session(text)
                 if tracked:
@@ -1848,12 +1996,18 @@ class LiveConversationService:
                         tracked, self.session_records.get(key)
                     ), None
             return "direct", summarize_gateway_status(self.sessions, agent_pending), None
-        if is_referential_agent_question(text) and has_explicit_action_request(text):
-            tracked = self.resolve_agent_session(text)
-            if tracked:
-                return "session", "I'll add that to the same agent.", str(tracked["session_key"])
-        if requires_authoritative_lookup(text):
-            return "agent", "I'll verify that against a current source.", None
+
+        if time.monotonic() - self.capabilities_updated_at >= CAPABILITY_CACHE_SECONDS:
+            if not self.capability_refresh_task or self.capability_refresh_task.done():
+                self.capability_refresh_task = asyncio.create_task(self.refresh_capabilities())
+        if time.monotonic() - self.sessions_updated_at >= SESSION_CACHE_SECONDS:
+            if not self.session_refresh_task or self.session_refresh_task.done():
+                self.session_refresh_task = asyncio.create_task(self.refresh_sessions())
+            if not self.sessions:
+                try:
+                    await asyncio.wait_for(asyncio.shield(self.session_refresh_task), timeout=2.5)
+                except asyncio.TimeoutError:
+                    pass
         capabilities = self.capabilities
         payload = {
             "model": SPEECH_MODEL,
@@ -1870,6 +2024,11 @@ class LiveConversationService:
                     event_context=self.event_context_summary(),
                     confirmation_required=self.confirmation_required,
                 )},
+                {"role": "system", "content": turn_understanding_prompt(
+                    text,
+                    pending_fragment=self.pending_fragment,
+                    recent_context=self.prompt_history(),
+                )},
                 *self.prompt_history(),
                 {"role": "user", "content": text},
             ],
@@ -1879,7 +2038,7 @@ class LiveConversationService:
                 "num_ctx": SPEECH_MODEL_CONTEXT,
             },
         }
-        timeout = aiohttp.ClientTimeout(total=15)
+        timeout = aiohttp.ClientTimeout(total=30)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 result: dict[str, Any] = {}
@@ -1941,9 +2100,48 @@ class LiveConversationService:
                 result.get("prompt_eval_duration", 0) / 1_000_000,
                 result.get("eval_duration", 0) / 1_000_000,
             )
-            route, reply, target_session = parse_speech_model_output(
-                result.get("message", {}).get("content", "")
+            raw_decision = result.get("message", {}).get("content", "")
+            understanding = parse_turn_understanding(raw_decision, text)
+            self.last_turn_understanding = understanding
+            LOGGER.info(
+                "turn_understanding complete=%s confidence=%.3f act=%s relation=%s "
+                "actionable=%s grounding=%s supersedes=%s reason=%r transcript=%r",
+                understanding.complete, understanding.confidence,
+                understanding.speech_act, understanding.relation,
+                understanding.actionable, understanding.requires_grounding,
+                understanding.supersedes_previous, understanding.reason, text,
             )
+            if understanding.supersedes_previous:
+                self.supersede_previous_agent_turn()
+            if not understanding.complete or understanding.confidence < 0.65:
+                self.pending_fragment = text.strip()
+                return "wait", "", None
+            effective_text = understanding.assembled_text or text
+            if self.pending_fragment:
+                if understanding.relation in {"continuation", "correction"}:
+                    LOGGER.info(
+                        "semantic_fragment_resolved relation=%s pending=%r assembled=%r",
+                        understanding.relation, self.pending_fragment, effective_text,
+                    )
+                else:
+                    LOGGER.info(
+                        "semantic_fragment_superseded pending=%r new=%r",
+                        self.pending_fragment, effective_text,
+                    )
+                    if self.pending_fragment_turn_id:
+                        self.superseded_turn_ids.add(self.pending_fragment_turn_id)
+                self.pending_fragment = ""
+                self.pending_fragment_turn_id = None
+
+            route, reply, target_session = parse_speech_model_output(raw_decision)
+            if is_referential_agent_question(effective_text) and understanding.actionable:
+                tracked = self.resolve_agent_session(effective_text)
+                if tracked:
+                    route, target_session = "session", str(tracked["session_key"])
+                    reply = reply or "I'll add that to the same agent."
+            elif understanding.requires_grounding:
+                route, target_session = "agent", None
+                reply = reply or "I'll verify that against a current source."
             reply = repair_known_transcription_errors(reply)
             if has_stale_identity_confusion(reply):
                 LOGGER.warning("speech_supervisor_repaired_false_identity")
@@ -1953,14 +2151,13 @@ class LiveConversationService:
                     "I answer here directly and use gateway agents when tool-backed work is needed.",
                     None,
                 )
-            explicit_action = (
-                has_explicit_action_request(text)
-                or requires_authoritative_lookup(text)
-            )
-            if route in {"agent", "new_agent", "session"} and not explicit_action:
+            if route in {"agent", "new_agent", "session"} and not (
+                understanding.actionable or understanding.requires_grounding
+            ):
                 LOGGER.warning("speech_supervisor_blocked_unrequested_action route=%s", route)
-                route, reply, target_session = "direct", "I understand.", None
-            elif route == "direct" and explicit_action and re.fullmatch(
+                route, target_session = "direct", None
+                reply = remove_unrequested_action_promises(reply)
+            elif route == "direct" and understanding.actionable and re.fullmatch(
                 r"(?i)(?:i understand|understood|okay|ok|all right|got it)[.!]?",
                 reply.strip(),
             ):
@@ -1971,7 +2168,7 @@ class LiveConversationService:
                     None,
                 )
             elif route == "direct" and is_operational_acknowledgment(reply):
-                if explicit_action:
+                if understanding.actionable or understanding.requires_grounding:
                     LOGGER.warning("speech_supervisor_repaired_missing_agent_route")
                     route, target_session = "agent", None
                 else:
@@ -2078,7 +2275,7 @@ class LiveConversationService:
     async def process_turn(
         self, socket: web.WebSocketResponse, audio: bytes, agent_pending: bool = False,
         turn_generation: int | None = None,
-        handoff_callback: Callable[[str, str | None], Awaitable[None]] | None = None,
+        handoff_callback: Callable[[str, str | None, str], Awaitable[None]] | None = None,
         transcript_override: str | None = None,
     ) -> tuple[str, str, str | None] | None:
         started = time.perf_counter()
@@ -2109,12 +2306,7 @@ class LiveConversationService:
             incremental_speech = IncrementalSpeechStream(
                 self, socket, response_id, turn_generation
             )
-            assembled_text = self.assemble_turn_text(transcript)
-            if assembled_text != transcript:
-                LOGGER.info(
-                    "turn_continuation_assembled turn_id=%s raw=%r assembled=%r",
-                    turn_id, transcript, assembled_text,
-                )
+            assembled_text = transcript
             handoff_request: str | None = None
             policy_command = confirmation_policy_command(assembled_text)
             answer = confirmation_answer(transcript) if self.pending_confirmation else None
@@ -2140,7 +2332,7 @@ class LiveConversationService:
                     route, reply, target_session = "direct", "Okay, I won't take that action.", None
             else:
                 routing_task = asyncio.create_task(self.speech_reply(
-                    assembled_text, agent_pending=agent_pending,
+                    transcript, agent_pending=agent_pending,
                     stream_callback=incremental_speech.feed,
                 ))
                 while not routing_task.done():
@@ -2168,9 +2360,29 @@ class LiveConversationService:
                         })
                         return None
                 route, reply, target_session = routing_task.result()
+                understanding = self.last_turn_understanding
+                if understanding is not None:
+                    assembled_text = understanding.assembled_text or transcript
+                if route == "wait":
+                    await incremental_speech.cancel()
+                    self.pending_fragment_turn_id = turn_id
+                    self.record_event(
+                        "fragment", turn_id=turn_id, status="awaiting_continuation",
+                        content=transcript,
+                        metadata={
+                            "confidence": understanding.confidence if understanding else 0,
+                            "reason": understanding.reason if understanding else "incomplete",
+                        },
+                    )
+                    self._save_history()
+                    await socket.send_json({
+                        "type": "state", "state": "listening",
+                        "detail": "Waiting for you to finish the thought.",
+                    })
+                    return None
                 agent_request = assembled_text
                 if route in ("agent", "new_agent", "session"):
-                    if route == "new_agent" and target_session is None:
+                    if route in {"agent", "new_agent"} and target_session is None:
                         target_session = self.allocate_agent_session_key(agent_request)
                     if self.confirmation_required:
                         self.pending_confirmation = (agent_request, target_session, route)
@@ -2212,8 +2424,6 @@ class LiveConversationService:
 
             prepared_handoff: tuple[str, str | None] | None = None
             if handoff_request is not None:
-                if route == "agent":
-                    target_session = self.session_key
                 repaired_request = repair_known_transcription_errors(handoff_request)
                 if repaired_request != handoff_request:
                     LOGGER.info(
@@ -2228,7 +2438,10 @@ class LiveConversationService:
                 # Authorized work starts as soon as routing is final. Spoken
                 # acknowledgment proceeds concurrently and cannot add latency.
                 if handoff_callback is not None:
-                    await handoff_callback(*prepared_handoff)
+                    if len(inspect.signature(handoff_callback).parameters) >= 3:
+                        await handoff_callback(*prepared_handoff, turn_id)
+                    else:
+                        await handoff_callback(*prepared_handoff)
 
             if route == "direct":
                 metrics.tts_ms = await incremental_speech.finish(reply, route)
@@ -2383,10 +2596,12 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
         except Exception as error:
             LOGGER.warning("partial_transcription_failed error=%s", error)
 
-    async def run_agent(transcript: str, target_session: str | None) -> None:
+    async def run_agent(
+        transcript: str, target_session: str | None, origin_turn_id: str
+    ) -> None:
         if target_session is None:
             target_session = service.allocate_agent_session_key(transcript)
-        service.register_agent_session(target_session, transcript)
+        service.register_agent_session(target_session, transcript, origin_turn_id)
         work = asyncio.create_task(service.agent_reply(transcript, target_session))
         refresh = asyncio.create_task(service.refresh_sessions(force=True))
         started = time.monotonic()
@@ -2403,6 +2618,17 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
             await refresh
             service.update_agent_session(target_session, "complete", reply)
             await service.refresh_sessions(force=True)
+            if origin_turn_id in service.superseded_turn_ids:
+                LOGGER.info(
+                    "agent_callback_suppressed_superseded_turn turn_id=%s session=%s",
+                    origin_turn_id, target_session,
+                )
+                if not socket.closed:
+                    await socket.send_json({
+                        "type": "agent_status", "state": "superseded",
+                        "sessionKey": target_session,
+                    })
+                return
             if socket.closed:
                 service.remember("assistant", reply)
                 service.queue_pending_reply(reply)
@@ -2464,8 +2690,12 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
                 })
 
     async def run_turn(turn: bytes, generation: int, transcript: str | None) -> None:
-        async def start_handoff(transcript: str, target_session: str | None) -> None:
-            task = asyncio.create_task(run_agent(transcript, target_session))
+        async def start_handoff(
+            transcript: str, target_session: str | None, origin_turn_id: str
+        ) -> None:
+            task = asyncio.create_task(run_agent(
+                transcript, target_session, origin_turn_id
+            ))
             agent_tasks.add(task)
             task.add_done_callback(agent_tasks.discard)
 
@@ -2480,7 +2710,9 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
         # Compatibility for test doubles and older service implementations.
         if handoff:
             transcript, _, target_session = handoff
-            await start_handoff(transcript, target_session)
+            await start_handoff(
+                transcript, target_session, f"legacy-turn-{time.time_ns()}"
+            )
 
     async def run_turn_queue() -> None:
         while True:
