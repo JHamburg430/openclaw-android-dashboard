@@ -154,18 +154,18 @@ function harness() {
   app.run(0.001, 25);
   assert.equal(app.count("commit"), 0, "a 500 ms thinking pause stays in one utterance");
   app.run(0.030, 10);
-  app.run(0.001, 30);
-  assert.equal(app.count("commit"), 1, "600 ms of silence commits exactly one utterance");
+  app.run(0.001, 35);
+  assert.equal(app.count("commit"), 1, "700 ms of silence commits an ordinary utterance");
 }
 
 {
   const app = harness();
   app.run(0.030, 25);
-  app.run(0.001, 30);
+  app.run(0.001, 35);
   assert.equal(app.count("commit"), 1);
   app.run(0.001, 50);
   app.run(0.030, 25);
-  app.run(0.001, 30);
+  app.run(0.001, 35);
   assert.equal(app.count("commit"), 2, "a second user turn is captured before the first reply arrives");
   assert.ok(
     app.sent.some((message) => message.type === "client_event"
@@ -180,8 +180,28 @@ function harness() {
   app.run(0.030, 15);
   app.socket.server({ type: "state", state: "listening" });
   app.run(0.030, 10);
-  app.run(0.001, 30);
+  app.run(0.001, 35);
   assert.equal(app.count("commit"), 1, "a stale listening event cannot reset active recording");
+}
+
+{
+  const app = harness();
+  app.run(0.030, 15);
+  app.run(0.030, 10);
+  app.socket.server({ type: "partial_transcript", text: "Are you ready?" });
+  app.run(0.001, 24);
+  assert.equal(app.count("commit"), 1, "a semantically complete question commits after 450 ms");
+}
+
+{
+  const app = harness();
+  app.run(0.030, 15);
+  app.run(0.030, 10);
+  app.socket.server({ type: "partial_transcript", text: "Please check the session and" });
+  app.run(0.001, 35);
+  assert.equal(app.count("commit"), 0, "an unfinished clause survives an ordinary 700 ms pause");
+  app.run(0.001, 21);
+  assert.equal(app.count("commit"), 1, "an unfinished clause eventually commits after 1100 ms");
 }
 
 {

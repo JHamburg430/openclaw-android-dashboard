@@ -17,7 +17,7 @@ import re
 import secrets
 import struct
 import time
-from typing import Any
+from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
 LOGGER = logging.getLogger("live_conversation")
@@ -77,10 +77,11 @@ DEFAULT_HISTORY_PATH = "/home/john/.openclaw/state/live-conversation-history.jso
 DEFAULT_SETTINGS_PATH = "/home/john/.openclaw/state/live-conversation-settings.json"
 MAX_HISTORY_MESSAGES = 120
 MAX_HISTORY_CHARS = 72_000
+MAX_CONVERSATION_EVENTS = 500
 PROMPT_HISTORY_MESSAGES = 32
 PROMPT_HISTORY_CHARS = 16_000
 WAKE_WORD = "jarvis"
-WAKE_WORD_ALIASES = frozenset(("jarvis", "jervis", "chavez"))
+WAKE_WORD_ALIASES = frozenset(("jarvis", "jervis"))
 WAKE_WINDOW_SECONDS = 2.5
 WAKE_COOLDOWN_SECONDS = 5.0
 
@@ -154,7 +155,13 @@ def confirmation_policy_command(transcript: str) -> str | None:
         return "status"
     confirmation = re.search(r"\b(?:confirm|confirmation|ask me|permission|approval)\b", normalized)
     action = re.search(r"\b(?:action|actions|act|acting|anything|proceed|doing|do it)\b", normalized)
-    if not confirmation or not action:
+    if not confirmation:
+        return None
+    if re.search(r"\b(?:turn|turning|switch|set|enable|activate)\b.*\b(?:on|required|always)\b", normalized):
+        return "confirm"
+    if re.search(r"\b(?:turn|turning|switch|set|disable|deactivate)\b.*\b(?:off|automatic|never)\b", normalized):
+        return "automatic"
+    if not action:
         return None
     if re.search(
         r"\b(?:don't|do not|never) (?:ask|require|need)\b|"
@@ -280,6 +287,26 @@ def has_explicit_action_request(transcript: str) -> bool:
     )
 
 
+def requires_authoritative_lookup(transcript: str) -> bool:
+    """Route changeable facts and ambiguous live locations to grounded tools."""
+    normalized = re.sub(r"\s+", " ", transcript).strip()
+    lowered = normalized.lower()
+    if re.match(r"^(?:i am|i'm) (?:testing|trying|using|reviewing|observing)\b", lowered):
+        return False
+    if re.search(
+        r"\b(?:latest|currently|right now|today|tonight|recent|news|weather|"
+        r"forecast|price|score|schedule|availability|verify|source)\b|"
+        r"\bfacts? (?:about|on)\b",
+        lowered,
+    ):
+        return True
+    return bool(re.match(
+        r"^where (?:is|are) (?:the )?[A-Z][\w'-]+(?: [A-Z][\w'-]+)+[?.!]*$",
+        normalized,
+        re.IGNORECASE,
+    ))
+
+
 def summarize_gateway_status(sessions: str, agent_pending: bool = False) -> str:
     """Build a short factual answer from the authoritative session catalog."""
     active: list[str] = []
@@ -330,6 +357,7 @@ def speech_model_prompt(
     capabilities: str = "",
     sessions: str = "",
     voice_sessions: str = "",
+    event_context: str = "",
     confirmation_required: bool = False,
 ) -> str:
     clock = now or datetime.now(ZoneInfo("America/Detroit"))
@@ -349,6 +377,7 @@ You are not a general chatbot pretending to lack system access. You can see the 
 {confirmation_note}
 Make each decision in this order: (1) determine whether John addressed you, (2) resolve references using the newest relevant conversation and session context, (3) distinguish conversation from an explicit request, (4) decide whether current evidence or a tool-backed refresh is required, (5) choose the least powerful route that can satisfy the request, and only then (6) write the spoken reply. Newer instructions override older ones.
 Conversation history is memory for continuity, preferences, names, and referents—not evidence that changeable information is still true. Never answer a request for current status, availability, progress, configuration, messages, schedules, files, logs, or other time-sensitive facts by repeating history. Refresh the authoritative source through an agent or the live session catalog first. If a refresh is unavailable, say that the current state could not be verified. A completed historical action never prevents John from requesting the same action again.
+For timeless factual questions, answer directly only when the fact is well established and you are highly confident. Otherwise choose `agent` to verify it. Never fill uncertainty with a plausible-sounding claim.
 First decide whether John actually requested something. Statements describing what he is currently doing, testing, observing, or noticing are conversation—not authorization to start work. Words such as “test,” “updates,” “performance,” or an agent name do not make a statement actionable. Launch or message an agent only when the transcript contains a request, command, or unmistakable instruction. Never invent work such as monitoring, verifying, checking, or updating when John merely says he is testing something.
 Return one JSON object matching the required schema. Choose `route` before writing `reply`:
 - `direct`: conversation, observations, acknowledgments, timeless knowledge, or answers already available in this prompt. The reply must answer or acknowledge naturally and must not promise agent work.
@@ -356,7 +385,7 @@ Return one JSON object matching the required schema. Choose `route` before writi
 - `new_agent`: only when John explicitly requests another, new, separate, or additional agent. Multiple agents may work concurrently.
 - `session`: only for a follow-up clearly aimed at one listed session. Copy its exact key into `session_key`; never invent one.
 - `ignore`: only speech clearly not addressed to you and having no plausible conversational meaning. Use an empty reply.
-For every action route (`agent`, `new_agent`, or `session`), `reply` is a brief, natural acknowledgment spoken before any work starts. Say what you are about to do; never imply the action already happened or include an unverified result. The bridge finishes delivering the acknowledgment before dispatching the action. A silent stop command is the sole exception because its purpose is to stop speech immediately.
+For every action route (`agent`, `new_agent`, or `session`), `reply` is a brief, natural acknowledgment. Say what you are about to do; never imply the action already happened or include an unverified result. Once routing and authorization are final, the bridge dispatches the action while the acknowledgment is spoken. A silent stop command is the sole exception because its purpose is to stop speech immediately.
 Use an empty `session_key` for every route except `session`. A question about status or currently running work is `direct`; answer it from the session summary. If a transcript is visibly unfinished, ask John to finish it with `direct`. Imperfect grammar alone is not grounds to ignore a turn.
 The current local date and time is {clock.strftime('%A, %B %-d, %Y, %-I:%M %p')} America/Detroit; time and date questions can be answered directly.
 Available OpenClaw capabilities (cached and refreshed automatically):
@@ -365,6 +394,8 @@ Live and recent gateway sessions (refreshed automatically; hasActiveRun is autho
 {sessions or 'No active or recent gateway sessions were returned.'}
 Sessions launched from this Live Conversation, newest first:
 {voice_sessions or 'No session has been launched from this Live Conversation yet.'}
+Recent structured conversation events (newest last):
+{event_context or 'No corrections, interruptions, or tool events need additional context.'}
 Resolve “this agent,” “that agent,” “it,” and similar follow-ups to the newest relevant Live Conversation session above. Preserve the subject and intent established by recent user turns. Do not replace a specific referent with a generic list of all sessions.
 Use this catalog to answer capability questions quickly. If the user explicitly asks to use, configure, expand, or change a capability, choose `agent`. Do not claim an unavailable capability exists. Newly added agents and skills appear after the catalog refreshes.
 Interpret likely recognition mistakes using the conversation and session context. In this voice app, “five agent” or “five conversation model” means “live agent” or “live conversation model” unless John explicitly discusses the number five or five distinct agents; correct that known ASR error without asking and use the corrected word “live” in the acknowledgment. Do not silently replace any other uncertain proper noun; ask a short clarification instead.
@@ -717,6 +748,154 @@ def split_spoken_text(text: str, max_chars: int = 90) -> list[str]:
     return parts or [normalized]
 
 
+def partial_structured_reply(text: str) -> tuple[str | None, str]:
+    """Extract the route and currently decoded reply from partial JSON."""
+    route_match = re.search(r'"route"\s*:\s*"([^"\\]*)"', text)
+    reply_match = re.search(r'"reply"\s*:\s*"', text)
+    if not reply_match:
+        return route_match.group(1) if route_match else None, ""
+    encoded = text[reply_match.end():]
+    decoded: list[str] = []
+    escaped = False
+    unicode_digits: str | None = None
+    for character in encoded:
+        if unicode_digits is not None:
+            if character.lower() not in "0123456789abcdef":
+                break
+            unicode_digits += character
+            if len(unicode_digits) == 4:
+                decoded.append(chr(int(unicode_digits, 16)))
+                unicode_digits = None
+                escaped = False
+            continue
+        if escaped:
+            if character == "u":
+                unicode_digits = ""
+                continue
+            decoded.append({
+                "n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f",
+                '"': '"', "\\": "\\", "/": "/",
+            }.get(character, character))
+            escaped = False
+            continue
+        if character == "\\":
+            escaped = True
+            continue
+        if character == '"':
+            break
+        decoded.append(character)
+    return route_match.group(1) if route_match else None, "".join(decoded)
+
+
+class IncrementalSpeechStream:
+    """Speak stable direct-reply clauses while Ollama is still generating."""
+
+    def __init__(
+        self, service: "LiveConversationService", socket: web.WebSocketResponse,
+        response_id: str, generation: int,
+    ):
+        self.service = service
+        self.socket = socket
+        self.response_id = response_id
+        self.generation = generation
+        self.spoken = ""
+        self.started = False
+        self.tts_ms = 0
+        self.queue: asyncio.Queue[str | None] = asyncio.Queue()
+        self.worker: asyncio.Task[None] | None = None
+
+    async def feed(self, structured_text: str) -> None:
+        route, reply = partial_structured_reply(structured_text)
+        if route != "direct" or not reply.startswith(self.spoken):
+            return
+        remainder = reply[len(self.spoken):]
+        boundaries = list(re.finditer(r"[.!?](?:\s+|$)|[,;:](?:\s+)", remainder))
+        if not boundaries:
+            return
+        end = boundaries[-1].end()
+        piece = remainder[:end].strip()
+        if len(piece) < 24 or is_operational_acknowledgment(piece):
+            return
+        self.spoken = reply[:len(self.spoken) + end]
+        self._queue(piece)
+
+    def _queue(self, text: str) -> None:
+        if not text:
+            return
+        self.queue.put_nowait(text)
+        if self.worker is None:
+            self.worker = asyncio.create_task(self._run())
+
+    async def _run(self) -> None:
+        while True:
+            text = await self.queue.get()
+            if text is None:
+                return
+            await self._speak(text)
+
+    async def cancel(self) -> None:
+        if self.worker is not None and not self.worker.done():
+            self.worker.cancel()
+            try:
+                await self.worker
+            except asyncio.CancelledError:
+                pass
+
+    async def _speak(self, text: str) -> None:
+        if not text or self.generation != self.service.speech_generation:
+            return
+        async with self.service.speech_lock:
+            if self.generation != self.service.speech_generation:
+                return
+            if not self.started:
+                await self.socket.send_json({
+                    "type": "state", "state": "speaking", "route": "direct"
+                })
+                await self.socket.send_json({
+                    "type": "output_audio_buffer.started", "responseId": self.response_id
+                })
+                self.started = True
+            tts_started = time.perf_counter()
+            pcm = await self.service.tts.synthesize(text)
+            self.tts_ms += round((time.perf_counter() - tts_started) * 1000)
+            chunk_bytes = OUTPUT_SAMPLE_RATE * 2 // 10
+            prefill_bytes = round(OUTPUT_SAMPLE_RATE * 2 * PLAYBACK_PREFILL_SECONDS)
+            for offset in range(0, len(pcm), chunk_bytes):
+                if self.generation != self.service.speech_generation:
+                    return
+                chunk = pcm[offset:offset + chunk_bytes]
+                await self.socket.send_json({
+                    "type": "response.output_audio.delta",
+                    "responseId": self.response_id,
+                    "sampleRate": OUTPUT_SAMPLE_RATE,
+                    "audioBase64": base64.b64encode(chunk).decode("ascii"),
+                })
+                if offset + len(chunk) > prefill_bytes:
+                    await asyncio.sleep(len(chunk) / (OUTPUT_SAMPLE_RATE * 2))
+
+    async def finish(self, reply: str, route: str) -> int:
+        await self.socket.send_json({
+            "type": "reply", "text": reply, "route": route,
+            "responseId": self.response_id,
+        })
+        if route != "direct" or not reply.startswith(self.spoken):
+            if self.worker is not None:
+                self.queue.put_nowait(None)
+                await self.worker
+            return -1
+        remainder = reply[len(self.spoken):].strip()
+        if remainder:
+            self._queue(remainder)
+        if self.worker is not None:
+            self.queue.put_nowait(None)
+            await self.worker
+        if self.started:
+            await self.socket.send_json({
+                "type": "response.output_audio.done", "responseId": self.response_id
+            })
+        return self.tts_ms
+
+
 class PersistentTtsWorker:
     def __init__(self, command: str, runtime_dir: str, model_dir: str, speed: float = 1.15):
         self.command = command
@@ -756,17 +935,24 @@ class PersistentTtsWorker:
 
     async def synthesize(self, text: str) -> bytes:
         async with self.lock:
-            await self.start()
-            assert self.process and self.process.stdin and self.process.stdout
-            encoded = text.encode("utf-8")
-            self.process.stdin.write(struct.pack("<I", len(encoded)) + encoded)
-            await self.process.stdin.drain()
-            header = await self.process.stdout.readexactly(8)
-            status, length = struct.unpack("<II", header)
-            payload = await self.process.stdout.readexactly(length)
-            if status != 0:
-                raise RuntimeError(payload.decode("utf-8", errors="replace"))
-            return payload
+            try:
+                await self.start()
+                assert self.process and self.process.stdin and self.process.stdout
+                encoded = text.encode("utf-8")
+                self.process.stdin.write(struct.pack("<I", len(encoded)) + encoded)
+                await self.process.stdin.drain()
+                header = await self.process.stdout.readexactly(8)
+                status, length = struct.unpack("<II", header)
+                payload = await self.process.stdout.readexactly(length)
+                if status != 0:
+                    raise RuntimeError(payload.decode("utf-8", errors="replace"))
+                return payload
+            except asyncio.CancelledError:
+                # A canceled read would leave that response at the head of the
+                # persistent protocol and poison the next utterance. Discard
+                # the worker so the next request starts with a clean handshake.
+                await self.stop()
+                raise
 
     async def stop(self) -> None:
         if not self.process:
@@ -803,6 +989,8 @@ class LiveConversationService:
         self.session_keys: set[str] = set()
         self.session_records: dict[str, dict[str, Any]] = {}
         self.sessions_updated_at = 0.0
+        self.sessions_last_success_wall = 0.0
+        self.sessions_error: str | None = None
         self.session_refresh_task: asyncio.Task[str] | None = None
         self.session_poll_task: asyncio.Task[None] | None = None
         self.speech_generation = 0
@@ -813,6 +1001,7 @@ class LiveConversationService:
         self.history_path = Path(history_path) if history_path else None
         self.settings_path = Path(settings_path) if settings_path else None
         self.history: deque[dict[str, str]] = deque(maxlen=MAX_HISTORY_MESSAGES)
+        self.events: deque[dict[str, Any]] = deque(maxlen=MAX_CONVERSATION_EVENTS)
         self._load_settings()
         self._load_history()
 
@@ -872,12 +1061,26 @@ class LiveConversationService:
             return
         try:
             payload = json.loads(self.history_path.read_text(encoding="utf-8"))
+            events = payload.get("events", []) if isinstance(payload, dict) else []
+            if isinstance(events, list):
+                for event in events[-MAX_CONVERSATION_EVENTS:]:
+                    if isinstance(event, dict) and isinstance(event.get("type"), str):
+                        self.events.append(dict(event))
             messages = payload.get("messages", []) if isinstance(payload, dict) else []
             for message in messages[-MAX_HISTORY_MESSAGES:]:
                 role = message.get("role")
                 content = message.get("content")
                 if role in ("user", "assistant") and isinstance(content, str) and content.strip():
                     self.history.append({"role": role, "content": content.strip()})
+            if not self.events:
+                now_ms = int(time.time() * 1000)
+                for index, message in enumerate(self.history):
+                    self.events.append({
+                        "id": f"legacy-{index}", "type": "message",
+                        "timestamp_ms": now_ms + index, "role": message["role"],
+                        "content": message["content"], "status": "final",
+                        "provenance": "legacy",
+                    })
         except (OSError, ValueError, TypeError) as error:
             LOGGER.warning("conversation_history_load_failed error=%s", error)
 
@@ -888,14 +1091,32 @@ class LiveConversationService:
             self.history_path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.history_path.with_suffix(".tmp")
             temporary.write_text(
-                json.dumps({"messages": list(self.history)}, ensure_ascii=False, indent=2),
+                json.dumps({
+                    "schema_version": 2,
+                    "messages": list(self.history),
+                    "events": list(self.events),
+                }, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
             temporary.replace(self.history_path)
         except OSError as error:
             LOGGER.warning("conversation_history_save_failed error=%s", error)
 
-    def remember(self, role: str, content: str) -> None:
+    def record_event(self, event_type: str, **fields: Any) -> dict[str, Any]:
+        event = {
+            "id": fields.pop("id", f"evt-{time.time_ns()}-{secrets.token_hex(3)}"),
+            "type": event_type,
+            "timestamp_ms": fields.pop("timestamp_ms", int(time.time() * 1000)),
+            **fields,
+        }
+        self.events.append(event)
+        return event
+
+    def remember(
+        self, role: str, content: str, *, turn_id: str | None = None,
+        status: str = "final", provenance: str = "live",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         content = content.strip()
         if role not in ("user", "assistant") or not content:
             return
@@ -908,12 +1129,41 @@ class LiveConversationService:
             if previous == current:
                 return
         self.history.append({"role": role, "content": content})
+        self.record_event(
+            "message", role=role, content=content, turn_id=turn_id,
+            status=status, provenance=provenance, metadata=metadata or {},
+        )
         while sum(len(item["content"]) for item in self.history) > MAX_HISTORY_CHARS:
             self.history.popleft()
         self._save_history()
 
     def recent_history(self) -> list[dict[str, str]]:
         return [dict(message) for message in self.history]
+
+    def recent_events(self) -> list[dict[str, Any]]:
+        return [dict(event) for event in self.events]
+
+    def event_context_summary(self) -> str:
+        lines: deque[str] = deque(maxlen=12)
+        for event in self.events:
+            if event.get("type") == "message":
+                metadata = event.get("metadata") or {}
+                assembled = str(metadata.get("assembled_text") or "")
+                content = str(event.get("content") or "")
+                if assembled and assembled != content:
+                    lines.append(
+                        f"turn={event.get('turn_id') or 'unknown'} continuation: {assembled[:300]}"
+                    )
+            elif event.get("type") == "tool":
+                lines.append(
+                    f"tool={event.get('tool')} session={event.get('session_key')} "
+                    f"status={event.get('status')} request={str(event.get('request') or '')[:220]}"
+                )
+            elif event.get("type") == "interruption":
+                lines.append(
+                    f"turn={event.get('turn_id') or 'unknown'} interrupted: {event.get('status')}"
+                )
+        return "\n".join(lines)
 
     def queue_pending_reply(self, reply: str) -> None:
         if reply.strip():
@@ -943,7 +1193,12 @@ class LiveConversationService:
             "started_at": int(time.time()),
         })
         self.sessions_updated_at = 0.0
+        self.record_event(
+            "tool", tool="gateway_agent", action="start", status="running",
+            session_key=session_key, request=re.sub(r"\s+", " ", request).strip(),
+        )
         self._save_settings()
+        self._save_history()
 
     def update_agent_session(self, session_key: str, state: str) -> None:
         for item in self.recent_agent_sessions:
@@ -951,10 +1206,40 @@ class LiveConversationService:
                 item["state"] = state
                 break
         self.sessions_updated_at = 0.0
+        self.record_event(
+            "tool", tool="gateway_agent", action="status", status=state,
+            session_key=session_key,
+        )
         self._save_settings()
+        self._save_history()
 
     def latest_agent_session(self) -> dict[str, Any] | None:
         return dict(self.recent_agent_sessions[-1]) if self.recent_agent_sessions else None
+
+    def resolve_agent_session(self, transcript: str) -> dict[str, Any] | None:
+        """Resolve a referenced voice session by topic, falling back to recency."""
+        if not self.recent_agent_sessions:
+            return None
+        stop_words = {
+            "a", "an", "and", "agent", "session", "that", "this", "the", "it",
+            "tell", "ask", "please", "status", "how", "is", "was", "to", "of",
+        }
+        query_terms = set(re.findall(r"[a-z0-9]+", transcript.lower())) - stop_words
+        best: dict[str, Any] | None = None
+        best_score = 0
+        for recency, item in enumerate(reversed(self.recent_agent_sessions)):
+            key = str(item.get("session_key") or "")
+            gateway = self.session_records.get(key, {})
+            candidate = " ".join(str(value or "") for value in (
+                item.get("request"), gateway.get("displayName"),
+                gateway.get("derivedTitle"), gateway.get("label"),
+            ))
+            candidate_terms = set(re.findall(r"[a-z0-9]+", candidate.lower())) - stop_words
+            score = len(query_terms & candidate_terms) * 10 + max(0, 5 - recency)
+            if score > best_score:
+                best, best_score = dict(item), score
+        # Pure pronouns have no topical terms and intentionally resolve by recency.
+        return best or self.latest_agent_session()
 
     def voice_session_summary(self) -> str:
         lines = []
@@ -1035,20 +1320,38 @@ class LiveConversationService:
             selected.popleft()
         return list(selected)
 
-    def contextualize_agent_request(self, transcript: str) -> str:
-        """Join a continuation to the immediately preceding unfinished agent request."""
+    def assemble_turn_text(self, transcript: str) -> str:
+        """Join a semantic continuation before routing or authorization."""
         previous_user = next(
             (item["content"] for item in reversed(self.history) if item["role"] == "user"),
             "",
         )
         unfinished_agent_request = re.search(
-            r"\b(?:start|have|ask|tell)\b.*\b(?:agent|sub-?agent)\b.*(?:\bthat|\bto|\bfor|\bso|\.{2,})\s*$",
+            r"\b(?:start|have|ask|tell|task|send)\b.*\b(?:agent|sub-?agent|session)\b.*(?:\bthat|\bto|\bfor|\bwith|\bso|\.{2,})\s*$",
             previous_user,
             flags=re.IGNORECASE,
         )
-        if unfinished_agent_request and len(previous_user) <= 240:
+        unfinished_clause = re.search(
+            r"\b(?:and|or|but|because|with|to|for|about|that|which)\s*$",
+            previous_user,
+            flags=re.IGNORECASE,
+        )
+        continuation_start = re.match(
+            r"\s*(?:and|also|then|but|because|with|to|for|about|checking|reviewing|"
+            r"fixing|updating|making|turning|looking|testing)\b",
+            transcript,
+            flags=re.IGNORECASE,
+        )
+        if (
+            unfinished_agent_request
+            or unfinished_clause and continuation_start
+        ) and len(previous_user) <= 500:
             return f"{previous_user.rstrip(' .')} {transcript.lstrip()}"
         return transcript
+
+    def contextualize_agent_request(self, transcript: str) -> str:
+        """Backward-compatible alias for assembled-turn action handoffs."""
+        return self.assemble_turn_text(transcript)
 
     async def start(self) -> None:
         try:
@@ -1207,7 +1510,7 @@ class LiveConversationService:
             payload = await self.openclaw_json(
                 "gateway", "call", "sessions.list", "--json", "--params",
                 json.dumps({
-                    "limit": 20,
+                    "limit": 100,
                     "activeMinutes": 10_080,
                     "includeLastMessage": True,
                     "includeDerivedTitles": True,
@@ -1246,6 +1549,8 @@ class LiveConversationService:
             self.session_records = records
             self.sessions = "\n".join(lines) or "No active or recent gateway sessions were returned."
             self.sessions_updated_at = time.monotonic()
+            self.sessions_last_success_wall = time.time()
+            self.sessions_error = None
             tracking_changed = False
             for tracked in self.recent_agent_sessions:
                 gateway = records.get(str(tracked.get("session_key") or ""))
@@ -1260,8 +1565,24 @@ class LiveConversationService:
             if tracking_changed:
                 self._save_settings()
         except Exception as error:
+            self.sessions_error = str(error) or error.__class__.__name__
             LOGGER.warning("session_refresh_failed error=%s", error)
         return self.sessions
+
+    def session_freshness_reply(self) -> str | None:
+        if not self.sessions_error:
+            return None
+        if self.sessions_last_success_wall:
+            age_seconds = max(0, round(time.time() - self.sessions_last_success_wall))
+            if age_seconds < 60:
+                age = f"{age_seconds} seconds"
+            else:
+                age = f"{max(1, round(age_seconds / 60))} minutes"
+            return (
+                "I couldn't refresh Gateway sessions just now. "
+                f"The last successful catalog is {age} old, so I won't present it as current."
+            )
+        return "I couldn't refresh Gateway sessions, so I can't verify their current status."
 
     @staticmethod
     def gateway_is_transient(error: Exception) -> bool:
@@ -1313,7 +1634,8 @@ class LiveConversationService:
         return "The delegated agent is still working in its session."
 
     async def speech_reply(
-        self, text: str, agent_pending: bool = False
+        self, text: str, agent_pending: bool = False,
+        stream_callback: Callable[[str], Awaitable[None]] | None = None,
     ) -> tuple[str, str, str | None]:
         direct_reply = direct_voice_surface_reply(text)
         if direct_reply:
@@ -1326,6 +1648,9 @@ class LiveConversationService:
                 self.capability_refresh_task = asyncio.create_task(self.refresh_capabilities())
         if status_question:
             await self.refresh_sessions(force=True)
+            freshness_reply = self.session_freshness_reply()
+            if freshness_reply:
+                return "direct", freshness_reply, None
         elif time.monotonic() - self.sessions_updated_at >= SESSION_CACHE_SECONDS:
             if not self.session_refresh_task or self.session_refresh_task.done():
                 self.session_refresh_task = asyncio.create_task(self.refresh_sessions())
@@ -1336,7 +1661,7 @@ class LiveConversationService:
                     pass
         if status_question:
             if is_referential_agent_question(text):
-                tracked = self.latest_agent_session()
+                tracked = self.resolve_agent_session(text)
                 if tracked:
                     key = str(tracked.get("session_key") or "")
                     return "direct", summarize_tracked_agent(
@@ -1344,14 +1669,16 @@ class LiveConversationService:
                     ), None
             return "direct", summarize_gateway_status(self.sessions, agent_pending), None
         if is_referential_agent_question(text) and has_explicit_action_request(text):
-            tracked = self.latest_agent_session()
+            tracked = self.resolve_agent_session(text)
             if tracked:
                 return "session", "I'll add that to the same agent.", str(tracked["session_key"])
+        if requires_authoritative_lookup(text):
+            return "agent", "I'll verify that against a current source.", None
         capabilities = self.capabilities
         payload = {
             "model": SPEECH_MODEL,
             "keep_alive": SPEECH_MODEL_KEEP_ALIVE,
-            "stream": False,
+            "stream": stream_callback is not None,
             "think": False,
             "format": SPEECH_OUTPUT_SCHEMA,
             "messages": [
@@ -1360,6 +1687,7 @@ class LiveConversationService:
                     capabilities=capabilities,
                     sessions=self.sessions,
                     voice_sessions=self.voice_session_summary(),
+                    event_context=self.event_context_summary(),
                     confirmation_required=self.confirmation_required,
                 )},
                 *self.prompt_history(),
@@ -1375,9 +1703,11 @@ class LiveConversationService:
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 result: dict[str, Any] = {}
-                for attempt, prediction_limit in enumerate(
-                    (SPEECH_NUM_PREDICT, SPEECH_RETRY_NUM_PREDICT), start=1
-                ):
+                prediction_limits = (
+                    (SPEECH_RETRY_NUM_PREDICT,) if stream_callback is not None
+                    else (SPEECH_NUM_PREDICT, SPEECH_RETRY_NUM_PREDICT)
+                )
+                for attempt, prediction_limit in enumerate(prediction_limits, start=1):
                     request_payload = {
                         **payload,
                         "options": {
@@ -1389,7 +1719,23 @@ class LiveConversationService:
                         SPEECH_MODEL_URL, json=request_payload
                     ) as response:
                         response.raise_for_status()
-                        result = await response.json()
+                        if stream_callback is None:
+                            result = await response.json()
+                        else:
+                            structured_text = ""
+                            async for raw_line in response.content:
+                                if not raw_line.strip():
+                                    continue
+                                update = json.loads(raw_line)
+                                if update.get("error"):
+                                    raise ValueError(str(update["error"]))
+                                structured_text += str(
+                                    update.get("message", {}).get("content", "")
+                                )
+                                await stream_callback(structured_text)
+                                if update.get("done"):
+                                    result = dict(update)
+                            result["message"] = {"content": structured_text}
                     eval_count = result.get("eval_count")
                     output_limited = (
                         result.get("done_reason") == "length"
@@ -1427,7 +1773,10 @@ class LiveConversationService:
                     "I answer here directly and use gateway agents when tool-backed work is needed.",
                     None,
                 )
-            explicit_action = has_explicit_action_request(text)
+            explicit_action = (
+                has_explicit_action_request(text)
+                or requires_authoritative_lookup(text)
+            )
             if route in {"agent", "new_agent", "session"} and not explicit_action:
                 LOGGER.warning("speech_supervisor_blocked_unrequested_action route=%s", route)
                 route, reply, target_session = "direct", "I understand.", None
@@ -1534,8 +1883,10 @@ class LiveConversationService:
     async def process_turn(
         self, socket: web.WebSocketResponse, audio: bytes, agent_pending: bool = False,
         turn_generation: int | None = None,
+        handoff_callback: Callable[[str, str | None], Awaitable[None]] | None = None,
     ) -> tuple[str, str, str | None] | None:
         started = time.perf_counter()
+        incremental_speech: IncrementalSpeechStream | None = None
         if turn_generation is None:
             turn_generation = self.speech_generation
         pending_confirmation_before = self.pending_confirmation
@@ -1557,8 +1908,19 @@ class LiveConversationService:
                 return None
 
             stage = time.perf_counter()
+            turn_id = f"turn-{time.time_ns()}"
+            response_id = f"response-{time.monotonic_ns()}"
+            incremental_speech = IncrementalSpeechStream(
+                self, socket, response_id, turn_generation
+            )
+            assembled_text = self.assemble_turn_text(transcript)
+            if assembled_text != transcript:
+                LOGGER.info(
+                    "turn_continuation_assembled turn_id=%s raw=%r assembled=%r",
+                    turn_id, transcript, assembled_text,
+                )
             handoff_request: str | None = None
-            policy_command = confirmation_policy_command(transcript)
+            policy_command = confirmation_policy_command(assembled_text)
             answer = confirmation_answer(transcript) if self.pending_confirmation else None
             if policy_command:
                 if policy_command == "status":
@@ -1581,16 +1943,42 @@ class LiveConversationService:
                 else:
                     route, reply, target_session = "direct", "Okay, I won't take that action.", None
             else:
-                route, reply, target_session = await self.speech_reply(
-                    transcript, agent_pending=agent_pending
-                )
-                agent_request = self.contextualize_agent_request(transcript)
+                routing_task = asyncio.create_task(self.speech_reply(
+                    assembled_text, agent_pending=agent_pending,
+                    stream_callback=incremental_speech.feed,
+                ))
+                while not routing_task.done():
+                    await asyncio.wait({routing_task}, timeout=0.05)
+                    if turn_generation != self.speech_generation:
+                        routing_task.cancel()
+                        try:
+                            await routing_task
+                        except asyncio.CancelledError:
+                            pass
+                        await incremental_speech.cancel()
+                        self.pending_confirmation = pending_confirmation_before
+                        self.remember(
+                            "user", transcript, turn_id=turn_id,
+                            status="superseded",
+                            metadata={"assembled_text": assembled_text},
+                        )
+                        self.record_event(
+                            "interruption", turn_id=turn_id,
+                            status="model_generation_cancelled",
+                        )
+                        self._save_history()
+                        await socket.send_json({
+                            "type": "turn_superseded", "text": transcript
+                        })
+                        return None
+                route, reply, target_session = routing_task.result()
+                agent_request = assembled_text
                 if route in ("agent", "new_agent", "session"):
                     if route == "new_agent" and target_session is None:
                         target_session = self.allocate_agent_session_key(agent_request)
                     if self.confirmation_required:
                         self.pending_confirmation = (agent_request, target_session, route)
-                        summary = re.sub(r"\s+", " ", transcript).strip()[:180].rstrip(" .?!")
+                        summary = re.sub(r"\s+", " ", assembled_text).strip()[:180].rstrip(" .?!")
                         route = "confirmation"
                         target_session = None
                         reply = f"Before I take that action, should I proceed with: {summary}?"
@@ -1600,11 +1988,19 @@ class LiveConversationService:
             metrics.route = route
 
             if route == "ignore":
+                await incremental_speech.cancel()
                 await socket.send_json({"type": "state", "state": "listening", "detail": "Ignored likely background speech."})
                 return None
 
-            self.remember("user", transcript)
+            if route != "direct":
+                await incremental_speech.cancel()
+
+            self.remember(
+                "user", transcript, turn_id=turn_id,
+                metadata={"assembled_text": assembled_text},
+            )
             if turn_generation != self.speech_generation:
+                await incremental_speech.cancel()
                 self.pending_confirmation = pending_confirmation_before
                 LOGGER.info(
                     "turn_superseded_by_newer_speech transcript=%r", transcript
@@ -1613,15 +2009,12 @@ class LiveConversationService:
                     "type": "turn_superseded", "text": transcript
                 })
                 return None
-            self.remember("assistant", reply)
-
-            response_id = f"response-{time.monotonic_ns()}"
-            metrics.tts_ms = await self.send_spoken_response(
-                socket, reply, metrics.route, response_id,
-                expected_generation=turn_generation,
+            self.remember(
+                "assistant", reply, turn_id=turn_id,
+                metadata={"route": route, "session_key": target_session},
             )
-            metrics.total_ms = round((time.perf_counter() - started) * 1000)
-            await socket.send_json({"type": "metrics", **asdict(metrics)})
+
+            prepared_handoff: tuple[str, str | None] | None = None
             if handoff_request is not None:
                 if route == "agent":
                     target_session = self.session_key
@@ -1631,18 +2024,31 @@ class LiveConversationService:
                         "transcript_repaired original=%r repaired=%r",
                         handoff_request, repaired_request,
                     )
-                # process_turn cannot return the action until the acknowledgment
-                # has been fully synthesized and delivered above. run_turn starts
-                # tool-backed work only after receiving this handoff.
+                prepared_handoff = (repaired_request, target_session)
                 await socket.send_json({
-                    "type": "action_status",
-                    "state": "acknowledged",
-                    "route": route,
-                    "sessionKey": target_session or "",
+                    "type": "action_status", "state": "acknowledged",
+                    "route": route, "sessionKey": target_session or "",
                 })
-                return repaired_request, reply, target_session
+                # Authorized work starts as soon as routing is final. Spoken
+                # acknowledgment proceeds concurrently and cannot add latency.
+                if handoff_callback is not None:
+                    await handoff_callback(*prepared_handoff)
+
+            if route == "direct":
+                metrics.tts_ms = await incremental_speech.finish(reply, route)
+            else:
+                metrics.tts_ms = await self.send_spoken_response(
+                    socket, reply, metrics.route, response_id,
+                    expected_generation=turn_generation,
+                )
+            metrics.total_ms = round((time.perf_counter() - started) * 1000)
+            await socket.send_json({"type": "metrics", **asdict(metrics)})
+            if prepared_handoff is not None and handoff_callback is None:
+                return prepared_handoff[0], reply, prepared_handoff[1]
             await socket.send_json({"type": "state", "state": "listening"})
         except Exception as error:
+            if incremental_speech is not None:
+                await incremental_speech.cancel()
             await socket.send_json({"type": "error", "message": str(error)})
         return None
 
@@ -1658,8 +2064,9 @@ function addHistory(role,content){if(!content)return;historyMessages.push({role,
 function rms(b64){const s=atob(b64||'');let sum=0,n=0;for(let i=0;i+1<s.length;i+=2){let v=(s.charCodeAt(i)&255)|((s.charCodeAt(i+1)&255)<<8);if(v&32768)v-=65536;const f=v/32768;sum+=f*f;n++}return n?Math.sqrt(sum/n):0}
 function send(x){if(ws&&ws.readyState===1)ws.send(JSON.stringify(x))}
 function report(event,detail){send({type:'client_event',event:event,detail:String(detail||'')})}
+function endpointSilenceMs(){const text=(pendingTranscript||'').trim().toLowerCase();if(/(?:,|(?:^| )(?:and|or|but|because|with|to|for|about|that|which))$/.test(text))return 1100;if(/[?]$/.test(text))return 450;return 700}
 function begin(){if(recording)return;const interruptedWait=awaitingResponse;recording=true;awaitingResponse=false;candidateSpeechMs=0;speechMs=0;silenceMs=0;if(responseActive){responseActive=false;if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}try{OpenClawNativeAudio.interruptAgentResponsePlayback()}catch(e){}report('barge_in','confirmed_user_speech')}send({type:'input_audio_buffer.speech_started'});send({type:'start'});for(const audioBase64 of pre)send({type:'audio',audioBase64});pre=[];report('speech_started',interruptedWait?'while_awaiting_response':'ready');state.textContent='Listening…'}
-function tick(){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>PREBUFFER_FRAMES)pre.shift();const speechThreshold=responseActive?.025:.012;const speechRequiredMs=responseActive?200:START_CONFIRM_MS;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+AUDIO_FRAME_MS:0;if(candidateSpeechMs>=speechRequiredMs)begin();return}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=AUDIO_FRAME_MS;silenceMs=0}else silenceMs+=AUDIO_FRAME_MS;if(speechMs>=200&&silenceMs>=600){recording=false;awaitingResponse=true;candidateSpeechMs=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}}
+function tick(){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>PREBUFFER_FRAMES)pre.shift();const speechThreshold=responseActive?.025:.012;const speechRequiredMs=responseActive?200:START_CONFIRM_MS;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+AUDIO_FRAME_MS:0;if(candidateSpeechMs>=speechRequiredMs)begin();return}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=AUDIO_FRAME_MS;silenceMs=0}else silenceMs+=AUDIO_FRAME_MS;if(speechMs>=200&&silenceMs>=endpointSilenceMs()){recording=false;awaitingResponse=true;candidateSpeechMs=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}}
 function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-120):[];renderHistory()}if(m.type==='settings')confirmation.textContent='Action confirmation: '+(m.action_confirmation==='confirm'?'On — asks before actions':'Off — replies before acting');if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.state==='listening'&&!recording){awaitingResponse=false;candidateSpeechMs=0}if((m.detail||'').startsWith('Ignored')||(m.detail||'').startsWith('Silent stop'))pendingTranscript=''}if(m.type==='action_status'&&m.state==='acknowledged')state.textContent='Working…';if(m.type==='partial_transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript='';addHistory('user',m.text)}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
 function stop(){if(timer)clearInterval(timer);timer=null;if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=null;try{OpenClawNativeAudio.stopCapture()}catch(e){}if(ws)ws.close();ws=null;recording=false;awaitingResponse=false;responseActive=false;candidateSpeechMs=0;bar.style.width='0%';state.textContent='Stopped'}
 document.getElementById('start').onclick=start;document.getElementById('stop').onclick=()=>{stop();try{OpenClawNativeApp.liveConversationStopped()}catch(e){}};window.addEventListener('pagehide',stop);if(new URLSearchParams(location.search).get('autostart')==='1')start();
@@ -1677,6 +2084,12 @@ async def health(request: web.Request) -> web.Response:
         "pipecat": "1.8.1",
         "stt": service.stt_description,
         "history_messages": len(service.history),
+        "conversation_events": len(service.events),
+        "session_catalog": {
+            "fresh": service.sessions_error is None,
+            "last_success_epoch": service.sessions_last_success_wall or None,
+            "error": service.sessions_error,
+        },
         "action_confirmation": (
             "confirm" if service.confirmation_required else "automatic"
         ),
@@ -1827,15 +2240,20 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
                 })
 
     async def run_turn(turn: bytes, generation: int) -> None:
-        handoff = await service.process_turn(
-            socket, turn, agent_pending=bool(agent_tasks),
-            turn_generation=generation,
-        )
-        if handoff:
-            transcript, _, target_session = handoff
+        async def start_handoff(transcript: str, target_session: str | None) -> None:
             task = asyncio.create_task(run_agent(transcript, target_session))
             agent_tasks.add(task)
             task.add_done_callback(agent_tasks.discard)
+
+        handoff = await service.process_turn(
+            socket, turn, agent_pending=bool(agent_tasks),
+            turn_generation=generation,
+            handoff_callback=start_handoff,
+        )
+        # Compatibility for test doubles and older service implementations.
+        if handoff:
+            transcript, _, target_session = handoff
+            await start_handoff(transcript, target_session)
 
     async def run_turn_queue() -> None:
         while True:

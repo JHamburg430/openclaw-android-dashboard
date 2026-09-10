@@ -37,6 +37,8 @@ PHRASES = {
     "confirm": "Go ahead.",
     "pause_a": "Please remember the first part",
     "pause_b": "and also remember the second part.",
+    "ambient": "The television report continues after the commercial break.",
+    "echo": "I am still speaking an older assistant response.",
 }
 
 
@@ -61,6 +63,17 @@ def _mix_noise(pcm: bytes, rms: float, seed: int = 430) -> bytes:
     noise = np.random.default_rng(seed).normal(0.0, rms, len(samples))
     mixed = np.clip(samples + noise, -1.0, 1.0)
     return np.rint(mixed * 32767.0).astype("<i2").tobytes()
+
+
+def _mix_pcm(foreground: bytes, background: bytes, background_gain: float = 0.25) -> bytes:
+    size = max(len(foreground), len(background)) // 2
+    front = np.zeros(size, dtype=np.float32)
+    back = np.zeros(size, dtype=np.float32)
+    foreground_samples = np.frombuffer(foreground, dtype="<i2").astype(np.float32)
+    background_samples = np.frombuffer(background, dtype="<i2").astype(np.float32)
+    front[:len(foreground_samples)] = foreground_samples
+    back[:len(background_samples)] = background_samples
+    return np.clip(front + back * background_gain, -32768, 32767).astype("<i2").tobytes()
 
 
 def _rms(pcm: bytes) -> float:
@@ -162,6 +175,21 @@ class VoiceModelAudioIntegrationTests(unittest.IsolatedAsyncioTestCase):
         noise_only = _mix_noise(_silence(2600), rms=0.008)
         self.assertEqual(await service.transcribe(noise_only), "")
 
+    async def test_near_field_turn_wins_over_background_dialogue_and_echo(self) -> None:
+        service = self.service()
+        television_mix = _mix_pcm(
+            self.audio["second"], self.audio["ambient"], background_gain=0.18
+        )
+        transcript = await service.transcribe(television_mix)
+        self.assert_words_heard(transcript, "second", "weather")
+
+        echo_mix = _mix_pcm(
+            self.audio["third"], _silence(350) + self.audio["echo"],
+            background_gain=0.15,
+        )
+        transcript = await service.transcribe(echo_mix)
+        self.assert_words_heard(transcript, "third", "tomorrow")
+
     async def test_natural_thinking_pause_remains_one_complete_input(self) -> None:
         service = self.service()
         combined = (
@@ -216,7 +244,9 @@ class VoiceModelAudioIntegrationTests(unittest.IsolatedAsyncioTestCase):
         first_routing_started = asyncio.Event()
         release_first_routing = asyncio.Event()
 
-        async def delayed_reply(transcript: str, agent_pending: bool = False):
+        async def delayed_reply(
+            transcript: str, agent_pending: bool = False, stream_callback=None
+        ):
             if "first" in transcript.lower():
                 first_routing_started.set()
                 await release_first_routing.wait()

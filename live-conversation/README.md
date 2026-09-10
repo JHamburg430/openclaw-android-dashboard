@@ -7,7 +7,9 @@ in the Android Dashboard plus menu.
 
 1. The Android native audio bridge captures 16 kHz PCM in 20 ms frames.
 2. Browser-side VAD requires 300 ms of near-field audio above a 0.012 RMS
-   threshold before opening a turn, then commits it after 600 ms of silence.
+   threshold before opening a turn. Endpointing uses the rolling transcript:
+   questions can complete after 450 ms, ordinary phrases after 700 ms, and
+   syntactically unfinished clauses remain open for at least 1,100 ms.
    This rejects the lower-level television/road speech that the former 0.006
    start gate treated as if it came from the person holding the phone. A 900 ms
    onset pre-roll is retained in addition to the 300 ms confirmation window,
@@ -47,7 +49,10 @@ in the Android Dashboard plus menu.
    and speaking a syntactically valid JSON response whose `reply` ends midway
    through a sentence.
 5. A bounded conversation history supplies the previous user and assistant
-   turns to the speech supervisor. It is persisted at
+   turns to the speech supervisor. Behind that projection is a versioned event
+   ledger with timestamps, turn IDs, assembled text, status, provenance,
+   routing metadata, interruptions, tool receipts, and exact session identity.
+   It is persisted at
    `~/.openclaw/state/live-conversation-history.json`, so context survives a
    WebView reconnect or service restart. Up to 80 messages and 48,000
    characters are retained; the newest context that fits the local model's
@@ -68,7 +73,13 @@ in the Android Dashboard plus menu.
    eventual visible result. If the WebView disconnects while an agent works,
    the task continues and its final reply is queued for speech on the next Live
    Conversation connection.
-8. A persistent local Kokoro TTS worker using the British male George voice
+8. Ollama's NDJSON stream is decoded incrementally. Once a direct route and a
+   stable spoken clause are available, Kokoro starts synthesizing that clause
+   while later model tokens are still arriving. New confirmed speech cancels
+   the in-flight HTTP generation as well as pending synthesis and playback.
+   Authorized tool work starts as soon as routing is final and runs concurrently
+   with its acknowledgment instead of waiting for the entire utterance.
+9. A persistent local Kokoro TTS worker using the British male George voice
    returns 24 kHz PCM to the Android
    native playback bridge. Replies are synthesized in short, look-ahead-buffered
    units so the first audio starts promptly while later speech is generated
@@ -80,7 +91,7 @@ in the Android Dashboard plus menu.
    controls such as “Jarvis stop,” “stop talking,” “be quiet,” and “that's
    enough” stop playback without entering history, invoking a model, or
    producing a reply.
-9. When OpenClaw Dashboard holds Android's Assistant role, its lightweight
+10. When OpenClaw Dashboard holds Android's Assistant role, its lightweight
    voice service streams rolling microphone windows to `/wake`. Detecting the
    standalone word “Jarvis” opens and auto-starts Live Conversation over the
    regular or lock screen. Turning the screen off stops an active conversation
@@ -119,7 +130,7 @@ before the final answer is shortened for speech.
 
 Rolling partial transcription makes speech visible before the turn ends and
 keeps capture open for natural-length input. The final transcript is sent to the
-speech supervisor as soon as endpointing detects 600 ms of silence. Partial
+speech supervisor as soon as adaptive endpointing detects a complete turn. Partial
 text is deliberately not allowed to launch tools or agents because early
 Whisper hypotheses can change as more words arrive.
 
