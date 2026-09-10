@@ -88,12 +88,14 @@ TURN_UNDERSTANDING_SCHEMA = {
         "actionable": {"type": "boolean"},
         "requires_grounding": {"type": "boolean"},
         "supersedes_previous": {"type": "boolean"},
+        "clarification_needed": {"type": "boolean"},
         "assembled_text": {"type": "string"},
         "reason": {"type": "string"},
     },
     "required": [
         "complete", "confidence", "speech_act", "relation", "actionable",
-        "requires_grounding", "supersedes_previous", "assembled_text", "reason",
+        "requires_grounding", "supersedes_previous", "clarification_needed",
+        "assembled_text", "reason",
     ],
     "additionalProperties": False,
 }
@@ -105,6 +107,10 @@ SESSION_POLL_SECONDS = 10
 PARTIAL_TRANSCRIPT_INTERVAL_SECONDS = 1.0
 ONLINE_ASR_WINDOW_SECONDS = 14.0
 ONLINE_ASR_OVERLAP_SECONDS = 2.0
+BACKCHANNEL_DISPLAY_TEXT = ""
+# eSpeak phoneme input keeps Kokoro from reading "mm-hm" as letters. This is
+# rendered as a short closed-mouth affirmative hum instead of visible speech.
+BACKCHANNEL_TTS_TEXT = "[[m: h m:]]"
 SMART_TURN_MODEL_PATH = os.environ.get(
     "SMART_TURN_MODEL_PATH",
     "/home/john/.openclaw/tools/pipecat-live-conversation/models/smart-turn-v3.2-cpu.onnx",
@@ -488,6 +494,7 @@ class TurnUnderstanding:
     supersedes_previous: bool
     assembled_text: str
     reason: str
+    clarification_needed: bool = False
 
 
 VALID_SPEECH_ACTS = frozenset({
@@ -554,7 +561,8 @@ Recent dialogue: {context}
 
 Return exactly one JSON object containing every one of these keys, even when a value is empty:
 `route`, `reply`, `session_key`, `complete`, `confidence`, `speech_act`, `relation`,
-`actionable`, `requires_grounding`, `supersedes_previous`, `assembled_text`, and `reason`.
+`actionable`, `requires_grounding`, `supersedes_previous`, `clarification_needed`,
+`assembled_text`, and `reason`.
 Never omit a key. `confidence` must be a JSON number from 0 through 1. `relation` must be exactly
 one of `new`, `continuation`, `correction`, or `meta`; incompleteness belongs only in `complete`.
 - `speech_act` must be exactly one of `request`, `question`, `answer`, `statement`, `correction`,
@@ -565,24 +573,28 @@ one of `new`, `continuation`, `correction`, or `meta`; incompleteness belongs on
 - `actionable` is true only for an actual request, command, or unmistakable instruction to do work. Mentioning words such as latest, verify, agent, update, test, or fix is not authorization by itself.
 - `requires_grounding` is true only when answering the complete communicative act requires current/private/tool-backed evidence. A meta-question about what the assistant just said does not require grounding merely because it repeats "verify" or "latest".
 - `supersedes_previous` is true when this turn corrects, retracts, or replaces the prior turn or its planned response.
+- `clarification_needed` is true when the committed speech is too garbled, contradictory, or semantically incoherent to recover confidently. This is different from an intelligible unfinished thought: unfinished speech waits for a continuation, while unclear speech gets one brief request to repeat or rephrase it. Never use a backchannel as the answer to unclear speech.
 - `assembled_text` is the exact complete meaning to route. Combine the unresolved fragment with this transcript only when they form one coherent thought. If the current transcript is incomplete, preserve it verbatim. If it is a new unrelated turn, use only the current transcript.
 - `reason` is a short semantic explanation, never a keyword citation.
 
 Complete examples (the reply wording may vary, but all keys are mandatory):
 Current: "What are the latest updates for the"
-{{"route":"direct","reply":"","session_key":null,"complete":false,"confidence":0.98,"speech_act":"question","relation":"new","actionable":false,"requires_grounding":false,"supersedes_previous":false,"assembled_text":"What are the latest updates for the","reason":"The requested subject is missing, so the thought is unfinished."}}
+{{"route":"direct","reply":"","session_key":null,"complete":false,"confidence":0.98,"speech_act":"question","relation":"new","actionable":false,"requires_grounding":false,"supersedes_previous":false,"clarification_needed":false,"assembled_text":"What are the latest updates for the","reason":"The requested subject is missing, so the thought is unfinished."}}
 
 Pending: "What are the latest updates for the"; current: "Live Conversation project?"
-{{"route":"agent","reply":"I'll check the latest Live Conversation project updates.","session_key":null,"complete":true,"confidence":0.97,"speech_act":"question","relation":"continuation","actionable":true,"requires_grounding":true,"supersedes_previous":false,"assembled_text":"What are the latest updates for the Live Conversation project?","reason":"The second fragment supplies the missing subject and asks for current information."}}
+{{"route":"agent","reply":"I'll check the latest Live Conversation project updates.","session_key":null,"complete":true,"confidence":0.97,"speech_act":"question","relation":"continuation","actionable":true,"requires_grounding":true,"supersedes_previous":false,"clarification_needed":false,"assembled_text":"What are the latest updates for the Live Conversation project?","reason":"The second fragment supplies the missing subject and asks for current information."}}
 
 Recent assistant: "I'll verify that"; current: "What are you going to verify?"
-{{"route":"direct","reply":"I was referring to the subject of your previous request, but that request was cut off before you named it.","session_key":null,"complete":true,"confidence":0.99,"speech_act":"meta","relation":"meta","actionable":false,"requires_grounding":false,"supersedes_previous":true,"assembled_text":"What are you going to verify?","reason":"This asks about the assistant's stated plan rather than requesting a new verification."}}
+{{"route":"direct","reply":"I was referring to the subject of your previous request, but that request was cut off before you named it.","session_key":null,"complete":true,"confidence":0.99,"speech_act":"meta","relation":"meta","actionable":false,"requires_grounding":false,"supersedes_previous":true,"clarification_needed":false,"assembled_text":"What are you going to verify?","reason":"This asks about the assistant's stated plan rather than requesting a new verification."}}
 
 Current: "I'm testing the latest update"
-{{"route":"direct","reply":"Understood.","session_key":null,"complete":true,"confidence":0.99,"speech_act":"statement","relation":"new","actionable":false,"requires_grounding":false,"supersedes_previous":false,"assembled_text":"I'm testing the latest update","reason":"This reports the speaker's activity and does not request work."}}
+{{"route":"direct","reply":"Understood.","session_key":null,"complete":true,"confidence":0.99,"speech_act":"statement","relation":"new","actionable":false,"requires_grounding":false,"supersedes_previous":false,"clarification_needed":false,"assembled_text":"I'm testing the latest update","reason":"This reports the speaker's activity and does not request work."}}
 
 Current: "Please verify the latest release"
-{{"route":"agent","reply":"I'll verify the latest release.","session_key":null,"complete":true,"confidence":0.99,"speech_act":"request","relation":"new","actionable":true,"requires_grounding":true,"supersedes_previous":false,"assembled_text":"Please verify the latest release","reason":"This explicitly requests a current, tool-backed verification."}}
+{{"route":"agent","reply":"I'll verify the latest release.","session_key":null,"complete":true,"confidence":0.99,"speech_act":"request","relation":"new","actionable":true,"requires_grounding":true,"supersedes_previous":false,"clarification_needed":false,"assembled_text":"Please verify the latest release","reason":"This explicitly requests a current, tool-backed verification."}}
+
+Current: "to fix the thing where instead of saying the same thing say the same thing"
+{{"route":"direct","reply":"I didn't catch that clearly. Could you say it again?","session_key":null,"complete":false,"confidence":0.35,"speech_act":"correction","relation":"correction","actionable":false,"requires_grounding":false,"supersedes_previous":false,"clarification_needed":true,"assembled_text":"to fix the thing where instead of saying the same thing say the same thing","reason":"The recognized wording is contradictory and does not preserve a recoverable intended correction."}}
 """
 
 
@@ -735,6 +747,24 @@ def parse_turn_understanding(text: str, transcript: str) -> TurnUnderstanding:
     assembled = payload.get("assembled_text")
     if not isinstance(assembled, str) or not assembled.strip():
         assembled = transcript
+    reason = str(payload.get("reason") or "semantic classification").strip()[:240]
+    clarification_needed = payload.get("clarification_needed") is True
+    # Enforce internal agreement in the model's structured decision. This does
+    # not inspect transcript words: it repairs the case where the controller's
+    # own semantic diagnosis says the input is unrecoverable/unclear but its
+    # boolean contradicts that diagnosis.
+    if not clarification_needed and payload.get("complete") is not True:
+        normalized_reason = reason.casefold()
+        diagnosed_unclear = any(phrase in normalized_reason for phrase in (
+            "semantically contradictory", "semantically incoherent",
+            "recognition error", "meaning is unclear", "warrant clarification",
+            "cannot be interpreted", "too garbled", "unrecoverable",
+        ))
+        if diagnosed_unclear:
+            clarification_needed = True
+            LOGGER.warning(
+                "semantic_controller_repaired_clarification_flag reason=%r", reason
+            )
     return TurnUnderstanding(
         complete=payload.get("complete") is True,
         confidence=max(0.0, min(1.0, float(confidence))),
@@ -744,7 +774,8 @@ def parse_turn_understanding(text: str, transcript: str) -> TurnUnderstanding:
         requires_grounding=payload.get("requires_grounding") is True,
         supersedes_previous=payload.get("supersedes_previous") is True,
         assembled_text=re.sub(r"\s+", " ", assembled).strip(),
-        reason=str(payload.get("reason") or "semantic classification").strip()[:240],
+        reason=reason,
+        clarification_needed=clarification_needed,
     )
 
 
@@ -1831,6 +1862,15 @@ class LiveConversationService:
     ) -> str:
         sample_count = len(audio) // 2
         max_window_samples = round(ONLINE_ASR_WINDOW_SECONDS * SAMPLE_RATE)
+        # A final decode of a normal-length turn must include the actual onset.
+        # LocalAgreement advances decode_from_sample as prefixes stabilize; using
+        # that rolling offset here made the final pass 1-2 seconds shorter than
+        # the captured turn and could replace a correct partial with a transcript
+        # missing its first words. Long turns still use the bounded stable-prefix
+        # tail so input duration remains uncapped.
+        if sample_count <= max_window_samples:
+            hypothesis = await self.transcribe(audio, purpose="final")
+            return hypothesis or state.display()
         start_sample = max(state.decode_from_sample, sample_count - max_window_samples)
         hypothesis = await self.transcribe(
             audio[start_sample * 2:],
@@ -2164,7 +2204,16 @@ class LiveConversationService:
             )
             if understanding.supersedes_previous:
                 self.supersede_previous_agent_turn()
-            if not understanding.complete or understanding.confidence < 0.65:
+            if understanding.clarification_needed or understanding.confidence < 0.65:
+                route, reply, _ = parse_speech_model_output(raw_decision)
+                if route != "direct" or not reply:
+                    reply = "I didn't catch that clearly. Could you say it again?"
+                LOGGER.info(
+                    "semantic_clarification_requested confidence=%.3f reason=%r",
+                    understanding.confidence, understanding.reason,
+                )
+                return "direct", reply, None
+            if not understanding.complete:
                 self.pending_fragment = text.strip()
                 return "wait", "", None
             effective_text = understanding.assembled_text or text
@@ -2242,6 +2291,7 @@ class LiveConversationService:
         response_id: str,
         message_type: str = "reply",
         expected_generation: int | None = None,
+        display_text: str | None = None,
     ) -> int:
         """Synthesize and stream one complete spoken response."""
         generation = (
@@ -2254,7 +2304,7 @@ class LiveConversationService:
             return -1
         await socket.send_json({
             "type": message_type,
-            "text": text,
+            "text": text if display_text is None else display_text,
             "route": route,
             "responseId": response_id,
         })
@@ -2518,7 +2568,7 @@ def render_page() -> str:
 <title>Live Conversation</title><style>
 html,body{margin:0;min-height:100%;background:#060a10;color:#f4f8fc;font-family:system-ui,sans-serif}main{padding:18px 14px 28px;max-width:760px;margin:auto}h1{font-size:23px;margin:0 0 5px}.sub{color:#9aa9b8;margin:0 0 7px}.setting{color:#7fcbb4;font-size:12px;margin-bottom:16px}.state{font-size:18px;color:#54e0b4;margin:12px 0}.meter{height:14px;background:#101820;border:1px solid #304050;border-radius:8px;overflow:hidden}.meter div{height:100%;width:0;background:#00ab7e;transition:width 60ms}.buttons{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:14px 0}button{min-height:48px;border:1px solid #00ab7e;border-radius:8px;background:#1e2630;color:#fff;font-size:15px}.card{background:#0a0e14;border-radius:8px;padding:12px;margin-top:10px;min-height:48px}.label{color:#8797a8;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.metrics{font-size:12px;color:#aebdca;margin-top:12px}.route{display:inline-block;border:1px solid #36556a;border-radius:10px;padding:2px 7px;font-size:11px;margin-left:6px}.history{margin-top:18px}.history-list{display:flex;flex-direction:column;gap:8px;margin-top:8px}.history-empty{color:#718294;font-size:13px}.message{max-width:88%;padding:9px 11px;border-radius:12px;line-height:1.35;white-space:pre-wrap;overflow-wrap:anywhere}.message.user{align-self:flex-end;background:#0e5948}.message.assistant{align-self:flex-start;background:#182431}.message-role{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:#9db0bf;margin-bottom:3px}
 </style></head><body><main><h1>Live Conversation</h1><p class="sub">Accurate local speech recognition. Simple requests answer here; complex work routes to the right OpenClaw session.</p><div id="confirmation" class="setting">Action confirmation: loading…</div><div id="state" class="state">Ready</div><div class="meter"><div id="bar"></div></div><div class="buttons"><button id="start">Start conversation</button><button id="stop">Stop</button></div><div class="card"><div class="label">You</div><div id="user">—</div></div><div class="card"><div class="label">Assistant <span id="route" class="route">waiting</span></div><div id="assistant">—</div></div><div id="metrics" class="metrics"></div><section class="history"><div class="label">Recent messages · newest first · last 120</div><div id="history" class="history-list"><div class="history-empty">No conversation history yet.</div></div></section></main><script>
-const state=document.getElementById('state'),bar=document.getElementById('bar'),user=document.getElementById('user'),assistant=document.getElementById('assistant'),route=document.getElementById('route'),metrics=document.getElementById('metrics'),confirmation=document.getElementById('confirmation'),historyList=document.getElementById('history');const AUDIO_FRAME_MS=20,START_CONFIRM_MS=300,ONSET_PREROLL_MS=900,PREBUFFER_FRAMES=Math.ceil((START_CONFIRM_MS+ONSET_PREROLL_MS)/AUDIO_FRAME_MS),SEMANTIC_CHECK_MS=350,HARD_ENDPOINT_MS=1900;let ws,timer,recording=false,awaitingResponse=false,responseActive=false,responseTailTimer=null,speechMs=0,silenceMs=0,candidateSpeechMs=0,pre=[],historyMessages=[],pendingTranscript='',endpointPending=false,nextEndpointAt=SEMANTIC_CHECK_MS,confirmationMode='automatic';const confirmationToggle=document.createElement('button');confirmationToggle.textContent='Toggle confirmation';confirmation.insertAdjacentElement('afterend',confirmationToggle);
+const state=document.getElementById('state'),bar=document.getElementById('bar'),user=document.getElementById('user'),assistant=document.getElementById('assistant'),route=document.getElementById('route'),metrics=document.getElementById('metrics'),confirmation=document.getElementById('confirmation'),historyList=document.getElementById('history');const AUDIO_FRAME_MS=20,START_CONFIRM_MS=300,ONSET_PREROLL_MS=1500,PREBUFFER_FRAMES=Math.ceil((START_CONFIRM_MS+ONSET_PREROLL_MS)/AUDIO_FRAME_MS),MAX_DRAIN_FRAMES=12,SEMANTIC_CHECK_MS=350,HARD_ENDPOINT_MS=1900;let ws,timer,recording=false,awaitingResponse=false,responseActive=false,responseTailTimer=null,speechMs=0,silenceMs=0,candidateSpeechMs=0,pre=[],historyMessages=[],pendingTranscript='',endpointPending=false,nextEndpointAt=SEMANTIC_CHECK_MS,confirmationMode='automatic';const confirmationToggle=document.createElement('button');confirmationToggle.textContent='Toggle confirmation';confirmation.insertAdjacentElement('afterend',confirmationToggle);
 function renderHistory(){historyList.replaceChildren();if(!historyMessages.length){const empty=document.createElement('div');empty.className='history-empty';empty.textContent='No conversation history yet.';historyList.appendChild(empty);return}for(const message of historyMessages.slice(-120).reverse()){const bubble=document.createElement('div');bubble.className='message '+message.role;const who=document.createElement('div');who.className='message-role';who.textContent=message.role==='user'?'You':'Assistant';const content=document.createElement('div');content.textContent=message.content;bubble.append(who,content);historyList.appendChild(bubble)}}
 function addHistory(role,content){if(!content)return;historyMessages.push({role,content});historyMessages=historyMessages.slice(-120);renderHistory()}
 function rms(b64){const s=atob(b64||'');let sum=0,n=0;for(let i=0;i+1<s.length;i+=2){let v=(s.charCodeAt(i)&255)|((s.charCodeAt(i+1)&255)<<8);if(v&32768)v-=65536;const f=v/32768;sum+=f*f;n++}return n?Math.sqrt(sum/n):0}
@@ -2526,7 +2576,8 @@ function send(x){if(ws&&ws.readyState===1)ws.send(JSON.stringify(x))}
 function report(event,detail){send({type:'client_event',event:event,detail:String(detail||'')})}
 function finishTurn(){if(!recording)return;recording=false;awaitingResponse=true;candidateSpeechMs=0;endpointPending=false;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}
 function begin(){if(recording)return;const interruptedWait=awaitingResponse;recording=true;awaitingResponse=false;candidateSpeechMs=0;speechMs=0;silenceMs=0;endpointPending=false;nextEndpointAt=SEMANTIC_CHECK_MS;if(responseActive){responseActive=false;if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}try{OpenClawNativeAudio.interruptAgentResponsePlayback()}catch(e){}report('barge_in','confirmed_user_speech')}send({type:'input_audio_buffer.speech_started'});send({type:'start'});for(const audioBase64 of pre)send({type:'audio',audioBase64});pre=[];report('speech_started',interruptedWait?'while_awaiting_response':'ready');state.textContent='Listening…'}
-function tick(){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>PREBUFFER_FRAMES)pre.shift();const speechThreshold=responseActive?.025:.012;const speechRequiredMs=responseActive?200:START_CONFIRM_MS;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+AUDIO_FRAME_MS:0;if(candidateSpeechMs>=speechRequiredMs)begin();return}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=AUDIO_FRAME_MS;silenceMs=0;endpointPending=false;nextEndpointAt=SEMANTIC_CHECK_MS}else silenceMs+=AUDIO_FRAME_MS;if(speechMs>=200&&silenceMs>=HARD_ENDPOINT_MS){finishTurn();return}if(speechMs>=200&&silenceMs>=nextEndpointAt&&!endpointPending){endpointPending=true;nextEndpointAt=silenceMs+400;send({type:'endpoint_candidate'});state.textContent='Listening for more…'}}
+function processChunk(chunk){const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>PREBUFFER_FRAMES)pre.shift();const speechThreshold=responseActive?.025:.012;const speechRequiredMs=responseActive?200:START_CONFIRM_MS;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+AUDIO_FRAME_MS:0;if(candidateSpeechMs>=speechRequiredMs)begin();return true}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=AUDIO_FRAME_MS;silenceMs=0;endpointPending=false;nextEndpointAt=SEMANTIC_CHECK_MS}else silenceMs+=AUDIO_FRAME_MS;if(speechMs>=200&&silenceMs>=HARD_ENDPOINT_MS){finishTurn();return false}if(speechMs>=200&&silenceMs>=nextEndpointAt&&!endpointPending){endpointPending=true;nextEndpointAt=silenceMs+400;send({type:'endpoint_candidate'});state.textContent='Listening for more…'}return true}
+function tick(){for(let drained=0;drained<MAX_DRAIN_FRAMES;drained++){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;if(processChunk(chunk)===false)return}}
 function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-120):[];renderHistory()}if(m.type==='settings')confirmation.textContent='Action confirmation: '+(m.action_confirmation==='confirm'?'On — asks before actions':'Off — replies before acting');if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.state==='listening'&&!recording){awaitingResponse=false;candidateSpeechMs=0}if((m.detail||'').startsWith('Ignored')||(m.detail||'').startsWith('Silent stop'))pendingTranscript=''}if(m.type==='action_status'&&m.state==='acknowledged')state.textContent='Working…';if(m.type==='partial_transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript='';addHistory('user',m.text)}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
 let realtimeListenerSocket=null;
 function installRealtimeListeners(){if(!ws||realtimeListenerSocket===ws)return;realtimeListenerSocket=ws;ws.addEventListener('message',event=>{const m=JSON.parse(event.data);if(m.type==='settings'){confirmationMode=m.action_confirmation;confirmationToggle.textContent=confirmationMode==='confirm'?'Turn confirmation off':'Turn confirmation on'}if(m.type==='endpoint_decision'){endpointPending=false;report('semantic_endpoint',m.source+':'+m.probability);if(recording&&m.complete)finishTurn()}if(m.type==='backchannel'){assistant.textContent=m.text;route.textContent='listening'}});setTimeout(()=>{try{report('voice_processing',OpenClawNativeAudio.getVoiceProcessingStatus())}catch(e){report('voice_processing','unavailable')}},250)}
@@ -2843,14 +2894,15 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
                     duration = len(snapshot) / (SAMPLE_RATE * 2)
                     if (
                         not decision.complete and not backchannel_used
-                        and duration >= 4.0 and transcript_snapshot
+                        and duration >= 4.0 and len(online_transcript.stable_words) >= 3
                     ):
                         backchannel_used = True
                         await service.send_spoken_response(
-                            socket, "Mm-hm.", "backchannel",
+                            socket, BACKCHANNEL_TTS_TEXT, "backchannel",
                             f"backchannel-{time.monotonic_ns()}",
                             message_type="backchannel",
                             expected_generation=service.speech_generation,
+                            display_text=BACKCHANNEL_DISPLAY_TEXT,
                         )
                 except Exception as error:
                     LOGGER.warning("semantic_endpoint_failed error=%s", error)

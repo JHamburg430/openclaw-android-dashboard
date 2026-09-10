@@ -2309,7 +2309,10 @@ public final class MainActivity extends Activity {
     private final class NativeAudioBridge {
         private static final int NATIVE_SAMPLE_RATE = 16000;
         private static final int OUTPUT_SAMPLE_RATE = 24000;
-        private static final int MAX_QUEUED_CHUNKS = 64;
+        // Preserve five seconds of microphone audio across brief WebView/UI
+        // scheduling stalls. The page drains bursts on its next timer tick, so
+        // an old 1.28-second cap no longer discards the beginning of a sentence.
+        private static final int MAX_QUEUED_CHUNKS = 256;
         private static final int MAX_OUTPUT_QUEUED_CHUNKS = 96;
         private static final double OUTPUT_GAIN = 5.0;
         private static final double TEST_TONE_AMPLITUDE = 30000.0;

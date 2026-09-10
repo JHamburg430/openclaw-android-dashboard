@@ -12,11 +12,12 @@ in the Android Dashboard plus menu.
    semantic/prosodic decision ends complete thoughts quickly and keeps
    unfinished thoughts open; a 1,900 ms hard-silence fallback prevents a bad
    prediction from leaving the microphone stuck without limiting utterance
-   duration.
-   This rejects the lower-level television/road speech that the former 0.006
-   start gate treated as if it came from the person holding the phone. A 900 ms
-   onset pre-roll is retained in addition to the 300 ms confirmation window,
-   so quiet initial words and consonants still reach transcription after the
+   duration. This rejects the lower-level television/road speech that the former
+   0.006 start gate treated as if it came from the person holding the phone. A
+   1.5-second onset pre-roll is retained in addition to the 300 ms
+   confirmation window, and queued native frames are drained in bursts so UI
+   scheduling jitter cannot discard the start of a sentence, so quiet initial
+   words and consonants still reach transcription after the
    stricter foreground-speech gate opens.
 3. Pipecat's persistent `faster-whisper` `small.en` service transcribes locally
    with CUDA `float16` beam search on GPU 0 and falls back to CPU `int8` if CUDA
@@ -102,8 +103,9 @@ in the Android Dashboard plus menu.
    enough” stop playback without entering history, invoking a model, or
    producing a reply. Each synthesis request carries a restrained contextual
    cadence: brief questions/backchannels are slightly quicker, while warnings
-   and apologies slow down. Smart Turn can emit one short “Mm-hm” backchannel
-   when a long utterance pauses but is semantically unfinished.
+   and apologies slow down. Smart Turn can emit one short, nonverbal affirmative
+   hum only after ASR has established a stable intelligible prefix when a long
+   utterance pauses but is semantically unfinished.
 10. When OpenClaw Dashboard holds Android's Assistant role, its lightweight
    voice service streams rolling microphone windows to `/wake`. Detecting the
    standalone word “Jarvis” opens and auto-starts Live Conversation over the

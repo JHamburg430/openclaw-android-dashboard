@@ -9,6 +9,8 @@ from zoneinfo import ZoneInfo
 
 from server import (
     AGENT_SENTINEL,
+    BACKCHANNEL_DISPLAY_TEXT,
+    BACKCHANNEL_TTS_TEXT,
     NEW_AGENT_SENTINEL,
     IGNORE_SENTINEL,
     SAY_SENTINEL,
@@ -61,7 +63,7 @@ from server import (
 def semantic_decision(
     route="direct", reply="I understand.", *, actionable=False,
     grounding=False, complete=True, confidence=0.98, speech_act="statement",
-    relation="new", supersedes=False, assembled_text="", session_key="",
+    relation="new", supersedes=False, clarification=False, assembled_text="", session_key="",
 ):
     return {
         "route": route,
@@ -74,6 +76,7 @@ def semantic_decision(
         "actionable": actionable,
         "requires_grounding": grounding,
         "supersedes_previous": supersedes,
+        "clarification_needed": clarification,
         "assembled_text": assembled_text or "Complete turn.",
         "reason": "Contextual semantic classification.",
     }
@@ -139,6 +142,88 @@ class RoutingTests(unittest.TestCase):
             state.final("to review the voice logs carefully"),
             "please ask the agent to review the voice logs carefully",
         )
+
+    def test_final_online_decode_includes_full_onset_for_normal_turn(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:test", 1.15)
+            service.transcribe = AsyncMock(
+                return_value="Please review the voice logs now."
+            )
+            state = OnlineTranscript(
+                stable_words=["Please", "review"],
+                previous_words=["the", "voice", "logs"],
+                unstable_words=["the", "voice", "logs"],
+                decode_from_sample=16_000,
+            )
+            audio = b"\0\0" * (SAMPLE_RATE * 4)
+
+            transcript = await service.finalize_online_transcript(audio, state)
+
+            self.assertEqual(transcript, "Please review the voice logs now.")
+            service.transcribe.assert_awaited_once_with(audio, purpose="final")
+
+        import asyncio
+        from server import SAMPLE_RATE
+        asyncio.run(run_test())
+
+    def test_semantic_controller_requests_repeat_for_unclear_committed_speech(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:test", 1.15)
+            service.sessions_updated_at = time.monotonic()
+            service.capabilities_updated_at = time.monotonic()
+            decision = semantic_decision(
+                "direct", "I didn't catch that clearly. Could you say it again?",
+                complete=False, confidence=0.92, speech_act="correction",
+                relation="correction", clarification=True,
+                assembled_text="instead of saying the same thing say the same thing",
+            )
+            client, _ = mock_semantic_model(decision)
+            with patch("server.aiohttp.ClientSession", return_value=client):
+                result = await service.speech_reply(
+                    "instead of saying the same thing say the same thing"
+                )
+            self.assertEqual(result, (
+                "direct", "I didn't catch that clearly. Could you say it again?", None
+            ))
+            self.assertEqual(service.pending_fragment, "")
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_controller_diagnosis_repairs_inconsistent_clarification_flag(self):
+        decision = semantic_decision(
+            "direct", "", complete=False, confidence=0.95,
+            speech_act="correction", relation="correction", clarification=False,
+            assembled_text="a damaged correction",
+        )
+        decision["reason"] = (
+            "The wording is semantically contradictory and indicates a recognition "
+            "error, so it warrants clarification."
+        )
+        understanding = parse_turn_understanding(
+            json.dumps(decision), "a damaged correction"
+        )
+        self.assertTrue(understanding.clarification_needed)
+
+    def test_backchannel_uses_nonverbal_phonemes_without_spelling_text(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:test", 1.15)
+            service.tts.synthesize = AsyncMock(return_value=b"")
+            socket = AsyncMock()
+            await service.send_spoken_response(
+                socket, BACKCHANNEL_TTS_TEXT, "backchannel", "bc-1",
+                message_type="backchannel", display_text=BACKCHANNEL_DISPLAY_TEXT,
+            )
+            service.tts.synthesize.assert_awaited_once()
+            self.assertEqual(
+                service.tts.synthesize.await_args.args[0], BACKCHANNEL_TTS_TEXT
+            )
+            first = socket.send_json.await_args_list[0].args[0]
+            self.assertEqual(first["type"], "backchannel")
+            self.assertEqual(first["text"], "")
+
+        import asyncio
+        asyncio.run(run_test())
 
     def test_conversation_entity_graph_and_dynamic_cadence(self):
         entities = conversation_entities(
@@ -1832,9 +1917,11 @@ class RoutingTests(unittest.TestCase):
         self.assertNotIn("if(awaitingResponse){candidateSpeechMs=0;return}", page)
         self.assertIn("interruptedWait?'while_awaiting_response':'ready'", page)
         self.assertIn("candidateSpeechMs>=speechRequiredMs", page)
-        self.assertIn("ONSET_PREROLL_MS=900", page)
+        self.assertIn("ONSET_PREROLL_MS=1500", page)
         self.assertIn("PREBUFFER_FRAMES=Math.ceil((START_CONFIRM_MS+ONSET_PREROLL_MS)/AUDIO_FRAME_MS)", page)
         self.assertIn("while(pre.length>PREBUFFER_FRAMES)pre.shift()", page)
+        self.assertIn("MAX_DRAIN_FRAMES=12", page)
+        self.assertIn("processChunk(chunk)", page)
         self.assertIn("responseActive=true", page)
         self.assertIn("first_pcm_enqueued", page)
         self.assertIn("pcm_delivery_done", page)
@@ -1855,6 +1942,8 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("async def run_turn_queue", source)
         self.assertIn("await conversation_idle.wait()", source)
         self.assertIn("if turn_queue.empty() and not user_input_active", source)
+        self.assertIn("len(online_transcript.stable_words) >= 3", source)
+        self.assertIn("display_text=BACKCHANNEL_DISPLAY_TEXT", source)
         self.assertNotIn("turn_task.cancel()", source)
         self.assertNotIn("len(audio) < SAMPLE_RATE * 2 * 30", source)
 
