@@ -696,6 +696,26 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(prompt_history[-1]["content"], service.recent_history()[-1]["content"])
         self.assertNotEqual(prompt_history[0]["role"], "assistant")
 
+    def test_one_oversized_recent_message_is_truncated_to_prompt_budget(self):
+        service = LiveConversationService("agent:main:live-conversation", 1.15)
+        service.remember("user", "beginning-marker " + ("x" * 20_000) + " ending-marker")
+
+        prompt_history = service.prompt_history()
+
+        self.assertEqual(len(prompt_history), 1)
+        self.assertLessEqual(len(prompt_history[0]["content"]), PROMPT_HISTORY_CHARS)
+        self.assertTrue(prompt_history[0]["content"].startswith("…"))
+        self.assertTrue(prompt_history[0]["content"].endswith("ending-marker"))
+
+    def test_adjacent_duplicate_transport_events_are_not_remembered_twice(self):
+        service = LiveConversationService("agent:main:live-conversation", 1.15)
+        service.remember("assistant", "  The agent completed.\n")
+        service.remember("assistant", "The  agent completed.")
+
+        self.assertEqual(service.recent_history(), [
+            {"role": "assistant", "content": "The agent completed."},
+        ])
+
     def test_completed_agent_reply_can_be_spoken_after_reconnect(self):
         service = LiveConversationService("agent:main:live-conversation", 1.15)
         service.queue_pending_reply("The background repair is complete.")

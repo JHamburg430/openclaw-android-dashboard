@@ -899,6 +899,14 @@ class LiveConversationService:
         content = content.strip()
         if role not in ("user", "assistant") or not content:
             return
+        # WebView reconnects and agent callback recovery can legitimately replay
+        # the same event. Do not let transport retries become conversational
+        # memory that the supervisor interprets as repeated user intent/results.
+        if self.history and self.history[-1]["role"] == role:
+            previous = re.sub(r"\s+", " ", self.history[-1]["content"]).strip()
+            current = re.sub(r"\s+", " ", content).strip()
+            if previous == current:
+                return
         self.history.append({"role": role, "content": content})
         while sum(len(item["content"]) for item in self.history) > MAX_HISTORY_CHARS:
             self.history.popleft()
@@ -1007,13 +1015,19 @@ class LiveConversationService:
         for message in reversed(filtered):
             if message["role"] == "assistant" and has_stale_identity_confusion(message["content"]):
                 continue
-            size = len(message["content"])
+            content = message["content"]
+            # A pasted diagnostic or long agent result must not consume more
+            # than the complete prompt-history budget. Preserve its newest end,
+            # which normally contains the conclusion and latest state.
+            if len(content) > PROMPT_HISTORY_CHARS:
+                content = "…" + content[-(PROMPT_HISTORY_CHARS - 1):]
+            size = len(content)
             if selected and (
                 len(selected) >= PROMPT_HISTORY_MESSAGES
                 or used_chars + size > PROMPT_HISTORY_CHARS
             ):
                 break
-            selected.appendleft(dict(message))
+            selected.appendleft({"role": message["role"], "content": content})
             used_chars += size
         # Do not begin the model context with a detached assistant answer when
         # the corresponding user turn fell just outside the history budget.
