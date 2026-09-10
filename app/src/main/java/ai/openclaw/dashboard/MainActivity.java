@@ -2404,6 +2404,23 @@ public final class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public String getVoiceProcessingStatus() {
+            synchronized (lock) {
+                try {
+                    return new JSONObject()
+                            .put("capturing", running.get())
+                            .put("source", "VOICE_COMMUNICATION")
+                            .put("aec", acousticEchoCanceler != null && acousticEchoCanceler.getEnabled())
+                            .put("noiseSuppression", noiseSuppressor != null && noiseSuppressor.getEnabled())
+                            .put("automaticGain", automaticGainControl != null && automaticGainControl.getEnabled())
+                            .toString();
+                } catch (Exception error) {
+                    return "{\"capturing\":false,\"error\":true}";
+                }
+            }
+        }
+
+        @JavascriptInterface
         public void playPcm16Base64(String base64Pcm16, int sampleRateHz) {
             playPcm16Base64(base64Pcm16, sampleRateHz, "playback");
         }

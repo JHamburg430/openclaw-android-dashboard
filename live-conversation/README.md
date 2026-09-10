@@ -7,9 +7,12 @@ in the Android Dashboard plus menu.
 
 1. The Android native audio bridge captures 16 kHz PCM in 20 ms frames.
 2. Browser-side VAD requires 300 ms of near-field audio above a 0.012 RMS
-   threshold before opening a turn. Endpointing uses the rolling transcript:
-   questions can complete after 450 ms, ordinary phrases after 700 ms, and
-   syntactically unfinished clauses remain open for at least 1,100 ms.
+   threshold before opening a turn. After 350 ms of silence, the server runs
+   Pipecat Smart Turn v3.2 on the final eight seconds of raw audio. Its learned
+   semantic/prosodic decision ends complete thoughts quickly and keeps
+   unfinished thoughts open; a 1,900 ms hard-silence fallback prevents a bad
+   prediction from leaving the microphone stuck without limiting utterance
+   duration.
    This rejects the lower-level television/road speech that the former 0.006
    start gate treated as if it came from the person holding the phone. A 900 ms
    onset pre-roll is retained in addition to the 300 ms confirmation window,
@@ -22,8 +25,12 @@ in the Android Dashboard plus menu.
    recurring proper-name and system-term substitutions. The larger cached model
    improves recognition of terms such as “live agent,” session names, and
    longer technical requests. While a
-   user is speaking, the service retranscribes the growing audio buffer about
-   once per second and displays partial text. Final decoding consumes
+   user is speaking, a LocalAgreement online layer decodes a bounded 14-second
+   tail about once per second. It exposes an immutable stable prefix separately
+   from the revisable suffix, carries stable context forward, and trims already
+   confirmed audio rather than repeatedly decoding an unbounded recording from
+   the beginning. Stable prefixes may trigger read-only session/capability
+   prefetch; they can never authorize actions. Final decoding consumes
    Faster-Whisper's lazy segment generator entirely on a worker thread, so
    inference cannot wedge the WebSocket event loop. No transcription timeout or
    fixed turn-length cap truncates a user's input. Silero VAD filters non-speech
@@ -90,7 +97,10 @@ in the Android Dashboard plus menu.
    new input cannot wait behind the remainder of an older reply. Spoken
    controls such as “Jarvis stop,” “stop talking,” “be quiet,” and “that's
    enough” stop playback without entering history, invoking a model, or
-   producing a reply.
+   producing a reply. Each synthesis request carries a restrained contextual
+   cadence: brief questions/backchannels are slightly quicker, while warnings
+   and apologies slow down. Smart Turn can emit one short “Mm-hm” backchannel
+   when a long utterance pauses but is semantically unfinished.
 10. When OpenClaw Dashboard holds Android's Assistant role, its lightweight
    voice service streams rolling microphone windows to `/wake`. Detecting the
    standalone word “Jarvis” opens and auto-starts Live Conversation over the
@@ -119,7 +129,8 @@ taking actions” to enable it, “Don't ask for confirmation before actions” 
 disable it, or ask “What is the confirmation setting?” When enabled, agent,
 new-agent, and existing-session actions are held until a short affirmative reply
 such as “go ahead”; a negative reply cancels the pending action. The current mode
-is shown near the top of the Live Conversation page.
+is shown near the top of the Live Conversation page and can also be changed
+with its direct toggle.
 
 The bridge forwards escalated transcripts without adding response-length or
 reasoning instructions. Voice response policy belongs to the gateway agent's
@@ -128,17 +139,16 @@ before the final answer is shortened for speech.
 
 ## Incremental speech behavior
 
-Rolling partial transcription makes speech visible before the turn ends and
-keeps capture open for natural-length input. The final transcript is sent to the
-speech supervisor as soon as adaptive endpointing detects a complete turn. Partial
-text is deliberately not allowed to launch tools or agents because early
-Whisper hypotheses can change as more words arrive.
+Stable and revisable partial transcription makes speech visible before the turn
+ends and keeps capture open for natural-length input. The final transcript is
+sent to the speech supervisor as soon as Smart Turn detects a complete turn.
+Only stable text can start read-only prefetch. Partial text is never allowed to
+launch tools or agents because an early Whisper hypothesis can still change.
 
 Ollama's `/api/chat` request cannot append more text to a user message after
-generation has begun. Safe future overlap is therefore to use stable partial
-prefixes for intent prediction and read-only prefetch, then start the definitive
-response from the final transcript. A true streaming speech-to-speech model or
-an online ASR decoder would be required to revise an already-running model turn.
+generation has begun, so definitive generation still starts at semantic turn
+completion. The online ASR and prefetch stages reduce duplicated recognition
+work and prepare authoritative context without acting on unstable speech.
 
 ## Jarvis wake word on Android
 
@@ -157,6 +167,9 @@ curl -fL -o /tmp/kokoro-en-v0_19.tar.bz2 \
   https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-en-v0_19.tar.bz2
 tar -xjf /tmp/kokoro-en-v0_19.tar.bz2 \
   -C ~/.openclaw/tools/sherpa-onnx-tts/models
+mkdir -p ~/.openclaw/tools/pipecat-live-conversation/models
+curl -fL -o ~/.openclaw/tools/pipecat-live-conversation/models/smart-turn-v3.2-cpu.onnx \
+  https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/main/smart-turn-v3.2-cpu.onnx
 chmod +x live-conversation/build-tts-worker.sh
 live-conversation/build-tts-worker.sh
 mkdir -p ~/.config/systemd/user

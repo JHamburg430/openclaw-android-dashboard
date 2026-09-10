@@ -81,7 +81,7 @@ int main(int argc, char **argv) {
     config.model.kokoro.data_dir = data_dir;
     config.model.num_threads = threads_text.empty() ? 8 : std::stoi(threads_text);
     config.model.provider = "cpu";
-    const float speed = speed_text.empty() ? 1.0f : std::stof(speed_text);
+    const float default_speed = speed_text.empty() ? 1.0f : std::stof(speed_text);
     const int32_t sid = sid_text.empty() ? 9 : std::stoi(sid_text);
     auto tts = sherpa_onnx::cxx::OfflineTts::Create(config);
 
@@ -100,6 +100,16 @@ int main(int argc, char **argv) {
       std::string text(length, '\0');
       if (!ReadExact(text.data(), text.size())) break;
       try {
+        float speed = default_speed;
+        // RTV1 extension: an ASCII record-separator prefix carries a
+        // per-utterance speed without changing the framed worker protocol.
+        if (!text.empty() && text[0] == '\x1e') {
+          const auto newline = text.find('\n');
+          if (newline != std::string::npos) {
+            speed = std::clamp(std::stof(text.substr(1, newline - 1)), 0.75f, 1.40f);
+            text.erase(0, newline + 1);
+          }
+        }
         auto generated = tts.Generate(text, sid, speed);
         auto pcm = ToPcm16(generated.samples);
         WriteResponse(0, pcm.data(), pcm.size() * sizeof(int16_t));

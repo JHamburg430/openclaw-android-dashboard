@@ -26,7 +26,9 @@ from server import (
     OUTPUT_SAMPLE_RATE,
     PersistentTtsWorker,
     SAMPLE_RATE,
+    SMART_TURN_MODEL_PATH,
 )
+from semantic_turn import SemanticTurnDetector
 
 
 PHRASES = {
@@ -39,6 +41,8 @@ PHRASES = {
     "pause_b": "and also remember the second part.",
     "ambient": "The television report continues after the commercial break.",
     "echo": "I am still speaking an older assistant response.",
+    "unfinished": "I think the important thing is because",
+    "finished": "Please review the voice logs now.",
 }
 
 
@@ -165,6 +169,14 @@ class VoiceModelAudioIntegrationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(turn=name):
                 transcript = await service.transcribe(self.audio[name])
                 self.assert_words_heard(transcript, *words)
+
+    async def test_production_speech_drives_native_audio_semantic_endpointing(self) -> None:
+        detector = SemanticTurnDetector(SMART_TURN_MODEL_PATH)
+        unfinished = await asyncio.to_thread(detector.predict, self.audio["unfinished"])
+        finished = await asyncio.to_thread(detector.predict, self.audio["finished"])
+        self.assertFalse(unfinished.complete, unfinished)
+        self.assertTrue(finished.complete, finished)
+        self.assertGreater(finished.probability, unfinished.probability)
 
     async def test_real_audio_survives_background_noise(self) -> None:
         service = self.service()

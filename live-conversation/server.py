@@ -27,6 +27,7 @@ from aiohttp import WSMsgType, web
 import numpy as np
 from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transcriptions.language import Language
+from semantic_turn import SemanticTurnDetector, TurnDecision
 
 
 SAMPLE_RATE = 16_000
@@ -71,6 +72,12 @@ CAPABILITY_CACHE_SECONDS = 60
 SESSION_CACHE_SECONDS = 3
 SESSION_POLL_SECONDS = 10
 PARTIAL_TRANSCRIPT_INTERVAL_SECONDS = 1.0
+ONLINE_ASR_WINDOW_SECONDS = 14.0
+ONLINE_ASR_OVERLAP_SECONDS = 2.0
+SMART_TURN_MODEL_PATH = os.environ.get(
+    "SMART_TURN_MODEL_PATH",
+    "/home/john/.openclaw/tools/pipecat-live-conversation/models/smart-turn-v3.2-cpu.onnx",
+)
 AGENT_RESULT_POLL_SECONDS = 3.0
 AGENT_RESULT_WAIT_SECONDS = 600.0
 DEFAULT_HISTORY_PATH = "/home/john/.openclaw/state/live-conversation-history.json"
@@ -84,6 +91,93 @@ WAKE_WORD = "jarvis"
 WAKE_WORD_ALIASES = frozenset(("jarvis", "jervis"))
 WAKE_WINDOW_SECONDS = 2.5
 WAKE_COOLDOWN_SECONDS = 5.0
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"\S+", re.sub(r"\s+", " ", text).strip())
+
+
+@dataclass
+class OnlineTranscript:
+    """LocalAgreement transcript with immutable and revisable prefixes."""
+
+    stable_words: list[str]
+    previous_words: list[str]
+    unstable_words: list[str]
+    decode_from_sample: int = 0
+
+    @classmethod
+    def empty(cls) -> "OnlineTranscript":
+        return cls([], [], [])
+
+    def update(self, hypothesis: str, audio_samples: int) -> tuple[str, str]:
+        current = self._without_stable_overlap(_words(hypothesis))
+        common = 0
+        for old, new in zip(self.previous_words, current):
+            if old.casefold().strip(".,?!") != new.casefold().strip(".,?!"):
+                break
+            common += 1
+        # Keep two words revisable; Whisper commonly repairs the newest phrase.
+        commit = max(0, common - 2)
+        if commit:
+            self.stable_words.extend(current[:commit])
+            current = current[commit:]
+            self.previous_words = self.previous_words[commit:]
+            self.decode_from_sample = max(
+                0,
+                audio_samples - round(ONLINE_ASR_OVERLAP_SECONDS * SAMPLE_RATE),
+            )
+        self.previous_words = current
+        self.unstable_words = current
+        return " ".join(self.stable_words), " ".join(self.unstable_words)
+
+    def display(self) -> str:
+        return " ".join((*self.stable_words, *self.unstable_words)).strip()
+
+    def final(self, hypothesis: str) -> str:
+        tail = self._without_stable_overlap(_words(hypothesis))
+        return " ".join((*self.stable_words, *tail)).strip()
+
+    def _without_stable_overlap(self, tail: list[str]) -> list[str]:
+        maximum = min(len(self.stable_words), len(tail), 12)
+        for size in range(maximum, 0, -1):
+            left = [word.casefold().strip(".,?!") for word in self.stable_words[-size:]]
+            right = [word.casefold().strip(".,?!") for word in tail[:size]]
+            if left == right:
+                return tail[size:]
+        return tail
+
+
+def tts_speed_for(text: str, route: str = "direct", base: float = 1.15) -> float:
+    """Choose restrained conversational cadence supported by Kokoro."""
+    normalized = text.strip()
+    if route == "backchannel":
+        return min(1.28, base + 0.10)
+    if re.search(r"\b(?:sorry|unfortunately|careful|warning|failed|can't|cannot)\b", normalized, re.I):
+        return max(0.96, base - 0.10)
+    if "?" in normalized or len(normalized) < 45:
+        return min(1.24, base + 0.04)
+    if len(normalized) > 260:
+        return min(1.20, base + 0.02)
+    return base
+
+
+def conversation_entities(text: str) -> dict[str, list[str]]:
+    """Extract compact topic/entity keys for durable referent resolution."""
+    normalized = re.sub(r"\s+", " ", text).strip()
+    stop = {
+        "about", "agent", "another", "could", "have", "please", "session",
+        "start", "that", "this", "with", "would", "your", "into", "from",
+    }
+    terms = [
+        word for word in re.findall(r"[a-z0-9][a-z0-9._-]+", normalized.lower())
+        if len(word) > 2 and word not in stop
+    ]
+    proper = re.findall(r"\b[A-Z][A-Za-z0-9._-]{2,}\b", normalized)
+    return {
+        "topics": list(dict.fromkeys(terms))[:16],
+        "named_entities": list(dict.fromkeys(proper))[:8],
+    }
 
 
 def is_wake_word(transcript: str) -> bool:
@@ -856,7 +950,9 @@ class IncrementalSpeechStream:
                 })
                 self.started = True
             tts_started = time.perf_counter()
-            pcm = await self.service.tts.synthesize(text)
+            pcm = await self.service.tts.synthesize(
+                text, tts_speed_for(text, "direct", self.service.tts.speed)
+            )
             self.tts_ms += round((time.perf_counter() - tts_started) * 1000)
             chunk_bytes = OUTPUT_SAMPLE_RATE * 2 // 10
             prefill_bytes = round(OUTPUT_SAMPLE_RATE * 2 * PLAYBACK_PREFILL_SECONDS)
@@ -933,12 +1029,13 @@ class PersistentTtsWorker:
         if handshake[:4] != b"RTV1" or struct.unpack("<I", handshake[4:])[0] != OUTPUT_SAMPLE_RATE:
             raise RuntimeError("Invalid TTS worker handshake")
 
-    async def synthesize(self, text: str) -> bytes:
+    async def synthesize(self, text: str, speed: float | None = None) -> bytes:
         async with self.lock:
             try:
                 await self.start()
                 assert self.process and self.process.stdin and self.process.stdout
-                encoded = text.encode("utf-8")
+                request_speed = self.speed if speed is None else speed
+                encoded = f"\x1e{request_speed:.3f}\n{text}".encode("utf-8")
                 self.process.stdin.write(struct.pack("<I", len(encoded)) + encoded)
                 await self.process.stdin.drain()
                 header = await self.process.stdout.readexactly(8)
@@ -979,6 +1076,8 @@ class LiveConversationService:
         self.session_key = session_key
         self.stt: WhisperSTTService | None = None
         self.stt_description = "not loaded"
+        self.semantic_turn: SemanticTurnDetector | None = None
+        self.semantic_turn_description = "fallback"
         self.tts = PersistentTtsWorker(DEFAULT_TTS_WORKER, DEFAULT_TTS_RUNTIME, DEFAULT_TTS_MODEL_DIR, tts_speed)
         self.speech_lock = asyncio.Lock()
         self.transcribe_lock = asyncio.Lock()
@@ -1186,11 +1285,14 @@ class LiveConversationService:
             (item for item in self.recent_agent_sessions if item.get("session_key") != session_key),
             maxlen=12,
         )
+        entity_state = conversation_entities(request)
         self.recent_agent_sessions.append({
             "session_key": session_key,
             "request": re.sub(r"\s+", " ", request).strip(),
             "state": "running",
             "started_at": int(time.time()),
+            **entity_state,
+            "result": "",
         })
         self.sessions_updated_at = 0.0
         self.record_event(
@@ -1200,10 +1302,14 @@ class LiveConversationService:
         self._save_settings()
         self._save_history()
 
-    def update_agent_session(self, session_key: str, state: str) -> None:
+    def update_agent_session(
+        self, session_key: str, state: str, result: str = ""
+    ) -> None:
         for item in self.recent_agent_sessions:
             if item.get("session_key") == session_key:
                 item["state"] = state
+                if result:
+                    item["result"] = re.sub(r"\s+", " ", result).strip()[:500]
                 break
         self.sessions_updated_at = 0.0
         self.record_event(
@@ -1233,9 +1339,13 @@ class LiveConversationService:
             candidate = " ".join(str(value or "") for value in (
                 item.get("request"), gateway.get("displayName"),
                 gateway.get("derivedTitle"), gateway.get("label"),
+                " ".join(item.get("topics") or []),
+                " ".join(item.get("named_entities") or []), item.get("result"),
             ))
             candidate_terms = set(re.findall(r"[a-z0-9]+", candidate.lower())) - stop_words
-            score = len(query_terms & candidate_terms) * 10 + max(0, 5 - recency)
+            overlap = len(query_terms & candidate_terms)
+            phrase_bonus = 12 if query_terms and " ".join(query_terms) in candidate.lower() else 0
+            score = overlap * 10 + phrase_bonus + max(0, 5 - recency)
             if score > best_score:
                 best, best_score = dict(item), score
         # Pure pronouns have no topical terms and intentionally resolve by recency.
@@ -1377,6 +1487,13 @@ class LiveConversationService:
             )
             self.stt_description = "faster-whisper small.en cpu-int8 fallback"
         await self.tts.start()
+        try:
+            self.semantic_turn = await asyncio.to_thread(
+                SemanticTurnDetector, SMART_TURN_MODEL_PATH
+            )
+            self.semantic_turn_description = "smart-turn-v3.2-cpu"
+        except Exception as error:
+            LOGGER.warning("semantic_turn_unavailable error=%s", error)
         await asyncio.gather(self.refresh_capabilities(), self.refresh_sessions())
         self.recover_recent_agent_session()
         await self.warm_speech_model()
@@ -1429,7 +1546,9 @@ class LiveConversationService:
         """Stop paced delivery promptly when confirmed new speech begins."""
         self.speech_generation += 1
 
-    async def transcribe(self, audio: bytes, purpose: str = "final") -> str:
+    async def transcribe(
+        self, audio: bytes, purpose: str = "final", initial_prompt: str = ""
+    ) -> str:
         if not self.stt:
             raise RuntimeError("Speech recognizer is not ready")
 
@@ -1449,6 +1568,7 @@ class LiveConversationService:
                     "John, Jarvis, OpenClaw, Live Conversation, live agent, "
                     "subagent, gateway, sessions"
                 ),
+                initial_prompt=initial_prompt or None,
                 vad_filter=True,
                 vad_parameters={
                     "threshold": 0.5 if purpose == "wake" else 0.6,
@@ -1471,6 +1591,58 @@ class LiveConversationService:
         async with self.transcribe_lock:
             decode = asyncio.create_task(asyncio.to_thread(run_to_completion))
             return await decode
+
+    async def transcribe_online(
+        self, audio: bytes, state: OnlineTranscript, purpose: str = "partial"
+    ) -> tuple[str, str, str]:
+        """Decode only the active tail and expose stable/revisable prefixes."""
+        sample_count = len(audio) // 2
+        max_window_samples = round(ONLINE_ASR_WINDOW_SECONDS * SAMPLE_RATE)
+        start_sample = max(state.decode_from_sample, sample_count - max_window_samples)
+        tail = audio[start_sample * 2:]
+        stable_prompt = " ".join(state.stable_words[-48:])
+        hypothesis = await self.transcribe(
+            tail, purpose=purpose, initial_prompt=stable_prompt
+        )
+        stable, unstable = state.update(hypothesis, sample_count)
+        return stable, unstable, state.display()
+
+    async def finalize_online_transcript(
+        self, audio: bytes, state: OnlineTranscript
+    ) -> str:
+        sample_count = len(audio) // 2
+        max_window_samples = round(ONLINE_ASR_WINDOW_SECONDS * SAMPLE_RATE)
+        start_sample = max(state.decode_from_sample, sample_count - max_window_samples)
+        hypothesis = await self.transcribe(
+            audio[start_sample * 2:],
+            purpose="final",
+            initial_prompt=" ".join(state.stable_words[-48:]),
+        )
+        return state.final(hypothesis)
+
+    async def endpoint_decision(self, audio: bytes, transcript: str = "") -> TurnDecision:
+        if self.semantic_turn is not None:
+            return await asyncio.to_thread(self.semantic_turn.predict, audio)
+        # Conservative fallback is explicit and observable rather than being
+        # misrepresented as model-based semantic endpointing.
+        unfinished = bool(re.search(
+            r"(?:,|\b(?:and|or|but|because|with|to|for|about|that|which))\s*$",
+            transcript.strip(), re.I,
+        ))
+        return TurnDecision(not unfinished, 0.5 if not unfinished else 0.0, "text-fallback")
+
+    async def prefetch_for_partial(self, stable_text: str) -> str | None:
+        """Warm read-only authoritative context from immutable ASR text."""
+        normalized = stable_text.lower()
+        if re.search(r"\b(?:session|agent|task|run)s?\b", normalized) and re.search(
+            r"\b(?:status|active|running|progress|latest|recent)\b", normalized
+        ):
+            await self.refresh_sessions(force=True)
+            return "sessions"
+        if re.search(r"\b(?:can you|capabilit|skill|available agent)\b", normalized):
+            await self.refresh_capabilities()
+            return "capabilities"
+        return None
 
     async def openclaw_json(self, *arguments: str, timeout: int = 30) -> Any:
         process = await asyncio.create_subprocess_exec(
@@ -1832,7 +2004,9 @@ class LiveConversationService:
             await socket.send_json({"type": "state", "state": "speaking", "route": route})
             speech_parts = split_spoken_text(text)
             tts_started = time.perf_counter()
-            pcm = await self.tts.synthesize(speech_parts[0])
+            pcm = await self.tts.synthesize(
+                speech_parts[0], tts_speed_for(speech_parts[0], route, self.tts.speed)
+            )
             tts_ms = round((time.perf_counter() - tts_started) * 1000)
             LOGGER.info(
                 "response_stream_start id=%s route=%s chars=%d parts=%d first_pcm_bytes=%d first_tts_ms=%d",
@@ -1848,7 +2022,10 @@ class LiveConversationService:
             for index, _ in enumerate(speech_parts):
                 next_synthesis: asyncio.Task[bytes] | None = None
                 if index + 1 < len(speech_parts):
-                    next_synthesis = asyncio.create_task(self.tts.synthesize(speech_parts[index + 1]))
+                    next_text = speech_parts[index + 1]
+                    next_synthesis = asyncio.create_task(self.tts.synthesize(
+                        next_text, tts_speed_for(next_text, route, self.tts.speed)
+                    ))
                 for offset in range(0, len(pcm), chunk_bytes):
                     if generation != self.speech_generation:
                         interrupted = True
@@ -1884,6 +2061,7 @@ class LiveConversationService:
         self, socket: web.WebSocketResponse, audio: bytes, agent_pending: bool = False,
         turn_generation: int | None = None,
         handoff_callback: Callable[[str, str | None], Awaitable[None]] | None = None,
+        transcript_override: str | None = None,
     ) -> tuple[str, str, str | None] | None:
         started = time.perf_counter()
         incremental_speech: IncrementalSpeechStream | None = None
@@ -1894,7 +2072,7 @@ class LiveConversationService:
         try:
             await socket.send_json({"type": "state", "state": "transcribing"})
             stage = time.perf_counter()
-            transcript = await self.transcribe(audio)
+            transcript = transcript_override or await self.transcribe(audio)
             metrics.asr_ms = round((time.perf_counter() - stage) * 1000)
             if not transcript:
                 await socket.send_json({"type": "state", "state": "listening", "detail": "No clear speech detected."})
@@ -2058,16 +2236,19 @@ def render_page() -> str:
 <title>Live Conversation</title><style>
 html,body{margin:0;min-height:100%;background:#060a10;color:#f4f8fc;font-family:system-ui,sans-serif}main{padding:18px 14px 28px;max-width:760px;margin:auto}h1{font-size:23px;margin:0 0 5px}.sub{color:#9aa9b8;margin:0 0 7px}.setting{color:#7fcbb4;font-size:12px;margin-bottom:16px}.state{font-size:18px;color:#54e0b4;margin:12px 0}.meter{height:14px;background:#101820;border:1px solid #304050;border-radius:8px;overflow:hidden}.meter div{height:100%;width:0;background:#00ab7e;transition:width 60ms}.buttons{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:14px 0}button{min-height:48px;border:1px solid #00ab7e;border-radius:8px;background:#1e2630;color:#fff;font-size:15px}.card{background:#0a0e14;border-radius:8px;padding:12px;margin-top:10px;min-height:48px}.label{color:#8797a8;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.metrics{font-size:12px;color:#aebdca;margin-top:12px}.route{display:inline-block;border:1px solid #36556a;border-radius:10px;padding:2px 7px;font-size:11px;margin-left:6px}.history{margin-top:18px}.history-list{display:flex;flex-direction:column;gap:8px;margin-top:8px}.history-empty{color:#718294;font-size:13px}.message{max-width:88%;padding:9px 11px;border-radius:12px;line-height:1.35;white-space:pre-wrap;overflow-wrap:anywhere}.message.user{align-self:flex-end;background:#0e5948}.message.assistant{align-self:flex-start;background:#182431}.message-role{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:#9db0bf;margin-bottom:3px}
 </style></head><body><main><h1>Live Conversation</h1><p class="sub">Accurate local speech recognition. Simple requests answer here; complex work routes to the right OpenClaw session.</p><div id="confirmation" class="setting">Action confirmation: loading…</div><div id="state" class="state">Ready</div><div class="meter"><div id="bar"></div></div><div class="buttons"><button id="start">Start conversation</button><button id="stop">Stop</button></div><div class="card"><div class="label">You</div><div id="user">—</div></div><div class="card"><div class="label">Assistant <span id="route" class="route">waiting</span></div><div id="assistant">—</div></div><div id="metrics" class="metrics"></div><section class="history"><div class="label">Recent messages · newest first · last 120</div><div id="history" class="history-list"><div class="history-empty">No conversation history yet.</div></div></section></main><script>
-const state=document.getElementById('state'),bar=document.getElementById('bar'),user=document.getElementById('user'),assistant=document.getElementById('assistant'),route=document.getElementById('route'),metrics=document.getElementById('metrics'),confirmation=document.getElementById('confirmation'),historyList=document.getElementById('history');const AUDIO_FRAME_MS=20,START_CONFIRM_MS=300,ONSET_PREROLL_MS=900,PREBUFFER_FRAMES=Math.ceil((START_CONFIRM_MS+ONSET_PREROLL_MS)/AUDIO_FRAME_MS);let ws,timer,recording=false,awaitingResponse=false,responseActive=false,responseTailTimer=null,speechMs=0,silenceMs=0,candidateSpeechMs=0,pre=[],historyMessages=[],pendingTranscript='';
+const state=document.getElementById('state'),bar=document.getElementById('bar'),user=document.getElementById('user'),assistant=document.getElementById('assistant'),route=document.getElementById('route'),metrics=document.getElementById('metrics'),confirmation=document.getElementById('confirmation'),historyList=document.getElementById('history');const AUDIO_FRAME_MS=20,START_CONFIRM_MS=300,ONSET_PREROLL_MS=900,PREBUFFER_FRAMES=Math.ceil((START_CONFIRM_MS+ONSET_PREROLL_MS)/AUDIO_FRAME_MS),SEMANTIC_CHECK_MS=350,HARD_ENDPOINT_MS=1900;let ws,timer,recording=false,awaitingResponse=false,responseActive=false,responseTailTimer=null,speechMs=0,silenceMs=0,candidateSpeechMs=0,pre=[],historyMessages=[],pendingTranscript='',endpointPending=false,nextEndpointAt=SEMANTIC_CHECK_MS,confirmationMode='automatic';const confirmationToggle=document.createElement('button');confirmationToggle.textContent='Toggle confirmation';confirmation.insertAdjacentElement('afterend',confirmationToggle);
 function renderHistory(){historyList.replaceChildren();if(!historyMessages.length){const empty=document.createElement('div');empty.className='history-empty';empty.textContent='No conversation history yet.';historyList.appendChild(empty);return}for(const message of historyMessages.slice(-120).reverse()){const bubble=document.createElement('div');bubble.className='message '+message.role;const who=document.createElement('div');who.className='message-role';who.textContent=message.role==='user'?'You':'Assistant';const content=document.createElement('div');content.textContent=message.content;bubble.append(who,content);historyList.appendChild(bubble)}}
 function addHistory(role,content){if(!content)return;historyMessages.push({role,content});historyMessages=historyMessages.slice(-120);renderHistory()}
 function rms(b64){const s=atob(b64||'');let sum=0,n=0;for(let i=0;i+1<s.length;i+=2){let v=(s.charCodeAt(i)&255)|((s.charCodeAt(i+1)&255)<<8);if(v&32768)v-=65536;const f=v/32768;sum+=f*f;n++}return n?Math.sqrt(sum/n):0}
 function send(x){if(ws&&ws.readyState===1)ws.send(JSON.stringify(x))}
 function report(event,detail){send({type:'client_event',event:event,detail:String(detail||'')})}
-function endpointSilenceMs(){const text=(pendingTranscript||'').trim().toLowerCase();if(/(?:,|(?:^| )(?:and|or|but|because|with|to|for|about|that|which))$/.test(text))return 1100;if(/[?]$/.test(text))return 450;return 700}
-function begin(){if(recording)return;const interruptedWait=awaitingResponse;recording=true;awaitingResponse=false;candidateSpeechMs=0;speechMs=0;silenceMs=0;if(responseActive){responseActive=false;if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}try{OpenClawNativeAudio.interruptAgentResponsePlayback()}catch(e){}report('barge_in','confirmed_user_speech')}send({type:'input_audio_buffer.speech_started'});send({type:'start'});for(const audioBase64 of pre)send({type:'audio',audioBase64});pre=[];report('speech_started',interruptedWait?'while_awaiting_response':'ready');state.textContent='Listening…'}
-function tick(){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>PREBUFFER_FRAMES)pre.shift();const speechThreshold=responseActive?.025:.012;const speechRequiredMs=responseActive?200:START_CONFIRM_MS;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+AUDIO_FRAME_MS:0;if(candidateSpeechMs>=speechRequiredMs)begin();return}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=AUDIO_FRAME_MS;silenceMs=0}else silenceMs+=AUDIO_FRAME_MS;if(speechMs>=200&&silenceMs>=endpointSilenceMs()){recording=false;awaitingResponse=true;candidateSpeechMs=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}}
+function finishTurn(){if(!recording)return;recording=false;awaitingResponse=true;candidateSpeechMs=0;endpointPending=false;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}
+function begin(){if(recording)return;const interruptedWait=awaitingResponse;recording=true;awaitingResponse=false;candidateSpeechMs=0;speechMs=0;silenceMs=0;endpointPending=false;nextEndpointAt=SEMANTIC_CHECK_MS;if(responseActive){responseActive=false;if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}try{OpenClawNativeAudio.interruptAgentResponsePlayback()}catch(e){}report('barge_in','confirmed_user_speech')}send({type:'input_audio_buffer.speech_started'});send({type:'start'});for(const audioBase64 of pre)send({type:'audio',audioBase64});pre=[];report('speech_started',interruptedWait?'while_awaiting_response':'ready');state.textContent='Listening…'}
+function tick(){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>PREBUFFER_FRAMES)pre.shift();const speechThreshold=responseActive?.025:.012;const speechRequiredMs=responseActive?200:START_CONFIRM_MS;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+AUDIO_FRAME_MS:0;if(candidateSpeechMs>=speechRequiredMs)begin();return}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=AUDIO_FRAME_MS;silenceMs=0;endpointPending=false;nextEndpointAt=SEMANTIC_CHECK_MS}else silenceMs+=AUDIO_FRAME_MS;if(speechMs>=200&&silenceMs>=HARD_ENDPOINT_MS){finishTurn();return}if(speechMs>=200&&silenceMs>=nextEndpointAt&&!endpointPending){endpointPending=true;nextEndpointAt=silenceMs+400;send({type:'endpoint_candidate'});state.textContent='Listening for more…'}}
 function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-120):[];renderHistory()}if(m.type==='settings')confirmation.textContent='Action confirmation: '+(m.action_confirmation==='confirm'?'On — asks before actions':'Off — replies before acting');if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.state==='listening'&&!recording){awaitingResponse=false;candidateSpeechMs=0}if((m.detail||'').startsWith('Ignored')||(m.detail||'').startsWith('Silent stop'))pendingTranscript=''}if(m.type==='action_status'&&m.state==='acknowledged')state.textContent='Working…';if(m.type==='partial_transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript='';addHistory('user',m.text)}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
+let realtimeListenerSocket=null;
+function installRealtimeListeners(){if(!ws||realtimeListenerSocket===ws)return;realtimeListenerSocket=ws;ws.addEventListener('message',event=>{const m=JSON.parse(event.data);if(m.type==='settings'){confirmationMode=m.action_confirmation;confirmationToggle.textContent=confirmationMode==='confirm'?'Turn confirmation off':'Turn confirmation on'}if(m.type==='endpoint_decision'){endpointPending=false;report('semantic_endpoint',m.source+':'+m.probability);if(recording&&m.complete)finishTurn()}if(m.type==='backchannel'){assistant.textContent=m.text;route.textContent='listening'}});setTimeout(()=>{try{report('voice_processing',OpenClawNativeAudio.getVoiceProcessingStatus())}catch(e){report('voice_processing','unavailable')}},250)}
+const originalStart=start;start=function(){originalStart();installRealtimeListeners()};confirmationToggle.onclick=()=>send({type:'set_confirmation',required:confirmationMode!=='confirm'});
 function stop(){if(timer)clearInterval(timer);timer=null;if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=null;try{OpenClawNativeAudio.stopCapture()}catch(e){}if(ws)ws.close();ws=null;recording=false;awaitingResponse=false;responseActive=false;candidateSpeechMs=0;bar.style.width='0%';state.textContent='Stopped'}
 document.getElementById('start').onclick=start;document.getElementById('stop').onclick=()=>{stop();try{OpenClawNativeApp.liveConversationStopped()}catch(e){}};window.addEventListener('pagehide',stop);if(new URLSearchParams(location.search).get('autostart')==='1')start();
 </script></body></html>"""
@@ -2083,6 +2264,8 @@ async def health(request: web.Request) -> web.Response:
         "ok": service.stt is not None,
         "pipecat": "1.8.1",
         "stt": service.stt_description,
+        "online_asr": "local-agreement-stable-prefix",
+        "semantic_turn": service.semantic_turn_description,
         "history_messages": len(service.history),
         "conversation_events": len(service.events),
         "session_catalog": {
@@ -2134,28 +2317,51 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
             socket, reply, "agent", f"agent-reconnect-{time.monotonic_ns()}"
         )
     audio = bytearray()
-    turn_queue: asyncio.Queue[tuple[bytes, int]] = asyncio.Queue()
+    turn_queue: asyncio.Queue[tuple[bytes, int, str | None]] = asyncio.Queue()
     turn_worker: asyncio.Task[None] | None = None
     partial_task: asyncio.Task[None] | None = None
     silent_stop_detected = False
     turn_sequence = 0
     next_partial_bytes = round(SAMPLE_RATE * 2 * PARTIAL_TRANSCRIPT_INTERVAL_SECONDS)
+    online_transcript = OnlineTranscript.empty()
+    endpoint_task: asyncio.Task[None] | None = None
+    backchannel_used = False
+    prefetched_kinds: set[str] = set()
     agent_tasks: set[asyncio.Task[None]] = set()
     user_input_active = False
     conversation_idle = asyncio.Event()
     conversation_idle.set()
     callback_delivery_lock = asyncio.Lock()
 
-    async def run_partial(snapshot: bytes, sequence: int) -> None:
+    async def run_partial(
+        snapshot: bytes, sequence: int, transcript_state: OnlineTranscript
+    ) -> None:
         nonlocal silent_stop_detected
         try:
-            transcript = await service.transcribe(snapshot, purpose="partial")
+            if hasattr(service, "transcribe_online"):
+                stable, unstable, transcript = await service.transcribe_online(
+                    snapshot, transcript_state, purpose="partial"
+                )
+            else:
+                transcript = await service.transcribe(snapshot, purpose="partial")
+                stable, unstable = "", transcript
             if transcript and sequence == turn_sequence and is_silent_stop_command(transcript):
                 silent_stop_detected = True
                 service.interrupt_speech()
                 await socket.send_json({"type": "output_audio_buffer.cleared"})
             elif transcript and sequence == turn_sequence and not socket.closed:
-                await socket.send_json({"type": "partial_transcript", "text": transcript})
+                await socket.send_json({
+                    "type": "partial_transcript", "text": transcript,
+                    "stable": stable, "unstable": unstable,
+                })
+                if stable and hasattr(service, "prefetch_for_partial"):
+                    kind = await service.prefetch_for_partial(stable)
+                    if kind and kind not in prefetched_kinds:
+                        prefetched_kinds.add(kind)
+                        service.record_event(
+                            "prefetch", source="stable_asr", target=kind,
+                            status="complete", content=stable[-240:],
+                        )
         except Exception as error:
             LOGGER.warning("partial_transcription_failed error=%s", error)
 
@@ -2177,7 +2383,7 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
                     pass
             reply = await work
             await refresh
-            service.update_agent_session(target_session, "complete")
+            service.update_agent_session(target_session, "complete", reply)
             await service.refresh_sessions(force=True)
             if socket.closed:
                 service.remember("assistant", reply)
@@ -2239,17 +2445,20 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
                     "type": "agent_status", "state": "error", "sessionKey": target_session
                 })
 
-    async def run_turn(turn: bytes, generation: int) -> None:
+    async def run_turn(turn: bytes, generation: int, transcript: str | None) -> None:
         async def start_handoff(transcript: str, target_session: str | None) -> None:
             task = asyncio.create_task(run_agent(transcript, target_session))
             agent_tasks.add(task)
             task.add_done_callback(agent_tasks.discard)
 
-        handoff = await service.process_turn(
-            socket, turn, agent_pending=bool(agent_tasks),
-            turn_generation=generation,
-            handoff_callback=start_handoff,
-        )
+        process_arguments = {
+            "agent_pending": bool(agent_tasks),
+            "turn_generation": generation,
+            "handoff_callback": start_handoff,
+        }
+        if transcript is not None:
+            process_arguments["transcript_override"] = transcript
+        handoff = await service.process_turn(socket, turn, **process_arguments)
         # Compatibility for test doubles and older service implementations.
         if handoff:
             transcript, _, target_session = handoff
@@ -2257,10 +2466,10 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
 
     async def run_turn_queue() -> None:
         while True:
-            turn, generation = await turn_queue.get()
+            turn, generation, transcript = await turn_queue.get()
             conversation_idle.clear()
             try:
-                await run_turn(turn, generation)
+                await run_turn(turn, generation, transcript)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -2282,9 +2491,15 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
             conversation_idle.clear()
             service.interrupt_speech()
             await socket.send_json({"type": "output_audio_buffer.cleared"})
+        elif kind == "set_confirmation":
+            service.set_confirmation_required(bool(payload.get("required")))
+            await socket.send_json(service.settings_payload())
         elif kind == "start":
             turn_sequence += 1
             silent_stop_detected = False
+            backchannel_used = False
+            prefetched_kinds.clear()
+            online_transcript = OnlineTranscript.empty()
             audio.clear()
             next_partial_bytes = round(
                 SAMPLE_RATE * 2 * PARTIAL_TRANSCRIPT_INTERVAL_SECONDS
@@ -2300,7 +2515,51 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
                 next_partial_bytes = len(snapshot) + round(
                     SAMPLE_RATE * 2 * PARTIAL_TRANSCRIPT_INTERVAL_SECONDS
                 )
-                partial_task = asyncio.create_task(run_partial(snapshot, sequence))
+                partial_task = asyncio.create_task(
+                    run_partial(snapshot, sequence, online_transcript)
+                )
+        elif kind == "endpoint_candidate":
+            if endpoint_task and not endpoint_task.done():
+                continue
+            sequence = turn_sequence
+            snapshot = bytes(audio)
+            transcript_snapshot = online_transcript.display()
+
+            async def evaluate_endpoint() -> None:
+                nonlocal backchannel_used
+                try:
+                    decision = await service.endpoint_decision(
+                        snapshot, transcript_snapshot
+                    )
+                    if sequence != turn_sequence or socket.closed:
+                        return
+                    await socket.send_json({
+                        "type": "endpoint_decision",
+                        "complete": decision.complete,
+                        "probability": round(decision.probability, 4),
+                        "source": decision.source,
+                    })
+                    duration = len(snapshot) / (SAMPLE_RATE * 2)
+                    if (
+                        not decision.complete and not backchannel_used
+                        and duration >= 4.0 and transcript_snapshot
+                    ):
+                        backchannel_used = True
+                        await service.send_spoken_response(
+                            socket, "Mm-hm.", "backchannel",
+                            f"backchannel-{time.monotonic_ns()}",
+                            message_type="backchannel",
+                            expected_generation=service.speech_generation,
+                        )
+                except Exception as error:
+                    LOGGER.warning("semantic_endpoint_failed error=%s", error)
+                    if sequence == turn_sequence and not socket.closed:
+                        await socket.send_json({
+                            "type": "endpoint_decision", "complete": False,
+                            "probability": 0.0, "source": "error",
+                        })
+
+            endpoint_task = asyncio.create_task(evaluate_endpoint())
         elif kind == "commit":
             turn_sequence += 1
             user_input_active = False
@@ -2319,7 +2578,19 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
                 continue
             turn = bytes(audio)
             audio.clear()
-            turn_queue.put_nowait((turn, service.speech_generation))
+            if partial_task and not partial_task.done():
+                try:
+                    await partial_task
+                except Exception:
+                    pass
+            final_transcript = None
+            if hasattr(service, "finalize_online_transcript"):
+                final_transcript = await service.finalize_online_transcript(
+                    turn, online_transcript
+                )
+            turn_queue.put_nowait(
+                (turn, service.speech_generation, final_transcript or None)
+            )
         elif kind == "client_event":
             LOGGER.info("client_event event=%s detail=%s", payload.get("event", ""), payload.get("detail", ""))
     if turn_worker and not turn_worker.done():

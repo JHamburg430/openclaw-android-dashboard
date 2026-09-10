@@ -36,6 +36,7 @@ function harness() {
       replaceChildren(...items) { this.children = items; },
       appendChild(item) { this.children.push(item); },
       append(...items) { this.children.push(...items); },
+      insertAdjacentElement(_position, item) { this.children.push(item); },
       scrollIntoView() {},
       get lastElementChild() { return this.children.at(-1); },
     };
@@ -53,11 +54,17 @@ function harness() {
     static latest;
     constructor() {
       this.readyState = 1;
+      this.listeners = [];
       FakeWebSocket.latest = this;
     }
+    addEventListener(type, listener) { if (type === "message") this.listeners.push(listener); }
     send(value) { sent.push(JSON.parse(value)); }
     close() { this.readyState = 3; }
-    server(message) { this.onmessage({ data: JSON.stringify(message) }); }
+    server(message) {
+      const event = { data: JSON.stringify(message) };
+      this.onmessage(event);
+      for (const listener of this.listeners) listener(event);
+    }
   }
 
   const context = vm.createContext({
@@ -73,6 +80,7 @@ function harness() {
       prepareAgentResponsePlayback: () => { prepares += 1; },
       interruptAgentResponsePlayback: () => { interrupts += 1; },
       playAgentResponsePcm16Base64() {},
+      getVoiceProcessingStatus: () => '{"aec":true,"noiseSuppression":true}',
     },
     OpenClawNativeApp: { liveConversationStopped() {} },
     atob: (value) => Buffer.from(value, "base64").toString("binary"),
@@ -153,19 +161,24 @@ function harness() {
   app.run(0.030, 10);
   app.run(0.001, 25);
   assert.equal(app.count("commit"), 0, "a 500 ms thinking pause stays in one utterance");
+  assert.equal(app.count("endpoint_candidate"), 1, "a pause asks the semantic model");
+  app.socket.server({ type: "endpoint_decision", complete: false, probability: 0.1, source: "smart-turn-v3.2" });
   app.run(0.030, 10);
-  app.run(0.001, 35);
-  assert.equal(app.count("commit"), 1, "700 ms of silence commits an ordinary utterance");
+  app.run(0.001, 18);
+  app.socket.server({ type: "endpoint_decision", complete: true, probability: 0.9, source: "smart-turn-v3.2" });
+  assert.equal(app.count("commit"), 1, "a semantic completion decision commits the utterance");
 }
 
 {
   const app = harness();
   app.run(0.030, 25);
-  app.run(0.001, 35);
+  app.run(0.001, 18);
+  app.socket.server({ type: "endpoint_decision", complete: true, probability: 0.9, source: "smart-turn-v3.2" });
   assert.equal(app.count("commit"), 1);
   app.run(0.001, 50);
   app.run(0.030, 25);
-  app.run(0.001, 35);
+  app.run(0.001, 18);
+  app.socket.server({ type: "endpoint_decision", complete: true, probability: 0.9, source: "smart-turn-v3.2" });
   assert.equal(app.count("commit"), 2, "a second user turn is captured before the first reply arrives");
   assert.ok(
     app.sent.some((message) => message.type === "client_event"
@@ -180,7 +193,8 @@ function harness() {
   app.run(0.030, 15);
   app.socket.server({ type: "state", state: "listening" });
   app.run(0.030, 10);
-  app.run(0.001, 35);
+  app.run(0.001, 18);
+  app.socket.server({ type: "endpoint_decision", complete: true, probability: 0.9, source: "smart-turn-v3.2" });
   assert.equal(app.count("commit"), 1, "a stale listening event cannot reset active recording");
 }
 
@@ -189,8 +203,9 @@ function harness() {
   app.run(0.030, 15);
   app.run(0.030, 10);
   app.socket.server({ type: "partial_transcript", text: "Are you ready?" });
-  app.run(0.001, 24);
-  assert.equal(app.count("commit"), 1, "a semantically complete question commits after 450 ms");
+  app.run(0.001, 18);
+  app.socket.server({ type: "endpoint_decision", complete: true, probability: 0.9, source: "smart-turn-v3.2" });
+  assert.equal(app.count("commit"), 1, "a semantically complete question commits after model confirmation");
 }
 
 {
@@ -198,10 +213,11 @@ function harness() {
   app.run(0.030, 15);
   app.run(0.030, 10);
   app.socket.server({ type: "partial_transcript", text: "Please check the session and" });
-  app.run(0.001, 35);
-  assert.equal(app.count("commit"), 0, "an unfinished clause survives an ordinary 700 ms pause");
-  app.run(0.001, 21);
-  assert.equal(app.count("commit"), 1, "an unfinished clause eventually commits after 1100 ms");
+  app.run(0.001, 18);
+  app.socket.server({ type: "endpoint_decision", complete: false, probability: 0.1, source: "smart-turn-v3.2" });
+  assert.equal(app.count("commit"), 0, "an unfinished clause survives a semantic endpoint check");
+  app.run(0.001, 77);
+  assert.equal(app.count("commit"), 1, "an unfinished clause eventually commits at the hard-silence fallback");
 }
 
 {

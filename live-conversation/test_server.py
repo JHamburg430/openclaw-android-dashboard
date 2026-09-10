@@ -24,10 +24,12 @@ from server import (
     DEFAULT_TTS_SPEAKER_ID,
     LiveConversationService,
     IncrementalSpeechStream,
+    OnlineTranscript,
     MAX_HISTORY_MESSAGES,
     PROMPT_HISTORY_CHARS,
     confirmation_answer,
     confirmation_policy_command,
+    conversation_entities,
     direct_voice_surface_reply,
     extract_agent_acknowledgment,
     extract_agent_text,
@@ -51,6 +53,7 @@ from server import (
     speech_model_prompt,
     summarize_gateway_status,
     summarize_tracked_agent,
+    tts_speed_for,
 )
 
 
@@ -82,6 +85,58 @@ class RoutingTests(unittest.TestCase):
         )
         self.assertIn("model operating Live Conversation", direct_voice_surface_reply("Who are you?"))
         self.assertIsNone(direct_voice_surface_reply("Can you check the RAG app?"))
+
+    def test_online_transcript_separates_stable_and_revisable_prefixes(self):
+        state = OnlineTranscript.empty()
+        stable, unstable = state.update("please ask the agent to review", 32_000)
+        self.assertEqual(stable, "")
+        self.assertEqual(unstable, "please ask the agent to review")
+        stable, unstable = state.update(
+            "please ask the agent to review the voice logs", 48_000
+        )
+        self.assertEqual(stable, "please ask the agent")
+        self.assertEqual(unstable, "to review the voice logs")
+        self.assertEqual(
+            state.final("to review the voice logs carefully"),
+            "please ask the agent to review the voice logs carefully",
+        )
+
+    def test_conversation_entity_graph_and_dynamic_cadence(self):
+        entities = conversation_entities(
+            "Have an agent review Manuals RAG retrieval failures"
+        )
+        self.assertIn("manuals", entities["topics"])
+        self.assertIn("Manuals", entities["named_entities"])
+        self.assertLess(
+            tts_speed_for("I'm sorry, that request failed.", base=1.15), 1.15
+        )
+        self.assertGreater(
+            tts_speed_for("Yes?", base=1.15), 1.15
+        )
+
+    def test_page_exposes_direct_confirmation_control(self):
+        page = render_page()
+        self.assertIn("Toggle confirmation", page)
+        self.assertIn("type:'set_confirmation'", page)
+
+    def test_stable_partial_prefetch_is_read_only(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:test", 1.15)
+            service.refresh_sessions = AsyncMock(return_value="fresh")
+            service.refresh_capabilities = AsyncMock(return_value="fresh")
+            self.assertEqual(
+                await service.prefetch_for_partial(
+                    "what is the latest status of that agent"
+                ),
+                "sessions",
+            )
+            service.refresh_sessions.assert_awaited_once_with(force=True)
+            self.assertIsNone(
+                await service.prefetch_for_partial("start another agent now")
+            )
+
+        import asyncio
+        asyncio.run(run_test())
 
     def test_spoken_stop_commands_are_silent_controls(self):
         for transcript in (
@@ -1462,7 +1517,8 @@ class RoutingTests(unittest.TestCase):
         self.assertIn('purpose="partial"', source)
         self.assertIn('"type": "partial_transcript"', source)
         self.assertIn("silent_stop_detected", source)
-        self.assertIn("turn_queue.put_nowait((turn, service.speech_generation))", source)
+        self.assertIn("turn_queue.put_nowait", source)
+        self.assertIn("finalize_online_transcript", source)
         self.assertIn("async def run_turn_queue", source)
         self.assertIn("await conversation_idle.wait()", source)
         self.assertIn("if turn_queue.empty() and not user_input_active", source)
@@ -1564,10 +1620,10 @@ class RoutingTests(unittest.TestCase):
         page = render_page()
         self.assertIn("const speechThreshold=responseActive?.025:.012", page)
         self.assertIn("const speechRequiredMs=responseActive?200:START_CONFIRM_MS", page)
-        self.assertIn("function endpointSilenceMs()", page)
-        self.assertIn("silenceMs>=endpointSilenceMs()", page)
-        self.assertIn("return 1100", page)
-        self.assertIn("return 450", page)
+        self.assertIn("SEMANTIC_CHECK_MS=350", page)
+        self.assertIn("HARD_ENDPOINT_MS=1900", page)
+        self.assertIn("send({type:'endpoint_candidate'})", page)
+        self.assertIn("m.type==='endpoint_decision'", page)
         self.assertIn("responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500)", page)
         self.assertIn("report('barge_in','confirmed_user_speech')", page)
         self.assertIn("}send({type:'input_audio_buffer.speech_started'});send({type:'start'})", page)
