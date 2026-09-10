@@ -2102,6 +2102,14 @@ class LiveConversationService:
         def run_to_completion() -> str:
             assert self.stt and self.stt._model
             audio_float = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
+            # Android's VOICE_COMMUNICATION processing can reduce the level of
+            # sentence endings substantially.  Keep partial and wake decoding
+            # conservative, but let the authoritative full-turn pass retain a
+            # quiet final phrase instead of converting a complete request into
+            # an unresolved fragment.
+            vad_threshold = 0.35 if purpose == "final" else (
+                0.5 if purpose == "wake" else 0.6
+            )
             segments, _ = self.stt._model.transcribe(
                 audio_float,
                 language="en",
@@ -2118,10 +2126,10 @@ class LiveConversationService:
                 initial_prompt=initial_prompt or None,
                 vad_filter=True,
                 vad_parameters={
-                    "threshold": 0.5 if purpose == "wake" else 0.6,
+                    "threshold": vad_threshold,
                     "min_speech_duration_ms": 250,
                     "min_silence_duration_ms": 300,
-                    "speech_pad_ms": 200,
+                    "speech_pad_ms": 300 if purpose == "final" else 200,
                 },
             )
             text = "".join(

@@ -1866,7 +1866,10 @@ class RoutingTests(unittest.TestCase):
         import inspect
         source = inspect.getsource(LiveConversationService.transcribe)
         self.assertIn("vad_filter=True", source)
-        self.assertIn('"threshold": 0.5 if purpose == "wake" else 0.6', source)
+        self.assertIn('vad_threshold = 0.35 if purpose == "final"', source)
+        self.assertIn('0.5 if purpose == "wake" else 0.6', source)
+        self.assertIn('"threshold": vad_threshold', source)
+        self.assertIn('"speech_pad_ms": 300 if purpose == "final" else 200', source)
         self.assertIn('"min_speech_duration_ms": 250', source)
         self.assertIn("beam_size=5", source)
         self.assertIn("best_of=5", source)

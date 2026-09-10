@@ -93,6 +93,31 @@ class RecordedPhoneAudioTests(unittest.TestCase):
 
         asyncio.run(replay())
 
+    def test_quiet_android_sentence_ending_is_preserved(self) -> None:
+        """Replay the debug capture that originally lost its requested subject."""
+        capture_id = "20260910T190707.340433-4-6f85dc"
+        manifest_path = next(
+            (path for path in self.manifests if path.stem == capture_id), None
+        )
+        if manifest_path is None:
+            self.skipTest(f"captured Android regression audio {capture_id} is unavailable")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        wav_path = manifest_path.parent / manifest["user_audio"]
+
+        async def replay() -> str:
+            service = LiveConversationService("agent:main:quiet-ending-regression", 1.15)
+            service.stt = self.stt
+            with wave.open(str(wav_path), "rb") as recording:
+                pcm = recording.readframes(recording.getnframes())
+            return await service.transcribe(pcm, purpose="final")
+
+        actual = asyncio.run(replay())
+        words = _words(actual)
+        self.assertTrue(
+            {"live", "conversation", "agent"}.issubset(words),
+            f"quiet requested subject was clipped from captured phone audio: {actual!r}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
