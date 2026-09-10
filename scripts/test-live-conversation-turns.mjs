@@ -121,6 +121,69 @@ function harness() {
 {
   const app = harness();
   app.socket.server({
+    type: "settings",
+    action_confirmation: "automatic",
+    audio_capture: false,
+    debug_status: { state: "idle", message: "No debug submission pending." },
+  });
+  assert.equal(
+    app.elements.get("recording").textContent,
+    "Test audio capture: Off",
+    "recording disclosure shows capture is disabled by default",
+  );
+  const recordingButton = app.elements.get("recording").children[0];
+  recordingButton.onclick();
+  assert.ok(
+    app.sent.some((message) => message.type === "set_audio_capture" && message.enabled === true),
+    "recording toggle explicitly opts in",
+  );
+  app.socket.server({
+    type: "settings",
+    action_confirmation: "automatic",
+    audio_capture: true,
+    debug_status: { state: "idle", message: "No debug submission pending." },
+  });
+  assert.equal(app.elements.get("recording").textContent,
+    "Test audio capture: On — saving microphone turns locally");
+  assert.equal(recordingButton.textContent, "Disable test audio capture");
+
+  const debugButton = app.elements.get("sendDebug");
+  debugButton.onclick();
+  assert.ok(
+    app.sent.some((message) => message.type === "send_for_debug"),
+    "Send for Debug starts a correction submission",
+  );
+  app.socket.server({
+    type: "settings",
+    action_confirmation: "automatic",
+    audio_capture: true,
+    debug_status: {
+      state: "working",
+      message: "Correction agent is diagnosing the captured conversation.",
+    },
+  });
+  assert.equal(debugButton.disabled, true, "duplicate debug submissions are disabled");
+  assert.equal(app.elements.get("debugIcon").className, "debug-icon working");
+  app.socket.server({
+    type: "settings",
+    action_confirmation: "automatic",
+    audio_capture: true,
+    debug_status: {
+      state: "release_available",
+      message: "New release v1.0.74 is available.",
+      release_tag: "v1.0.74",
+    },
+  });
+  assert.equal(debugButton.disabled, false);
+  assert.equal(app.elements.get("debugStatus").textContent,
+    "New release v1.0.74 is available.");
+  assert.equal(app.elements.get("debugIcon").className,
+    "debug-icon release_available", "release status remains visible after completion");
+}
+
+{
+  const app = harness();
+  app.socket.server({
     type: "history",
     messages: [
       { role: "user", content: "Older message" },

@@ -19,6 +19,7 @@ import secrets
 import struct
 import time
 from typing import Any, Awaitable, Callable
+import wave
 from zoneinfo import ZoneInfo
 
 LOGGER = logging.getLogger("live_conversation")
@@ -141,6 +142,9 @@ AGENT_RESULT_POLL_SECONDS = 3.0
 AGENT_RESULT_WAIT_SECONDS = 600.0
 DEFAULT_HISTORY_PATH = "/home/john/.openclaw/state/live-conversation-history.json"
 DEFAULT_SETTINGS_PATH = "/home/john/.openclaw/state/live-conversation-settings.json"
+DEFAULT_RECORDINGS_PATH = "/home/john/.openclaw/state/live-conversation-recordings"
+DEFAULT_DEBUG_PATH = "/home/john/.openclaw/state/live-conversation-debug"
+DEFAULT_DASHBOARD_REPO = "/home/john/openclaw-android-dashboard"
 MAX_HISTORY_MESSAGES = 120
 MAX_HISTORY_CHARS = 72_000
 MAX_CONVERSATION_EVENTS = 500
@@ -1373,6 +1377,8 @@ class LiveConversationService:
         tts_speed: float,
         history_path: str | None = None,
         settings_path: str | None = None,
+        recordings_path: str | None = None,
+        debug_path: str | None = None,
     ):
         self.session_key = session_key
         self.stt: WhisperSTTService | None = None
@@ -1396,6 +1402,8 @@ class LiveConversationService:
         self.speech_generation = 0
         self.pending_spoken_replies: deque[str] = deque(maxlen=10)
         self.confirmation_required = False
+        self.audio_capture_enabled = False
+        self.debug_status: dict[str, Any] = {"state": "idle"}
         self.pending_confirmation: tuple[str, str | None, str] | None = None
         self.pending_fragment = ""
         self.pending_fragment_turn_id: str | None = None
@@ -1404,6 +1412,8 @@ class LiveConversationService:
         self.recent_agent_sessions: deque[dict[str, Any]] = deque(maxlen=12)
         self.history_path = Path(history_path) if history_path else None
         self.settings_path = Path(settings_path) if settings_path else None
+        self.recordings_path = Path(recordings_path) if recordings_path else None
+        self.debug_path = Path(debug_path) if debug_path else None
         self.history: deque[dict[str, str]] = deque(maxlen=MAX_HISTORY_MESSAGES)
         self.events: deque[dict[str, Any]] = deque(maxlen=MAX_CONVERSATION_EVENTS)
         self._load_settings()
@@ -1415,6 +1425,10 @@ class LiveConversationService:
         try:
             payload = json.loads(self.settings_path.read_text(encoding="utf-8"))
             self.confirmation_required = payload.get("action_confirmation") == "confirm"
+            self.audio_capture_enabled = payload.get("audio_capture") is True
+            debug_status = payload.get("debug_status")
+            if isinstance(debug_status, dict) and isinstance(debug_status.get("state"), str):
+                self.debug_status = dict(debug_status)
             tracked = payload.get("recent_agent_sessions", [])
             if isinstance(tracked, list):
                 for item in tracked[-12:]:
@@ -1439,6 +1453,8 @@ class LiveConversationService:
                         "confirm" if self.confirmation_required else "automatic"
                     ),
                     "recent_agent_sessions": list(self.recent_agent_sessions),
+                    "audio_capture": self.audio_capture_enabled,
+                    "debug_status": self.debug_status,
                 }, indent=2),
                 encoding="utf-8",
             )
@@ -1452,13 +1468,221 @@ class LiveConversationService:
             self.pending_confirmation = None
         self._save_settings()
 
-    def settings_payload(self) -> dict[str, str]:
+    def set_audio_capture_enabled(self, enabled: bool) -> None:
+        self.audio_capture_enabled = enabled
+        self._save_settings()
+
+    def settings_payload(self) -> dict[str, Any]:
         return {
             "type": "settings",
             "action_confirmation": (
                 "confirm" if self.confirmation_required else "automatic"
             ),
+            "audio_capture": self.audio_capture_enabled,
+            "audio_capture_path": str(self.recordings_path) if self.recordings_path else "",
+            "debug_status": dict(self.debug_status),
         }
+
+    def set_debug_status(self, state: str, **fields: Any) -> dict[str, Any]:
+        allowed = {"idle", "collecting", "working", "fixed", "release_available", "gateway_updated", "failed"}
+        if state not in allowed:
+            raise ValueError(f"invalid debug state: {state}")
+        self.debug_status = {"state": state, **fields}
+        self._save_settings()
+        return dict(self.debug_status)
+
+    @staticmethod
+    def redact_diagnostics(value: str) -> str:
+        """Remove credential-shaped values before diagnostic text is persisted."""
+        patterns = (
+            r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s\"']+",
+            r"(?i)((?:token|secret|password|api[_-]?key|device[_-]?token)\s*[:=]\s*)[^\s,;\"']+",
+            r"(?i)(\"(?:token|secret|password|api[_-]?key|device[_-]?token)\"\s*:\s*\")[^\"]+",
+        )
+        redacted = value
+        for pattern in patterns:
+            redacted = re.sub(pattern, r"\1[REDACTED]", redacted)
+        return redacted
+
+    async def _diagnostic_command(self, *arguments: str, timeout: int = 15) -> str:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *arguments,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            text = stdout.decode("utf-8", errors="replace")
+            return self.redact_diagnostics(text[-80_000:])
+        except Exception as error:
+            return f"unavailable: {error.__class__.__name__}: {error}"
+
+    async def system_update_snapshot(self) -> dict[str, Any]:
+        repo = DEFAULT_DASHBOARD_REPO
+        head, tag, gateway_version, gateway_state, gateway_config_stamp = await asyncio.gather(
+            self._diagnostic_command("git", "-C", repo, "rev-parse", "HEAD"),
+            self._diagnostic_command("git", "-C", repo, "describe", "--tags", "--abbrev=0"),
+            self._diagnostic_command(DEFAULT_NODE_COMMAND, DEFAULT_OPENCLAW_MODULE, "--version"),
+            self._diagnostic_command(
+                "systemctl", "--user", "show", "openclaw-gateway.service",
+                "--property=ActiveState,SubState,ActiveEnterTimestampMonotonic",
+            ),
+            self._diagnostic_command(
+                "stat", "--format=%Y:%s", "/home/john/.openclaw/openclaw.json"
+            ),
+        )
+        return {
+            "dashboard_head": head.strip(),
+            "dashboard_tag": tag.strip(),
+            "gateway_version": gateway_version.strip(),
+            "gateway_service": gateway_state.strip(),
+            "gateway_config_stamp": gateway_config_stamp.strip(),
+        }
+
+    async def create_debug_bundle(
+        self, request_id: str, client_context: dict[str, Any] | None = None
+    ) -> tuple[Path, dict[str, Any]]:
+        """Collect a local, redacted diagnosis package without exposing it over HTTP."""
+        if not self.debug_path:
+            raise RuntimeError("Live Conversation debug storage is not configured")
+        now = datetime.now(ZoneInfo("America/Detroit"))
+        directory = self.debug_path / now.strftime("%Y%m%d")
+        directory.mkdir(parents=True, exist_ok=True)
+        baseline, dashboard_status, voice_logs, gateway_logs = await asyncio.gather(
+            self.system_update_snapshot(),
+            self._diagnostic_command(
+                "git", "-C", DEFAULT_DASHBOARD_REPO, "status", "--short", "--branch"
+            ),
+            self._diagnostic_command(
+                "journalctl", "--user", "-u", "openclaw-live-conversation.service",
+                "-n", "350", "--no-pager", "-o", "short-iso"
+            ),
+            self._diagnostic_command(
+                "journalctl", "--user", "-u", "openclaw-gateway.service",
+                "-n", "180", "--no-pager", "-o", "short-iso"
+            ),
+        )
+        recordings: list[dict[str, Any]] = []
+        if self.recordings_path and self.recordings_path.exists():
+            for manifest in sorted(self.recordings_path.glob("*/*.json"), reverse=True)[:20]:
+                try:
+                    item = json.loads(manifest.read_text(encoding="utf-8"))
+                    item["manifest_path"] = str(manifest)
+                    recordings.append(item)
+                except (OSError, ValueError, TypeError):
+                    continue
+        bundle = {
+            "schema_version": 1,
+            "request_id": request_id,
+            "requested_at": now.isoformat(),
+            "purpose": "live_conversation_diagnosis_and_correction",
+            "authorization": {
+                "diagnose": True,
+                "correct": True,
+                "publish_release_if_needed": True,
+                "update_gateway_if_needed": True,
+            },
+            "privacy": "Local host only; credentials redacted; recordings referenced by local path.",
+            "client_context": dict(client_context or {}),
+            "settings": {
+                "action_confirmation": "confirm" if self.confirmation_required else "automatic",
+                "audio_capture": self.audio_capture_enabled,
+                "stt": self.stt_description,
+                "semantic_turn": self.semantic_turn_description,
+            },
+            "conversation": {
+                "messages": self.recent_history()[-120:],
+                "events": self.recent_events()[-500:],
+            },
+            "recent_audio_captures": recordings,
+            "system_before": baseline,
+            "dashboard_git_status": dashboard_status,
+            "live_conversation_logs": voice_logs,
+            "gateway_logs": gateway_logs,
+        }
+        path = directory / f"{request_id}.json"
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(
+            self.redact_diagnostics(json.dumps(bundle, ensure_ascii=False, indent=2)),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+        return path, baseline
+
+    def begin_audio_capture(
+        self, pcm: bytes, sequence: int, client_context: dict[str, Any] | None = None
+    ) -> str | None:
+        """Persist one consented microphone turn as PCM WAV plus a sidecar.
+
+        Capture is deliberately performed before ASR so recognition failures,
+        clipped onsets, room noise, and rejected speech remain available for
+        regression work. It is disabled by default and never records wake-word
+        audio.
+        """
+        if not self.audio_capture_enabled or not self.recordings_path or not pcm:
+            return None
+        now = datetime.now(ZoneInfo("America/Detroit"))
+        capture_id = f"{now:%Y%m%dT%H%M%S.%f}-{sequence}-{secrets.token_hex(3)}"
+        day = self.recordings_path / now.strftime("%Y%m%d")
+        try:
+            day.mkdir(parents=True, exist_ok=True)
+            wav_path = day / f"{capture_id}-user.wav"
+            with wave.open(str(wav_path), "wb") as recording:
+                recording.setnchannels(1)
+                recording.setsampwidth(2)
+                recording.setframerate(SAMPLE_RATE)
+                recording.writeframes(pcm)
+            samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
+            rms = float(np.sqrt(np.mean(np.square(samples / 32768.0)))) if len(samples) else 0.0
+            user_agent = str((client_context or {}).get("user_agent") or "")
+            capture_source = (
+                "android_live_microphone"
+                if "android" in user_agent.casefold() else
+                "automated_or_non_android_client"
+            )
+            self._write_capture_manifest(capture_id, {
+                "schema_version": 1,
+                "capture_id": capture_id,
+                "captured_at": now.isoformat(),
+                "consent": "explicit_in_app_opt_in",
+                "capture_source": capture_source,
+                "status": "captured",
+                "user_audio": wav_path.name,
+                "sample_rate": SAMPLE_RATE,
+                "channels": 1,
+                "sample_width_bytes": 2,
+                "duration_ms": round(len(pcm) / (SAMPLE_RATE * 2) * 1000),
+                "rms": round(rms, 6),
+                "sequence": sequence,
+                "client_context": dict(client_context or {}),
+            })
+            LOGGER.info("audio_capture_saved id=%s path=%s", capture_id, wav_path)
+            return capture_id
+        except (OSError, ValueError) as error:
+            LOGGER.warning("audio_capture_failed error=%s", error)
+            return None
+
+    def update_audio_capture(self, capture_id: str | None, **fields: Any) -> None:
+        if not capture_id or not self.recordings_path:
+            return
+        manifest = self._capture_manifest_path(capture_id)
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload.update(fields)
+            self._write_capture_manifest(capture_id, payload)
+        except (OSError, ValueError, TypeError) as error:
+            LOGGER.warning("audio_capture_metadata_failed id=%s error=%s", capture_id, error)
+
+    def _capture_manifest_path(self, capture_id: str) -> Path:
+        assert self.recordings_path is not None
+        return self.recordings_path / capture_id[:8] / f"{capture_id}.json"
+
+    def _write_capture_manifest(self, capture_id: str, payload: dict[str, Any]) -> None:
+        manifest = self._capture_manifest_path(capture_id)
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        temporary = manifest.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        temporary.replace(manifest)
 
     def _load_history(self) -> None:
         if not self.history_path or not self.history_path.exists():
@@ -1991,7 +2215,13 @@ class LiveConversationService:
                 )},
                 {"role": "user", "content": transcript},
             ],
-            "options": {"temperature": 0, "num_predict": 96, "num_ctx": 1024},
+            # Keep the same context allocation as the main speech supervisor.
+            # Asking Ollama for 1024 here evicted the warm 8192-token runner,
+            # forcing a multi-second model reload during natural pauses.
+            "options": {
+                "temperature": 0, "num_predict": 96,
+                "num_ctx": SPEECH_MODEL_CONTEXT,
+            },
         }
         timeout = aiohttp.ClientTimeout(total=4)
         last_error: Exception | None = None
@@ -2721,6 +2951,7 @@ class LiveConversationService:
         turn_generation: int | None = None,
         handoff_callback: Callable[[str, str | None, str], Awaitable[None]] | None = None,
         transcript_override: str | None = None,
+        capture_id: str | None = None,
     ) -> tuple[str, str, str | None] | None:
         started = time.perf_counter()
         incremental_speech: IncrementalSpeechStream | None = None
@@ -2734,10 +2965,19 @@ class LiveConversationService:
             transcript = transcript_override or await self.transcribe(audio)
             metrics.asr_ms = round((time.perf_counter() - stage) * 1000)
             if not transcript:
+                self.update_audio_capture(
+                    capture_id, status="no_clear_speech", transcript="",
+                    asr_ms=metrics.asr_ms,
+                )
                 await socket.send_json({"type": "state", "state": "listening", "detail": "No clear speech detected."})
                 return
+            self.update_audio_capture(
+                capture_id, status="transcribed", transcript=transcript,
+                asr_ms=metrics.asr_ms,
+            )
             await socket.send_json({"type": "transcript", "text": transcript})
             if is_silent_stop_command(transcript):
+                self.update_audio_capture(capture_id, status="silent_stop")
                 self.interrupt_speech()
                 await socket.send_json({
                     "type": "state", "state": "listening", "detail": "Silent stop command."
@@ -2819,6 +3059,10 @@ class LiveConversationService:
                         },
                     )
                     self._save_history()
+                    self.update_audio_capture(
+                        capture_id, status="awaiting_continuation",
+                        turn_id=turn_id, assembled_text=assembled_text,
+                    )
                     await socket.send_json({
                         "type": "state", "state": "listening",
                         "detail": "Waiting for you to finish the thought.",
@@ -2840,6 +3084,10 @@ class LiveConversationService:
             metrics.route = route
 
             if route == "ignore":
+                self.update_audio_capture(
+                    capture_id, status="ignored_ambient", turn_id=turn_id,
+                    assembled_text=assembled_text, route=route,
+                )
                 await incremental_speech.cancel()
                 await socket.send_json({"type": "state", "state": "listening", "detail": "Ignored likely background speech."})
                 return None
@@ -2864,6 +3112,17 @@ class LiveConversationService:
             self.remember(
                 "assistant", reply, turn_id=turn_id,
                 metadata={"route": route, "session_key": target_session},
+            )
+            self.update_audio_capture(
+                capture_id,
+                status="complete",
+                turn_id=turn_id,
+                response_id=response_id,
+                assembled_text=assembled_text,
+                route=route,
+                reply=reply,
+                session_key=target_session,
+                routing_ms=metrics.routing_ms,
             )
 
             prepared_handoff: tuple[str, str | None] | None = None
@@ -2895,11 +3154,15 @@ class LiveConversationService:
                     expected_generation=turn_generation,
                 )
             metrics.total_ms = round((time.perf_counter() - started) * 1000)
+            self.update_audio_capture(
+                capture_id, tts_ms=metrics.tts_ms, total_ms=metrics.total_ms,
+            )
             await socket.send_json({"type": "metrics", **asdict(metrics)})
             if prepared_handoff is not None and handoff_callback is None:
                 return prepared_handoff[0], reply, prepared_handoff[1]
             await socket.send_json({"type": "state", "state": "listening"})
         except Exception as error:
+            self.update_audio_capture(capture_id, status="error", error=str(error))
             if incremental_speech is not None:
                 await incremental_speech.cancel()
             await socket.send_json({"type": "error", "message": str(error)})
@@ -2909,22 +3172,24 @@ def render_page() -> str:
     return """<!doctype html>
 <html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>Live Conversation</title><style>
-html,body{margin:0;min-height:100%;background:#060a10;color:#f4f8fc;font-family:system-ui,sans-serif}main{padding:18px 14px 28px;max-width:760px;margin:auto}h1{font-size:23px;margin:0 0 5px}.sub{color:#9aa9b8;margin:0 0 7px}.setting{color:#7fcbb4;font-size:12px;margin-bottom:16px}.state{font-size:18px;color:#54e0b4;margin:12px 0}.meter{height:14px;background:#101820;border:1px solid #304050;border-radius:8px;overflow:hidden}.meter div{height:100%;width:0;background:#00ab7e;transition:width 60ms}.buttons{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:14px 0}button{min-height:48px;border:1px solid #00ab7e;border-radius:8px;background:#1e2630;color:#fff;font-size:15px}.card{background:#0a0e14;border-radius:8px;padding:12px;margin-top:10px;min-height:48px}.label{color:#8797a8;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.metrics{font-size:12px;color:#aebdca;margin-top:12px}.route{display:inline-block;border:1px solid #36556a;border-radius:10px;padding:2px 7px;font-size:11px;margin-left:6px}.history{margin-top:18px}.history-list{display:flex;flex-direction:column;gap:8px;margin-top:8px}.history-empty{color:#718294;font-size:13px}.message{max-width:88%;padding:9px 11px;border-radius:12px;line-height:1.35;white-space:pre-wrap;overflow-wrap:anywhere}.message.user{align-self:flex-end;background:#0e5948}.message.assistant{align-self:flex-start;background:#182431}.message-role{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:#9db0bf;margin-bottom:3px}
-</style></head><body><main><h1>Live Conversation</h1><p class="sub">Accurate local speech recognition. Simple requests answer here; complex work routes to the right OpenClaw session.</p><div id="confirmation" class="setting">Action confirmation: loading…</div><div id="state" class="state">Ready</div><div class="meter"><div id="bar"></div></div><div class="buttons"><button id="start">Start conversation</button><button id="stop">Stop</button></div><div class="card"><div class="label">You</div><div id="user">—</div></div><div class="card"><div class="label">Assistant <span id="route" class="route">waiting</span></div><div id="assistant">—</div></div><div id="metrics" class="metrics"></div><section class="history"><div class="label">Recent messages · newest first · last 120</div><div id="history" class="history-list"><div class="history-empty">No conversation history yet.</div></div></section></main><script>
-const state=document.getElementById('state'),bar=document.getElementById('bar'),user=document.getElementById('user'),assistant=document.getElementById('assistant'),route=document.getElementById('route'),metrics=document.getElementById('metrics'),confirmation=document.getElementById('confirmation'),historyList=document.getElementById('history');const AUDIO_FRAME_MS=20,START_CONFIRM_MS=300,ONSET_PREROLL_MS=2500,PREBUFFER_FRAMES=Math.ceil((START_CONFIRM_MS+ONSET_PREROLL_MS)/AUDIO_FRAME_MS),MAX_DRAIN_FRAMES=24,SEMANTIC_CHECK_MS=750,HARD_ENDPOINT_MS=3500;let ws,timer,recording=false,awaitingResponse=false,responseActive=false,responseTailTimer=null,speechMs=0,silenceMs=0,candidateSpeechMs=0,pre=[],historyMessages=[],pendingTranscript='',endpointPending=false,nextEndpointAt=SEMANTIC_CHECK_MS,confirmationMode='automatic';const confirmationToggle=document.createElement('button');confirmationToggle.textContent='Toggle confirmation';confirmation.insertAdjacentElement('afterend',confirmationToggle);
+html,body{margin:0;min-height:100%;background:#060a10;color:#f4f8fc;font-family:system-ui,sans-serif}main{padding:18px 14px 28px;max-width:760px;margin:auto}h1{font-size:23px;margin:0 0 5px}.sub{color:#9aa9b8;margin:0 0 7px}.setting{color:#7fcbb4;font-size:12px;margin-bottom:16px}.state{font-size:18px;color:#54e0b4;margin:12px 0}.meter{height:14px;background:#101820;border:1px solid #304050;border-radius:8px;overflow:hidden}.meter div{height:100%;width:0;background:#00ab7e;transition:width 60ms}.buttons{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:14px 0}button{min-height:48px;border:1px solid #00ab7e;border-radius:8px;background:#1e2630;color:#fff;font-size:15px}button:disabled{opacity:.55}.debug-card{border:1px solid #31475a}.debug-line{display:flex;align-items:center;gap:8px;margin:5px 0 10px}.debug-icon{width:12px;height:12px;border-radius:50%;background:#708090;box-shadow:0 0 8px currentColor}.debug-icon.collecting,.debug-icon.working{background:#e0a84f;color:#e0a84f}.debug-icon.fixed{background:#54e0b4;color:#54e0b4}.debug-icon.release_available{background:#59a9ff;color:#59a9ff}.debug-icon.gateway_updated{background:#bf8cff;color:#bf8cff}.debug-icon.failed{background:#ff6b72;color:#ff6b72}.card{background:#0a0e14;border-radius:8px;padding:12px;margin-top:10px;min-height:48px}.label{color:#8797a8;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.metrics{font-size:12px;color:#aebdca;margin-top:12px}.route{display:inline-block;border:1px solid #36556a;border-radius:10px;padding:2px 7px;font-size:11px;margin-left:6px}.history{margin-top:18px}.history-list{display:flex;flex-direction:column;gap:8px;margin-top:8px}.history-empty{color:#718294;font-size:13px}.message{max-width:88%;padding:9px 11px;border-radius:12px;line-height:1.35;white-space:pre-wrap;overflow-wrap:anywhere}.message.user{align-self:flex-end;background:#0e5948}.message.assistant{align-self:flex-start;background:#182431}.message-role{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:#9db0bf;margin-bottom:3px}
+</style></head><body><main><h1>Live Conversation</h1><p class="sub">Accurate local speech recognition. Simple requests answer here; complex work routes to the right OpenClaw session.</p><div id="confirmation" class="setting">Action confirmation: loading…</div><div id="recording" class="setting">Test audio capture: loading…</div><p class="sub">Audio capture is off by default. When enabled, microphone turns and test metadata are saved locally on the OpenClaw host for regression testing.</p><div class="card debug-card"><div class="label">Conversation diagnostics</div><div class="debug-line"><span id="debugIcon" class="debug-icon idle" aria-hidden="true"></span><span id="debugStatus" role="status">No debug submission pending.</span></div><button id="sendDebug">Send for Debug</button></div><div id="state" class="state">Ready</div><div class="meter"><div id="bar"></div></div><div class="buttons"><button id="start">Start conversation</button><button id="stop">Stop</button></div><div class="card"><div class="label">You</div><div id="user">—</div></div><div class="card"><div class="label">Assistant <span id="route" class="route">waiting</span></div><div id="assistant">—</div></div><div id="metrics" class="metrics"></div><section class="history"><div class="label">Recent messages · newest first · last 120</div><div id="history" class="history-list"><div class="history-empty">No conversation history yet.</div></div></section></main><script>
+const state=document.getElementById('state'),bar=document.getElementById('bar'),user=document.getElementById('user'),assistant=document.getElementById('assistant'),route=document.getElementById('route'),metrics=document.getElementById('metrics'),confirmation=document.getElementById('confirmation'),recordingSetting=document.getElementById('recording'),debugIcon=document.getElementById('debugIcon'),debugStatus=document.getElementById('debugStatus'),sendDebug=document.getElementById('sendDebug'),historyList=document.getElementById('history');const AUDIO_FRAME_MS=20,START_CONFIRM_MS=300,ONSET_PREROLL_MS=2500,PREBUFFER_FRAMES=Math.ceil((START_CONFIRM_MS+ONSET_PREROLL_MS)/AUDIO_FRAME_MS),MAX_DRAIN_FRAMES=24,SEMANTIC_CHECK_MS=750,HARD_ENDPOINT_MS=3500;let ws,timer,recording=false,awaitingResponse=false,responseActive=false,responseTailTimer=null,speechMs=0,silenceMs=0,candidateSpeechMs=0,pre=[],historyMessages=[],pendingTranscript='',endpointPending=false,nextEndpointAt=SEMANTIC_CHECK_MS,confirmationMode='automatic',audioCapture=false,pendingMessages=[];const confirmationToggle=document.createElement('button');confirmationToggle.textContent='Toggle confirmation';confirmation.insertAdjacentElement('afterend',confirmationToggle);const recordingToggle=document.createElement('button');recordingToggle.textContent='Enable test audio capture';recordingSetting.insertAdjacentElement('afterend',recordingToggle);
 function renderHistory(){historyList.replaceChildren();if(!historyMessages.length){const empty=document.createElement('div');empty.className='history-empty';empty.textContent='No conversation history yet.';historyList.appendChild(empty);return}for(const message of historyMessages.slice(-120).reverse()){const bubble=document.createElement('div');bubble.className='message '+message.role;const who=document.createElement('div');who.className='message-role';who.textContent=message.role==='user'?'You':'Assistant';const content=document.createElement('div');content.textContent=message.content;bubble.append(who,content);historyList.appendChild(bubble)}}
 function addHistory(role,content){if(!content)return;historyMessages.push({role,content});historyMessages=historyMessages.slice(-120);renderHistory()}
 function rms(b64){const s=atob(b64||'');let sum=0,n=0;for(let i=0;i+1<s.length;i+=2){let v=(s.charCodeAt(i)&255)|((s.charCodeAt(i+1)&255)<<8);if(v&32768)v-=65536;const f=v/32768;sum+=f*f;n++}return n?Math.sqrt(sum/n):0}
-function send(x){if(ws&&ws.readyState===1)ws.send(JSON.stringify(x))}
+function send(x){if(ws&&ws.readyState===1){ws.send(JSON.stringify(x));return true}return false}
+function sendWhenConnected(x){if(send(x))return;pendingMessages.push(x);start()}
+function renderDebugStatus(value){const current=value&&value.state?value:{state:'idle'};debugIcon.className='debug-icon '+current.state;debugStatus.textContent=current.message||'No debug submission pending.';sendDebug.disabled=current.state==='collecting'||current.state==='working';sendDebug.textContent=sendDebug.disabled?'Debug in progress…':'Send for Debug';sendDebug.ariaLabel=debugStatus.textContent}
 function report(event,detail){send({type:'client_event',event:event,detail:String(detail||'')})}
 function finishTurn(){if(!recording)return;recording=false;awaitingResponse=true;candidateSpeechMs=0;endpointPending=false;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}
 function begin(){if(recording)return;const interruptedWait=awaitingResponse;recording=true;awaitingResponse=false;candidateSpeechMs=0;speechMs=0;silenceMs=0;endpointPending=false;nextEndpointAt=SEMANTIC_CHECK_MS;if(responseActive){responseActive=false;if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}try{OpenClawNativeAudio.interruptAgentResponsePlayback()}catch(e){}report('barge_in','confirmed_user_speech')}send({type:'input_audio_buffer.speech_started'});send({type:'start'});for(const audioBase64 of pre)send({type:'audio',audioBase64});pre=[];report('speech_started',interruptedWait?'while_awaiting_response':'ready');state.textContent='Listening…'}
 function processChunk(chunk){const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>PREBUFFER_FRAMES)pre.shift();const speechThreshold=responseActive?.025:.012;const speechRequiredMs=responseActive?200:START_CONFIRM_MS;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+AUDIO_FRAME_MS:0;if(candidateSpeechMs>=speechRequiredMs)begin();return true}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=AUDIO_FRAME_MS;silenceMs=0;endpointPending=false;nextEndpointAt=SEMANTIC_CHECK_MS}else silenceMs+=AUDIO_FRAME_MS;if(speechMs>=200&&silenceMs>=HARD_ENDPOINT_MS){finishTurn();return false}if(speechMs>=200&&silenceMs>=nextEndpointAt&&!endpointPending){endpointPending=true;nextEndpointAt=silenceMs+400;send({type:'endpoint_candidate'});state.textContent='Listening for more…'}return true}
 function tick(){for(let drained=0;drained<MAX_DRAIN_FRAMES;drained++){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;if(processChunk(chunk)===false)return}}
-function start(){if(ws&&ws.readyState===1)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-120):[];renderHistory()}if(m.type==='settings')confirmation.textContent='Action confirmation: '+(m.action_confirmation==='confirm'?'On — asks before actions':'Off — replies before acting');if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.state==='listening'&&!recording){awaitingResponse=false;candidateSpeechMs=0}if((m.detail||'').startsWith('Ignored')||(m.detail||'').startsWith('Silent stop'))pendingTranscript=''}if(m.type==='action_status'&&m.state==='acknowledged')state.textContent='Working…';if(m.type==='partial_transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript='';addHistory('user',m.text)}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
+function start(){if(ws&&(ws.readyState===0||ws.readyState===1))return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…';for(const message of pendingMessages.splice(0))send(message)};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-120):[];renderHistory()}if(m.type==='settings'){confirmation.textContent='Action confirmation: '+(m.action_confirmation==='confirm'?'On — asks before actions':'Off — replies before acting');audioCapture=m.audio_capture===true;recordingSetting.textContent='Test audio capture: '+(audioCapture?'On — saving microphone turns locally':'Off');recordingToggle.textContent=audioCapture?'Disable test audio capture':'Enable test audio capture';renderDebugStatus(m.debug_status)}if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.state==='listening'&&!recording){awaitingResponse=false;candidateSpeechMs=0}if((m.detail||'').startsWith('Ignored')||(m.detail||'').startsWith('Silent stop'))pendingTranscript=''}if(m.type==='action_status'&&m.state==='acknowledged')state.textContent='Working…';if(m.type==='partial_transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript='';addHistory('user',m.text)}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
 let realtimeListenerSocket=null;
 function installRealtimeListeners(){if(!ws||realtimeListenerSocket===ws)return;realtimeListenerSocket=ws;ws.addEventListener('message',event=>{const m=JSON.parse(event.data);if(m.type==='settings'){confirmationMode=m.action_confirmation;confirmationToggle.textContent=confirmationMode==='confirm'?'Turn confirmation off':'Turn confirmation on'}if(m.type==='endpoint_decision'){endpointPending=false;report('semantic_endpoint',m.source+':'+m.probability);if(recording&&m.complete)finishTurn()}if(m.type==='backchannel'){assistant.textContent=m.text;route.textContent='listening'}});setTimeout(()=>{try{report('voice_processing',OpenClawNativeAudio.getVoiceProcessingStatus())}catch(e){report('voice_processing','unavailable')}},250)}
-const originalStart=start;start=function(){originalStart();installRealtimeListeners()};confirmationToggle.onclick=()=>send({type:'set_confirmation',required:confirmationMode!=='confirm'});
+const originalStart=start;start=function(){originalStart();installRealtimeListeners()};confirmationToggle.onclick=()=>sendWhenConnected({type:'set_confirmation',required:confirmationMode!=='confirm'});recordingToggle.onclick=()=>sendWhenConnected({type:'set_audio_capture',enabled:!audioCapture});sendDebug.onclick=()=>sendWhenConnected({type:'send_for_debug'});renderDebugStatus({state:'idle'});
 function stop(){if(timer)clearInterval(timer);timer=null;if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=null;try{OpenClawNativeAudio.stopCapture()}catch(e){}if(ws)ws.close();ws=null;recording=false;awaitingResponse=false;responseActive=false;candidateSpeechMs=0;bar.style.width='0%';state.textContent='Stopped'}
 document.getElementById('start').onclick=start;document.getElementById('stop').onclick=()=>{stop();try{OpenClawNativeApp.liveConversationStopped()}catch(e){}};window.addEventListener('pagehide',stop);if(new URLSearchParams(location.search).get('autostart')==='1')start();
 </script></body></html>"""
@@ -2952,6 +3217,11 @@ async def health(request: web.Request) -> web.Response:
         "action_confirmation": (
             "confirm" if service.confirmation_required else "automatic"
         ),
+        "audio_capture": {
+            "enabled": service.audio_capture_enabled,
+            "path": str(service.recordings_path) if service.recordings_path else "",
+        },
+        "debug_status": dict(service.debug_status),
     })
 
 
@@ -2993,7 +3263,7 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
             socket, reply, "agent", f"agent-reconnect-{time.monotonic_ns()}"
         )
     audio = bytearray()
-    turn_queue: asyncio.Queue[tuple[bytes, int, str | None]] = asyncio.Queue()
+    turn_queue: asyncio.Queue[tuple[bytes, int, str | None, str | None]] = asyncio.Queue()
     turn_worker: asyncio.Task[None] | None = None
     partial_task: asyncio.Task[None] | None = None
     silent_stop_detected = False
@@ -3008,6 +3278,9 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
     conversation_idle = asyncio.Event()
     conversation_idle.set()
     callback_delivery_lock = asyncio.Lock()
+    client_context: dict[str, Any] = {
+        "user_agent": request.headers.get("User-Agent", ""),
+    }
 
     async def run_partial(
         snapshot: bytes, sequence: int, transcript_state: OnlineTranscript
@@ -3134,7 +3407,94 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
                     "type": "agent_status", "state": "error", "sessionKey": target_session
                 })
 
-    async def run_turn(turn: bytes, generation: int, transcript: str | None) -> None:
+    async def run_debug(request_id: str) -> None:
+        target_session = service.allocate_agent_session_key(
+            f"debug and correct live conversation {request_id}"
+        )
+        try:
+            bundle_path, baseline = await service.create_debug_bundle(
+                request_id, client_context
+            )
+            service.set_debug_status(
+                "working", request_id=request_id, requested_at=int(time.time()),
+                session_key=target_session, bundle_path=str(bundle_path),
+                message="Correction agent is diagnosing the captured conversation.",
+            )
+            service.register_agent_session(
+                target_session,
+                "Diagnose and correct the submitted Live Conversation issue.",
+                f"debug-{request_id}",
+            )
+            if not socket.closed:
+                await socket.send_json(service.settings_payload())
+            prompt = (
+                "You are the dedicated Live Conversation correction agent. The user pressed "
+                "Send for Debug, explicitly authorizing diagnosis, implementation, verification, "
+                "and delivery for the submitted problem. Read the complete local diagnostic bundle "
+                f"at {bundle_path}. Inspect the referenced real microphone WAV files, conversation "
+                "events, timings, service logs, gateway logs, and repository state. Reproduce the "
+                "failure before changing code. Correct the root cause in "
+                f"{DEFAULT_DASHBOARD_REPO}, add regression coverage that uses the captured audio "
+                "when relevant, and run proportionate end-to-end tests. Deploy affected services, "
+                "restart the Live Conversation service when its code changes, and verify loopback "
+                "and Android-facing health. Preserve unrelated user "
+                "changes. If app or served application code changes, commit and push it and publish "
+                "a new signed GitHub release when an installable release is required. If the root "
+                "cause is OpenClaw configuration or an available supported gateway update, apply it "
+                "using supported update-safe configuration and the safe gateway restart workflow. "
+                "Do not patch installed OpenClaw runtime/package code. Finish with a concise report "
+                "including root cause, verification, release tag if any, and gateway change if any."
+            )
+            reply = await service.agent_reply(prompt, target_session)
+            service.update_agent_session(target_session, "complete", reply)
+            after = await service.system_update_snapshot()
+            release_available = (
+                bool(after.get("dashboard_tag"))
+                and after.get("dashboard_tag") != baseline.get("dashboard_tag")
+            )
+            gateway_updated = any(
+                after.get(key) != baseline.get(key)
+                for key in ("gateway_version", "gateway_service", "gateway_config_stamp")
+            )
+            state_name = (
+                "release_available" if release_available else
+                "gateway_updated" if gateway_updated else "fixed"
+            )
+            message = (
+                f"New release {after.get('dashboard_tag')} is available."
+                if release_available else
+                "Gateway update applied." if gateway_updated else
+                "Correction completed; no new install is required."
+            )
+            service.set_debug_status(
+                state_name, request_id=request_id,
+                requested_at=service.debug_status.get("requested_at"),
+                completed_at=int(time.time()), session_key=target_session,
+                bundle_path=str(bundle_path), message=message,
+                release_available=release_available,
+                release_tag=after.get("dashboard_tag") if release_available else "",
+                gateway_updated=gateway_updated,
+                result=re.sub(r"\s+", " ", reply).strip()[:1000],
+            )
+            if not socket.closed:
+                await socket.send_json(service.settings_payload())
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            LOGGER.exception("debug_correction_failed request_id=%s error=%s", request_id, error)
+            service.update_agent_session(target_session, "failed")
+            service.set_debug_status(
+                "failed", request_id=request_id, completed_at=int(time.time()),
+                session_key=target_session,
+                message="The correction session failed. The diagnostic bundle was retained.",
+                error=f"{error.__class__.__name__}: {error}",
+            )
+            if not socket.closed:
+                await socket.send_json(service.settings_payload())
+
+    async def run_turn(
+        turn: bytes, generation: int, transcript: str | None, capture_id: str | None
+    ) -> None:
         async def start_handoff(
             transcript: str, target_session: str | None, origin_turn_id: str
         ) -> None:
@@ -3151,6 +3511,8 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
         }
         if transcript is not None:
             process_arguments["transcript_override"] = transcript
+        if capture_id is not None:
+            process_arguments["capture_id"] = capture_id
         handoff = await service.process_turn(socket, turn, **process_arguments)
         # Compatibility for test doubles and older service implementations.
         if handoff:
@@ -3161,10 +3523,10 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
 
     async def run_turn_queue() -> None:
         while True:
-            turn, generation, transcript = await turn_queue.get()
+            turn, generation, transcript, capture_id = await turn_queue.get()
             conversation_idle.clear()
             try:
-                await run_turn(turn, generation, transcript)
+                await run_turn(turn, generation, transcript, capture_id)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -3189,6 +3551,22 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
         elif kind == "set_confirmation":
             service.set_confirmation_required(bool(payload.get("required")))
             await socket.send_json(service.settings_payload())
+        elif kind == "set_audio_capture":
+            service.set_audio_capture_enabled(bool(payload.get("enabled")))
+            await socket.send_json(service.settings_payload())
+        elif kind == "send_for_debug":
+            if service.debug_status.get("state") in {"collecting", "working"}:
+                await socket.send_json(service.settings_payload())
+                continue
+            request_id = f"debug-{datetime.now(ZoneInfo('America/Detroit')):%Y%m%dT%H%M%S}-{secrets.token_hex(3)}"
+            service.set_debug_status(
+                "collecting", request_id=request_id, requested_at=int(time.time()),
+                message="Collecting redacted diagnostics and recent captured audio.",
+            )
+            await socket.send_json(service.settings_payload())
+            task = asyncio.create_task(run_debug(request_id))
+            agent_tasks.add(task)
+            task.add_done_callback(agent_tasks.discard)
         elif kind == "start":
             turn_sequence += 1
             silent_stop_detected = False
@@ -3275,6 +3653,10 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
                 continue
             turn = bytes(audio)
             audio.clear()
+            capture_id = (
+                service.begin_audio_capture(turn, turn_sequence, client_context)
+                if hasattr(service, "begin_audio_capture") else None
+            )
             if partial_task and not partial_task.done():
                 try:
                     await partial_task
@@ -3286,9 +3668,13 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
                     turn, online_transcript
                 )
             turn_queue.put_nowait(
-                (turn, service.speech_generation, final_transcript or None)
+                (turn, service.speech_generation, final_transcript or None, capture_id)
             )
         elif kind == "client_event":
+            event = str(payload.get("event", ""))
+            detail = str(payload.get("detail", ""))
+            if event in {"voice_processing", "speech_started", "barge_in"}:
+                client_context[event] = detail
             LOGGER.info("client_event event=%s detail=%s", payload.get("event", ""), payload.get("detail", ""))
     if turn_worker and not turn_worker.done():
         turn_worker.cancel()
@@ -3300,7 +3686,11 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
 
 async def build_app(args: argparse.Namespace) -> web.Application:
     service = LiveConversationService(
-        args.session_key, args.tts_speed, args.history_path, args.settings_path
+        args.session_key, args.tts_speed,
+        getattr(args, "history_path", DEFAULT_HISTORY_PATH),
+        getattr(args, "settings_path", DEFAULT_SETTINGS_PATH),
+        getattr(args, "recordings_path", DEFAULT_RECORDINGS_PATH),
+        getattr(args, "debug_path", DEFAULT_DEBUG_PATH),
     )
     await service.start()
     app = web.Application()
@@ -3324,6 +3714,8 @@ def main() -> None:
     parser.add_argument("--session-key", default=DEFAULT_SESSION_KEY)
     parser.add_argument("--history-path", default=DEFAULT_HISTORY_PATH)
     parser.add_argument("--settings-path", default=DEFAULT_SETTINGS_PATH)
+    parser.add_argument("--recordings-path", default=DEFAULT_RECORDINGS_PATH)
+    parser.add_argument("--debug-path", default=DEFAULT_DEBUG_PATH)
     parser.add_argument("--tts-speed", type=float, default=1.15)
     args = parser.parse_args()
     web.run_app(build_app(args), host=args.host, port=args.port, print=None)

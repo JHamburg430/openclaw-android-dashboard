@@ -146,6 +146,66 @@ reasoning instructions. Voice response policy belongs to the gateway agent's
 workspace instructions so complex requests can finish normal tool-backed work
 before the final answer is shortened for speech.
 
+## Consented real-audio capture
+
+The Live Conversation page includes **Enable test audio capture**. Capture is
+off by default and must be explicitly enabled in the app. While enabled, every
+committed microphone turn is saved on the OpenClaw host under
+`~/.openclaw/state/live-conversation-recordings/YYYYMMDD/` as:
+
+- lossless mono 16 kHz PCM WAV (`*-user.wav`), captured before ASR or routing;
+- a JSON sidecar with the capture/turn/response IDs, timestamps, duration, RMS,
+  transcript, assembled meaning, route, response text, latency, and Android
+  voice-processing diagnostics.
+
+Capturing before ASR intentionally preserves clipped starts, room noise,
+misrecognitions, interruptions, and ignored ambient turns. Wake-word windows
+are never recorded. Disabling the toggle stops new capture immediately; it does
+not delete prior recordings. The files remain local and are not exposed by an
+HTTP download route.
+
+To replay up to the latest 20 consented phone captures through the production
+Whisper model as part of the regression suite:
+
+```bash
+LIVE_CONVERSATION_TEST_RECORDINGS="$HOME/.openclaw/state/live-conversation-recordings" \
+  PYTHONPATH=live-conversation \
+  ~/.openclaw/tools/pipecat-live-conversation/venv/bin/python \
+  -m unittest live-conversation/test_recorded_audio.py -v
+```
+
+The replay gate validates the WAV contract, requires every captured turn to
+remain decodable, and detects material transcript drift. A normal test run skips
+this optional corpus when no capture path is supplied. Android WebView captures
+are labeled as real phone microphone audio; synthetic and desktop probes remain
+available for diagnosis but are excluded from the real-phone regression corpus.
+
+## Send for Debug
+
+The Live Conversation page includes **Send for Debug**. Pressing it explicitly
+authorizes one correction run. The server writes a local, redacted diagnostic
+bundle under `~/.openclaw/state/live-conversation-debug/YYYYMMDD/` containing
+recent conversation messages and turn events, the latest consented capture
+manifests, client voice-processing details, model/service state, repository
+state, and bounded Live Conversation and Gateway logs. Credentials are redacted
+and the bundle is not exposed over HTTP.
+
+Each submission gets a unique OpenClaw agent session. The correction agent is
+instructed to reproduce the issue, inspect the locally referenced WAV files,
+implement and test the root-cause fix, and complete delivery. It publishes a
+new signed app release only when an installable app change is required, or
+applies an update-safe Gateway configuration/update through the supported safe
+restart workflow when that is the actual cause. It must not patch installed
+OpenClaw package code.
+
+The status dot persists across page and service restarts:
+
+- amber: diagnostics are being collected or corrected;
+- green: correction completed without a new install;
+- blue: a new app release is available;
+- purple: a Gateway update was applied;
+- red: the correction session failed and its bundle was retained.
+
 ## Incremental speech behavior
 
 Stable and revisable partial transcription makes speech visible before the turn

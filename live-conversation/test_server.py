@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import time
+import wave
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
@@ -223,6 +224,14 @@ class RoutingTests(unittest.TestCase):
 
         import asyncio
         asyncio.run(run_test())
+
+    def test_semantic_endpoint_reuses_warm_supervisor_context(self):
+        import inspect
+        import server
+
+        source = inspect.getsource(server.LiveConversationService.semantic_endpoint_decision)
+        self.assertIn('"num_ctx": SPEECH_MODEL_CONTEXT', source)
+        self.assertNotIn('"num_ctx": 1024', source)
 
     def test_semantic_controller_requests_repeat_for_unclear_committed_speech(self):
         async def run_test():
@@ -932,6 +941,141 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(
                 json.loads(settings_path.read_text())["action_confirmation"], "confirm"
             )
+
+    def test_audio_capture_is_opt_in_and_persists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            service = LiveConversationService(
+                "agent:main:live-conversation", 1.15,
+                settings_path=str(settings_path),
+                recordings_path=str(Path(directory) / "recordings"),
+            )
+            self.assertFalse(service.audio_capture_enabled)
+            self.assertIsNone(service.begin_audio_capture(b"\0\0" * 320, 1))
+
+            service.set_audio_capture_enabled(True)
+            restarted = LiveConversationService(
+                "agent:main:live-conversation", 1.15,
+                settings_path=str(settings_path),
+                recordings_path=str(Path(directory) / "recordings"),
+            )
+            self.assertTrue(restarted.audio_capture_enabled)
+            self.assertTrue(restarted.settings_payload()["audio_capture"])
+
+    def test_audio_capture_writes_lossless_wav_and_test_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recordings = Path(directory) / "recordings"
+            service = LiveConversationService(
+                "agent:main:live-conversation", 1.15,
+                recordings_path=str(recordings),
+            )
+            service.audio_capture_enabled = True
+            pcm = (b"\x00\x10\x00\xf0" * 8_000)
+
+            capture_id = service.begin_audio_capture(pcm, 7)
+            self.assertIsNotNone(capture_id)
+            service.update_audio_capture(
+                capture_id, status="complete", transcript="Test the real recording.",
+                route="direct", reply="Recorded.", turn_id="turn-7",
+            )
+
+            day = recordings / capture_id[:8]
+            wav_path = day / f"{capture_id}-user.wav"
+            manifest_path = day / f"{capture_id}.json"
+            with wave.open(str(wav_path), "rb") as recording:
+                self.assertEqual(recording.getnchannels(), 1)
+                self.assertEqual(recording.getsampwidth(), 2)
+                self.assertEqual(recording.getframerate(), 16_000)
+                self.assertEqual(recording.readframes(recording.getnframes()), pcm)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["consent"], "explicit_in_app_opt_in")
+            self.assertEqual(manifest["duration_ms"], 1000)
+            self.assertEqual(manifest["sequence"], 7)
+            self.assertEqual(manifest["transcript"], "Test the real recording.")
+            self.assertEqual(manifest["reply"], "Recorded.")
+            self.assertEqual(manifest["user_audio"], wav_path.name)
+            self.assertEqual(manifest["capture_source"], "automated_or_non_android_client")
+
+    def test_android_user_agent_marks_capture_as_real_phone_microphone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = LiveConversationService(
+                "agent:main:live-conversation", 1.15,
+                recordings_path=str(Path(directory) / "recordings"),
+            )
+            service.audio_capture_enabled = True
+            capture_id = service.begin_audio_capture(
+                b"\0\0" * 320, 2, {"user_agent": "Android WebView; Pixel"}
+            )
+            manifest = json.loads(
+                service._capture_manifest_path(capture_id).read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["capture_source"], "android_live_microphone")
+
+    def test_debug_status_persists_and_diagnostics_redact_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            service = LiveConversationService(
+                "agent:main:live-conversation", 1.15,
+                settings_path=str(settings_path),
+            )
+            service.set_debug_status(
+                "release_available", message="New release v1.0.74 is available.",
+                release_tag="v1.0.74",
+            )
+            restarted = LiveConversationService(
+                "agent:main:live-conversation", 1.15,
+                settings_path=str(settings_path),
+            )
+            self.assertEqual(restarted.debug_status["state"], "release_available")
+            self.assertEqual(restarted.settings_payload()["debug_status"]["release_tag"], "v1.0.74")
+            redacted = service.redact_diagnostics(
+                'Authorization: Bearer private-value token=another-secret "password":"hidden"'
+            )
+            self.assertNotIn("private-value", redacted)
+            self.assertNotIn("another-secret", redacted)
+            self.assertNotIn("hidden", redacted)
+            self.assertEqual(redacted.count("[REDACTED]"), 3)
+
+    def test_debug_bundle_contains_conversation_audio_and_system_context(self):
+        async def run_test():
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                service = LiveConversationService(
+                    "agent:main:live-conversation", 1.15,
+                    recordings_path=str(root / "recordings"),
+                    debug_path=str(root / "debug"),
+                )
+                service.audio_capture_enabled = True
+                capture_id = service.begin_audio_capture(b"\0\0" * 16_000, 4)
+                service.update_audio_capture(
+                    capture_id, status="complete", transcript="This is a real phone turn."
+                )
+                service.remember("user", "This is a real phone turn.")
+                service.remember("assistant", "I heard the turn.")
+                service.system_update_snapshot = AsyncMock(return_value={
+                    "dashboard_head": "abc", "dashboard_tag": "v1.0.73",
+                    "gateway_version": "OpenClaw 1", "gateway_service": "ActiveState=active",
+                })
+                service._diagnostic_command = AsyncMock(
+                    return_value="token=private-value diagnostic output"
+                )
+
+                path, baseline = await service.create_debug_bundle(
+                    "debug-test", {"voice_processing": "aec=true"}
+                )
+
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(baseline["dashboard_tag"], "v1.0.73")
+                self.assertTrue(payload["authorization"]["correct"])
+                self.assertTrue(payload["authorization"]["publish_release_if_needed"])
+                self.assertEqual(payload["client_context"]["voice_processing"], "aec=true")
+                self.assertEqual(payload["conversation"]["messages"][-1]["role"], "assistant")
+                self.assertEqual(payload["recent_audio_captures"][0]["capture_id"], capture_id)
+                self.assertNotIn("private-value", path.read_text(encoding="utf-8"))
+                self.assertIn("[REDACTED]", path.read_text(encoding="utf-8"))
+
+        import asyncio
+        asyncio.run(run_test())
 
     def test_voice_launched_session_tracking_persists(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2026,6 +2170,99 @@ class RoutingTests(unittest.TestCase):
         import asyncio
         asyncio.run(run_test())
 
+    def test_websocket_send_for_debug_launches_unique_correction_session(self):
+        async def run_test():
+            from collections import deque
+            from aiohttp import web
+            from aiohttp.test_utils import TestClient, TestServer
+            from server import websocket
+
+            class FakeService:
+                def __init__(self):
+                    self.pending_spoken_replies = deque()
+                    self.debug_status = {"state": "idle"}
+                    self.speech_generation = 0
+                    self.called = asyncio.Event()
+                    self.registered = []
+
+                def recent_history(self):
+                    return [{"role": "user", "content": "The previous turn failed."}]
+
+                def settings_payload(self):
+                    return {
+                        "type": "settings", "action_confirmation": "automatic",
+                        "audio_capture": True, "debug_status": dict(self.debug_status),
+                    }
+
+                def set_debug_status(self, state, **fields):
+                    self.debug_status = {"state": state, **fields}
+                    return dict(self.debug_status)
+
+                def allocate_agent_session_key(self, request):
+                    return "agent:main:live-conversation-debug-test-abcdef"
+
+                async def create_debug_bundle(self, request_id, client_context):
+                    self.bundle_context = client_context
+                    return Path("/tmp/debug-test.json"), {
+                        "dashboard_tag": "v1.0.73", "gateway_version": "1",
+                        "gateway_service": "active-1",
+                    }
+
+                def register_agent_session(self, session_key, request, origin_turn_id):
+                    self.registered.append((session_key, request, origin_turn_id))
+
+                async def agent_reply(self, prompt, session_key):
+                    self.prompt = prompt
+                    self.called.set()
+                    return "Correction completed."
+
+                def update_agent_session(self, session_key, state, result=""):
+                    self.updated = (session_key, state, result)
+
+                async def system_update_snapshot(self):
+                    return {
+                        "dashboard_tag": "v1.0.74", "gateway_version": "1",
+                        "gateway_service": "active-1",
+                    }
+
+                @staticmethod
+                def gateway_is_transient(error):
+                    return False
+
+            service = FakeService()
+            app = web.Application()
+            app["service"] = service
+            app.router.add_get("/ws", websocket)
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            socket = await client.ws_connect("/ws")
+            await socket.receive_json()
+            await socket.receive_json()
+            await socket.send_json({"type": "send_for_debug"})
+
+            messages = []
+            for _ in range(5):
+                message = await asyncio.wait_for(socket.receive_json(), timeout=1)
+                messages.append(message)
+                if message.get("debug_status", {}).get("state") == "release_available":
+                    break
+
+            await asyncio.wait_for(service.called.wait(), timeout=1)
+            self.assertEqual(len(service.registered), 1)
+            self.assertIn("dedicated Live Conversation correction agent", service.prompt)
+            self.assertIn("/tmp/debug-test.json", service.prompt)
+            states = [item.get("debug_status", {}).get("state") for item in messages]
+            self.assertIn("collecting", states)
+            self.assertIn("working", states)
+            self.assertIn("release_available", states)
+            self.assertEqual(service.debug_status["release_tag"], "v1.0.74")
+
+            await socket.close()
+            await client.close()
+
+        import asyncio
+        asyncio.run(run_test())
+
     def test_background_noise_turn_returns_to_listening_without_history_or_reply(self):
         async def run_test():
             service = LiveConversationService("agent:main:live-conversation", 1.15)
@@ -2065,9 +2302,9 @@ class RoutingTests(unittest.TestCase):
                 self.assertTrue(service.confirmation_required)
                 service.speech_reply.assert_not_awaited()
                 messages = [call.args[0] for call in socket.send_json.await_args_list]
-                self.assertIn(
-                    {"type": "settings", "action_confirmation": "confirm"}, messages
-                )
+                settings = [message for message in messages if message.get("type") == "settings"]
+                self.assertEqual(settings[-1]["action_confirmation"], "confirm")
+                self.assertFalse(settings[-1]["audio_capture"])
 
         import asyncio
         asyncio.run(run_test())

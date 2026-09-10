@@ -1,0 +1,2 @@
+c7a0b7c580c4c5f486f25528d53fe1a0c668c6eee95fc02a5a6fda1d927c04f4  openclaw-dashboard-release-1.0.74.apk
+9a13582bf80364547aa6428e65fc8797975a994d8b7561babe00f1c9a9e3a861  openclaw-dashboard-debug-1.0.74.apk
