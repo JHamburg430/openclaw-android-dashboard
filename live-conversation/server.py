@@ -368,10 +368,10 @@ def has_explicit_action_request(transcript: str) -> bool:
     return bool(
         re.search(r"\b(?:can|could|would|will) you\b|\bplease\b", normalized)
         or re.search(r"\b(?:i need|i want) you to\b", normalized)
-        or re.search(r"\b(?:have|ask|tell)\b.*\bagent\b", normalized)
+        or re.search(r"\b(?:have|ask|tell|assign|get)\b.*\bagent\b", normalized)
         or re.match(
             r"^(?:also )?(?:fix|change|update|monitor|verify|review|inspect|check|"
-            r"start|spawn|launch|create|send|add|remove|stop|run|build|deploy)\b",
+            r"start|spawn|launch|create|assign|send|set|add|remove|stop|run|build|deploy)\b",
             normalized,
         )
         or re.search(
@@ -391,6 +391,14 @@ def requires_authoritative_lookup(transcript: str) -> bool:
         r"\b(?:latest|currently|right now|today|tonight|recent|news|weather|"
         r"forecast|price|score|schedule|availability|verify|source)\b|"
         r"\bfacts? (?:about|on)\b",
+        lowered,
+    ):
+        return True
+    if re.search(
+        r"\b(?:hear|listen|microphone|wake word)\b.*\b(?:app|screen|phone)\b.*"
+        r"\b(?:closed|minimi[sz]ed|background|locked|off)\b|"
+        r"\b(?:app|screen|phone)\b.*\b(?:closed|minimi[sz]ed|background|locked|off)\b.*"
+        r"\b(?:hear|listen|microphone|wake word)\b",
         lowered,
     ):
         return True
@@ -466,7 +474,7 @@ def speech_model_prompt(
         "Action confirmation is OFF. Explicit action requests execute after your acknowledgment. "
     )
     return f"""You are Jarvis, the model operating John's Live Conversation voice interface right now.
-Jarvis and the Live Conversation model are the same speaker: both refer to you. You receive John's locally transcribed microphone input, choose how each turn is handled, and speak the response. A gateway agent is only a tool-backed work session that you may use; it is not a separate Live Conversation model. Never claim that you are merely a supervisor outside Live Conversation, and never ask an agent to verify whether you can hear John. If a microphone utterance reaches you as a transcript, you heard it.
+Jarvis and the Live Conversation model are the same speaker: both refer to you. You receive John's locally transcribed microphone input, choose how each turn is handled, and speak the response. A gateway agent is only a tool-backed work session that you may use; it is not a separate Live Conversation model. Never claim that you are merely a supervisor outside Live Conversation, and never ask an agent to verify whether you can hear John when the current utterance already arrived. Receiving one transcript proves only that the current capture path worked; it does not prove that listening continues while the app is closed, minimized, backgrounded, or the screen is locked. Questions about those runtime states require an authoritative refresh through an agent.
 You are not a general chatbot pretending to lack system access. You can see the live gateway-session summary and capability catalog below, answer questions about them directly, route a follow-up into an existing session, or launch a separate agent session. {pending_note}
 {confirmation_note}
 Make each decision in this order: (1) determine whether John addressed you, (2) resolve references using the newest relevant conversation and session context, (3) distinguish conversation from an explicit request, (4) decide whether current evidence or a tool-backed refresh is required, (5) choose the least powerful route that can satisfy the request, and only then (6) write the spoken reply. Newer instructions override older ones.
@@ -1952,6 +1960,16 @@ class LiveConversationService:
             if route in {"agent", "new_agent", "session"} and not explicit_action:
                 LOGGER.warning("speech_supervisor_blocked_unrequested_action route=%s", route)
                 route, reply, target_session = "direct", "I understand.", None
+            elif route == "direct" and explicit_action and re.fullmatch(
+                r"(?i)(?:i understand|understood|okay|ok|all right|got it)[.!]?",
+                reply.strip(),
+            ):
+                LOGGER.warning("speech_supervisor_repaired_nonresponsive_action_ack")
+                route, reply, target_session = (
+                    "agent",
+                    "I'll have the agent handle that.",
+                    None,
+                )
             elif route == "direct" and is_operational_acknowledgment(reply):
                 if explicit_action:
                     LOGGER.warning("speech_supervisor_repaired_missing_agent_route")

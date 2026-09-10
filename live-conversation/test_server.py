@@ -354,6 +354,10 @@ class RoutingTests(unittest.TestCase):
         self.assertTrue(has_explicit_action_request("Please fix the response latency."))
         self.assertTrue(has_explicit_action_request("Can you monitor the logs?"))
         self.assertTrue(has_explicit_action_request("The routing needs to be fixed."))
+        self.assertTrue(has_explicit_action_request(
+            "Assign an agent to review this conversation and make improvements."
+        ))
+        self.assertTrue(has_explicit_action_request("Set an alarm for six tomorrow."))
 
     def test_changeable_facts_require_authoritative_grounding(self):
         for transcript in (
@@ -362,6 +366,8 @@ class RoutingTests(unittest.TestCase):
             "Where is Harvey Depp?",
             "Is that service currently available?",
             "Tell me two facts about the moon.",
+            "Can you still hear me when the app is closed?",
+            "Does the microphone listen while the phone is locked?",
         ):
             self.assertTrue(requires_authoritative_lookup(transcript), transcript)
         for transcript in (
@@ -379,6 +385,7 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("agent research: Research", prompt)
         self.assertIn("answer capability questions quickly", prompt)
         self.assertIn("Statements describing what he is currently doing", prompt)
+        self.assertIn("does not prove that listening continues", prompt)
         self.assertIn("Testing out the latest Live Conversation updates", prompt)
 
     def test_confirmation_setting_persists(self):
@@ -1087,6 +1094,11 @@ class RoutingTests(unittest.TestCase):
             "reply": "I'll have the agent fix that.",
             "session_key": "",
         }
+        empty_ack = {
+            "route": "direct",
+            "reply": "I understand.",
+            "session_key": "",
+        }
         self.assertEqual(
             asyncio.run(decide("The response feels the same.", invented)),
             ("direct", "I understand.", None),
@@ -1094,6 +1106,13 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(
             asyncio.run(decide("Please fix the response latency.", missing_route)),
             ("agent", "I'll have the agent fix that.", None),
+        )
+        self.assertEqual(
+            asyncio.run(decide(
+                "Assign an agent to review this conversation and make improvements.",
+                empty_ack,
+            )),
+            ("agent", "I'll have the agent handle that.", None),
         )
 
     def test_start_uses_the_more_accurate_cached_whisper_model(self):
