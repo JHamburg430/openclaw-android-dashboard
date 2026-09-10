@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo
 from server import (
     AGENT_SENTINEL,
     BACKCHANNEL_DISPLAY_TEXT,
-    BACKCHANNEL_TTS_TEXT,
     NEW_AGENT_SENTINEL,
     IGNORE_SENTINEL,
     SAY_SENTINEL,
@@ -27,11 +26,13 @@ from server import (
     LiveConversationService,
     IncrementalSpeechStream,
     OnlineTranscript,
+    TurnDecision,
     MAX_HISTORY_MESSAGES,
     PROMPT_HISTORY_CHARS,
     confirmation_answer,
     confirmation_policy_command,
     conversation_entities,
+    affirmative_hum_pcm,
     direct_voice_surface_reply,
     extract_agent_acknowledgment,
     extract_agent_text,
@@ -85,7 +86,10 @@ def semantic_decision(
 def mock_semantic_model(*decisions):
     response = AsyncMock()
     response.raise_for_status = lambda: None
-    payloads = [{"message": {"content": json.dumps(item)}} for item in decisions]
+    payloads = [
+        {"message": {"content": item if isinstance(item, str) else json.dumps(item)}}
+        for item in decisions
+    ]
     if len(payloads) == 1:
         response.json = AsyncMock(return_value=payloads[0])
     else:
@@ -166,6 +170,60 @@ class RoutingTests(unittest.TestCase):
         from server import SAMPLE_RATE
         asyncio.run(run_test())
 
+    def test_final_online_decode_includes_full_onset_for_long_slow_turn(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:test", 1.15)
+            service.transcribe = AsyncMock(return_value="The complete slow sentence.")
+            state = OnlineTranscript(
+                stable_words=["The", "complete"], previous_words=["slow"],
+                unstable_words=["slow"], decode_from_sample=160_000,
+            )
+            from server import SAMPLE_RATE
+            audio = b"\0\0" * (SAMPLE_RATE * 22)
+            transcript = await service.finalize_online_transcript(audio, state)
+            self.assertEqual(transcript, "The complete slow sentence.")
+            service.transcribe.assert_awaited_once_with(audio, purpose="final")
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_semantic_endpoint_vetoes_complete_acoustic_prediction(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:test", 1.15)
+            service.semantic_turn = MagicMock()
+            service.semantic_turn.predict.return_value = TurnDecision(
+                True, 0.97, "smart-turn-v3.2"
+            )
+            service.semantic_endpoint_decision = AsyncMock(return_value=(False, 0.99))
+
+            decision = await service.endpoint_decision(
+                b"speech", "Do not answer yet since I still need to ask"
+            )
+
+            self.assertFalse(decision.complete)
+            self.assertEqual(decision.source, "smart-turn-v3.2+semantic")
+            service.semantic_endpoint_decision.assert_awaited_once()
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_semantic_endpoint_failure_waits_for_hard_endpoint(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:test", 1.15)
+            service.semantic_turn = MagicMock()
+            service.semantic_turn.predict.return_value = TurnDecision(
+                True, 0.94, "smart-turn-v3.2"
+            )
+            service.semantic_endpoint_decision = AsyncMock(return_value=None)
+
+            decision = await service.endpoint_decision(b"speech", "A possible turn")
+
+            self.assertFalse(decision.complete)
+            self.assertEqual(decision.source, "smart-turn-v3.2+semantic-error")
+
+        import asyncio
+        asyncio.run(run_test())
+
     def test_semantic_controller_requests_repeat_for_unclear_committed_speech(self):
         async def run_test():
             service = LiveConversationService("agent:main:test", 1.15)
@@ -205,22 +263,77 @@ class RoutingTests(unittest.TestCase):
         )
         self.assertTrue(understanding.clarification_needed)
 
-    def test_backchannel_uses_nonverbal_phonemes_without_spelling_text(self):
+    def test_semantic_controller_accepts_fenced_schema_json(self):
+        decision = semantic_decision(
+            "direct", "The sky is blue.", speech_act="answer",
+            assembled_text="What colour is the sky?",
+        )
+        understanding = parse_turn_understanding(
+            f"```json\n{json.dumps(decision)}\n```",
+            "What colour is the sky?",
+        )
+        self.assertTrue(understanding.complete)
+        self.assertEqual(understanding.speech_act, "answer")
+
+    def test_semantic_controller_retries_non_json_with_real_schema_request(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:test", 1.15)
+            service.sessions_updated_at = time.monotonic()
+            service.capabilities_updated_at = time.monotonic()
+            valid = semantic_decision(
+                "direct", "The sky is blue.", speech_act="answer",
+                assembled_text="What colour is the sky?",
+            )
+            client, session = mock_semantic_model("not json", valid)
+            with patch("server.aiohttp.ClientSession", return_value=client):
+                result = await service.speech_reply("What colour is the sky?")
+            self.assertEqual(result, ("direct", "The sky is blue.", None))
+            self.assertEqual(session.post.call_count, 2)
+            repair_request = session.post.call_args_list[1].kwargs["json"]
+            self.assertFalse(repair_request["stream"])
+            self.assertIn("previous response was not valid JSON", repair_request["messages"][-1]["content"])
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_complete_direct_turn_recovers_missing_controller_reply(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:test", 1.15)
+            service.sessions_updated_at = time.monotonic()
+            service.capabilities_updated_at = time.monotonic()
+            decision = semantic_decision(
+                "direct", "", speech_act="question",
+                assembled_text="What colour is the sky?",
+            )
+            client, _ = mock_semantic_model(decision)
+            service.generate_direct_answer = AsyncMock(return_value="The sky is blue.")
+            with patch("server.aiohttp.ClientSession", return_value=client):
+                result = await service.speech_reply("What colour is the sky?")
+            self.assertEqual(result, ("direct", "The sky is blue.", None))
+            service.generate_direct_answer.assert_awaited_once_with(
+                "What colour is the sky?"
+            )
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_backchannel_uses_generated_nonverbal_audio_without_tts_text(self):
         async def run_test():
             service = LiveConversationService("agent:main:test", 1.15)
             service.tts.synthesize = AsyncMock(return_value=b"")
             socket = AsyncMock()
+            hum = affirmative_hum_pcm()
             await service.send_spoken_response(
-                socket, BACKCHANNEL_TTS_TEXT, "backchannel", "bc-1",
+                socket, "", "backchannel", "bc-1",
                 message_type="backchannel", display_text=BACKCHANNEL_DISPLAY_TEXT,
+                pcm_override=hum,
             )
-            service.tts.synthesize.assert_awaited_once()
-            self.assertEqual(
-                service.tts.synthesize.await_args.args[0], BACKCHANNEL_TTS_TEXT
-            )
+            service.tts.synthesize.assert_not_awaited()
             first = socket.send_json.await_args_list[0].args[0]
             self.assertEqual(first["type"], "backchannel")
             self.assertEqual(first["text"], "")
+            self.assertGreater(len(hum), 20_000)
+            self.assertNotEqual(hum, bytes(len(hum)))
 
         import asyncio
         asyncio.run(run_test())
@@ -699,6 +812,11 @@ class RoutingTests(unittest.TestCase):
                 assembled_text="What are the latest updates for the Live Conversation project?",
             )
             client, _ = mock_semantic_model(first, second)
+            service.semantic_fragment_resolution = AsyncMock(return_value=(
+                "continuation", True, 0.99,
+                "What are the latest updates for the Live Conversation project?",
+                "The second fragment supplies the missing subject.",
+            ))
             with patch("server.aiohttp.ClientSession", return_value=client):
                 self.assertEqual(
                     await service.speech_reply("What are the latest updates for the"),
@@ -713,6 +831,55 @@ class RoutingTests(unittest.TestCase):
                 service.last_turn_understanding.assembled_text,
                 "What are the latest updates for the Live Conversation project?",
             )
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_fragment_resolver_semantically_assembles_two_transcriptions(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:test", 1.15)
+            resolution = {
+                "relation": "continuation",
+                "complete": True,
+                "confidence": 0.99,
+                "assembled_text": "What is the capital of the nation called Canada?",
+                "reason": "The newer phrase supplies the missing object.",
+            }
+            client, session = mock_semantic_model(resolution)
+            with patch("server.aiohttp.ClientSession", return_value=client):
+                result = await service.semantic_fragment_resolution(
+                    "Please answer only after both parts. What is the capital of?",
+                    "The nation called Canada?",
+                )
+            self.assertEqual(result[0], "continuation")
+            self.assertTrue(result[1])
+            self.assertEqual(
+                result[3], "What is the capital of the nation called Canada?"
+            )
+            request = session.post.call_args.kwargs["json"]
+            self.assertIn("missing arguments", request["messages"][0]["content"])
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_fragment_resolver_preserves_unrelated_new_turn(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:test", 1.15)
+            resolution = {
+                "relation": "new",
+                "complete": True,
+                "confidence": 0.98,
+                "assembled_text": "What time is it?",
+                "reason": "The newer question is self-contained and unrelated.",
+            }
+            client, _ = mock_semantic_model(resolution)
+            with patch("server.aiohttp.ClientSession", return_value=client):
+                result = await service.semantic_fragment_resolution(
+                    "What is the capital of?", "What time is it?"
+                )
+            self.assertEqual(result[:4], (
+                "new", True, 0.98, "What time is it?"
+            ))
 
         import asyncio
         asyncio.run(run_test())
@@ -1917,10 +2084,10 @@ class RoutingTests(unittest.TestCase):
         self.assertNotIn("if(awaitingResponse){candidateSpeechMs=0;return}", page)
         self.assertIn("interruptedWait?'while_awaiting_response':'ready'", page)
         self.assertIn("candidateSpeechMs>=speechRequiredMs", page)
-        self.assertIn("ONSET_PREROLL_MS=1500", page)
+        self.assertIn("ONSET_PREROLL_MS=2500", page)
         self.assertIn("PREBUFFER_FRAMES=Math.ceil((START_CONFIRM_MS+ONSET_PREROLL_MS)/AUDIO_FRAME_MS)", page)
         self.assertIn("while(pre.length>PREBUFFER_FRAMES)pre.shift()", page)
-        self.assertIn("MAX_DRAIN_FRAMES=12", page)
+        self.assertIn("MAX_DRAIN_FRAMES=24", page)
         self.assertIn("processChunk(chunk)", page)
         self.assertIn("responseActive=true", page)
         self.assertIn("first_pcm_enqueued", page)
@@ -1943,7 +2110,7 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("await conversation_idle.wait()", source)
         self.assertIn("if turn_queue.empty() and not user_input_active", source)
         self.assertIn("len(online_transcript.stable_words) >= 3", source)
-        self.assertIn("display_text=BACKCHANNEL_DISPLAY_TEXT", source)
+        self.assertIn("pcm_override=affirmative_hum_pcm()", source)
         self.assertNotIn("turn_task.cancel()", source)
         self.assertNotIn("len(audio) < SAMPLE_RATE * 2 * 30", source)
 
@@ -2042,8 +2209,8 @@ class RoutingTests(unittest.TestCase):
         page = render_page()
         self.assertIn("const speechThreshold=responseActive?.025:.012", page)
         self.assertIn("const speechRequiredMs=responseActive?200:START_CONFIRM_MS", page)
-        self.assertIn("SEMANTIC_CHECK_MS=350", page)
-        self.assertIn("HARD_ENDPOINT_MS=1900", page)
+        self.assertIn("SEMANTIC_CHECK_MS=750", page)
+        self.assertIn("HARD_ENDPOINT_MS=3500", page)
         self.assertIn("send({type:'endpoint_candidate'})", page)
         self.assertIn("m.type==='endpoint_decision'", page)
         self.assertIn("responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500)", page)

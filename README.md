@@ -44,12 +44,12 @@ openclaw devices approve <requestId>
 
 ## Hybrid Control UI and phone node
 
-Version 1.0.71 deliberately keeps two independent OpenClaw connections:
+Version 1.0.73 deliberately keeps two independent OpenClaw connections:
 
 - The embedded WebView is a normal Control UI browser client for complete chat, agent, session, and settings functionality.
 - `PhoneNodeService` is a separately paired Android node that remains available when the activity or WebView is recreated.
 
-The phone node runs as an opted-in foreground service, reconnects with bounded exponential backoff after gateway or network loss, restores after boot/application upgrades, and re-advertises its native commands after each connection. The native **Connection Center** reports the WebView connection, phone-node identity/connection, active session metadata observed from Control UI traffic, retry state, and the most recent error.
+The phone node runs as an opted-in foreground service, reconnects with bounded exponential backoff after gateway or network loss, restores after boot/application upgrades, and re-advertises its native commands after each connection. A service watchdog replaces stalled connection handshakes and disconnected sockets, while network and gateway changes force a fresh connection automatically. If the gateway rejects an obsolete device token, the client preserves its stable device identity, clears only that stale authorization, and retries with the configured gateway authentication—the same recovery formerly available only through **Re-pair Phone Node**. The native **Connection Center** reports the WebView connection, phone-node identity/connection, active session metadata observed from Control UI traffic, retry state, and the most recent error.
 
 Live Conversation capture uses Android's voice-communication path and reports
 the active acoustic echo cancellation, noise suppression, and automatic gain

@@ -239,10 +239,24 @@ final class OpenClawClient {
             listener.onConnected(payloadJson == null ? new JSONObject() : payloadJson);
             refreshDashboard();
         }, error -> {
+            if (isStaleDeviceTokenError(error) && identityStore.getDeviceToken() != null) {
+                identityStore.clearDeviceToken();
+                listener.onLog("Cleared stale node authorization; retrying with the configured gateway authentication");
+                listener.onStatus("Refreshing node authorization");
+            }
             listener.onError("Connect rejected: " + error);
             listener.onStatus("Pairing or auth required");
             webSocket.close(1000, "connect rejected");
         });
+    }
+
+    private static boolean isStaleDeviceTokenError(String error) {
+        if (error == null) return false;
+        String normalized = error.toLowerCase(java.util.Locale.ROOT);
+        return normalized.contains("device token mismatch")
+                || normalized.contains("rotate/reissue device token")
+                || normalized.contains("invalid device token")
+                || normalized.contains("expired device token");
     }
 
     private void handleNodeInvoke(JSONObject payload) throws Exception {

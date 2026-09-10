@@ -138,13 +138,13 @@ function harness() {
 {
   const app = harness();
   // A near-field sentence can begin quietly before a later vowel crosses the
-  // conservative start gate.  Preserve 900 ms before the 300 ms confirmation
+  // conservative start gate. Preserve 2.5 seconds before the 300 ms confirmation
   // window so those first words reach ASR instead of starting mid-sentence.
-  app.run(0.007, 45);
+  app.run(0.007, 125);
   app.run(0.030, 15);
   const captured = app.sent.filter((message) => message.type === "audio");
   assert.equal(app.count("start"), 1, "confirmed foreground speech starts a turn");
-  assert.equal(captured.length, 60, "the full 900 ms quiet onset and confirmation window are retained");
+  assert.equal(captured.length, 140, "the full 2.5 second quiet onset and confirmation window are retained");
   assert.equal(captured[0].audioBase64, pcm(0.007), "capture begins at the quiet sentence onset");
 }
 
@@ -161,10 +161,12 @@ function harness() {
   app.run(0.030, 10);
   app.run(0.001, 25);
   assert.equal(app.count("commit"), 0, "a 500 ms thinking pause stays in one utterance");
+  assert.equal(app.count("endpoint_candidate"), 0, "500 ms is below the semantic endpoint window");
+  app.run(0.001, 13);
   assert.equal(app.count("endpoint_candidate"), 1, "a pause asks the semantic model");
   app.socket.server({ type: "endpoint_decision", complete: false, probability: 0.1, source: "smart-turn-v3.2" });
   app.run(0.030, 10);
-  app.run(0.001, 18);
+  app.run(0.001, 38);
   app.socket.server({ type: "endpoint_decision", complete: true, probability: 0.9, source: "smart-turn-v3.2" });
   assert.equal(app.count("commit"), 1, "a semantic completion decision commits the utterance");
 }
@@ -172,12 +174,12 @@ function harness() {
 {
   const app = harness();
   app.run(0.030, 25);
-  app.run(0.001, 18);
+  app.run(0.001, 38);
   app.socket.server({ type: "endpoint_decision", complete: true, probability: 0.9, source: "smart-turn-v3.2" });
   assert.equal(app.count("commit"), 1);
   app.run(0.001, 50);
   app.run(0.030, 25);
-  app.run(0.001, 18);
+  app.run(0.001, 38);
   app.socket.server({ type: "endpoint_decision", complete: true, probability: 0.9, source: "smart-turn-v3.2" });
   assert.equal(app.count("commit"), 2, "a second user turn is captured before the first reply arrives");
   assert.ok(
@@ -193,7 +195,7 @@ function harness() {
   app.run(0.030, 15);
   app.socket.server({ type: "state", state: "listening" });
   app.run(0.030, 10);
-  app.run(0.001, 18);
+  app.run(0.001, 38);
   app.socket.server({ type: "endpoint_decision", complete: true, probability: 0.9, source: "smart-turn-v3.2" });
   assert.equal(app.count("commit"), 1, "a stale listening event cannot reset active recording");
 }
@@ -203,7 +205,7 @@ function harness() {
   app.run(0.030, 15);
   app.run(0.030, 10);
   app.socket.server({ type: "partial_transcript", text: "Are you ready?" });
-  app.run(0.001, 18);
+  app.run(0.001, 38);
   app.socket.server({ type: "endpoint_decision", complete: true, probability: 0.9, source: "smart-turn-v3.2" });
   assert.equal(app.count("commit"), 1, "a semantically complete question commits after model confirmation");
 }
@@ -213,10 +215,10 @@ function harness() {
   app.run(0.030, 15);
   app.run(0.030, 10);
   app.socket.server({ type: "partial_transcript", text: "Please check the session and" });
-  app.run(0.001, 18);
+  app.run(0.001, 38);
   app.socket.server({ type: "endpoint_decision", complete: false, probability: 0.1, source: "smart-turn-v3.2" });
   assert.equal(app.count("commit"), 0, "an unfinished clause survives a semantic endpoint check");
-  app.run(0.001, 77);
+  app.run(0.001, 138);
   assert.equal(app.count("commit"), 1, "an unfinished clause eventually commits at the hard-silence fallback");
 }
 

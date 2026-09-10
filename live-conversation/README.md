@@ -7,14 +7,14 @@ in the Android Dashboard plus menu.
 
 1. The Android native audio bridge captures 16 kHz PCM in 20 ms frames.
 2. Browser-side VAD requires 300 ms of near-field audio above a 0.012 RMS
-   threshold before opening a turn. After 350 ms of silence, the server runs
+   threshold before opening a turn. After 750 ms of silence, the server runs
    Pipecat Smart Turn v3.2 on the final eight seconds of raw audio. Its learned
    semantic/prosodic decision ends complete thoughts quickly and keeps
-   unfinished thoughts open; a 1,900 ms hard-silence fallback prevents a bad
+   unfinished thoughts open; a 3,500 ms hard-silence fallback prevents a bad
    prediction from leaving the microphone stuck without limiting utterance
    duration. This rejects the lower-level television/road speech that the former
    0.006 start gate treated as if it came from the person holding the phone. A
-   1.5-second onset pre-roll is retained in addition to the 300 ms
+   2.5-second onset pre-roll is retained in addition to the 300 ms
    confirmation window, and queued native frames are drained in bursts so UI
    scheduling jitter cannot discard the start of a sentence, so quiet initial
    words and consonants still reach transcription after the
@@ -203,6 +203,9 @@ PYTHONPATH=live-conversation \
   -m unittest discover -s live-conversation -p 'test_*.py' -v
 node scripts/test-live-conversation-app.mjs
 node scripts/test-live-conversation-turns.mjs
+PYTHONPATH=live-conversation \
+  ~/.openclaw/tools/pipecat-live-conversation/venv/bin/python \
+  live-conversation/e2e_conversation_matrix.py --url http://127.0.0.1:8790/ws
 ```
 
 The Python discovery suite includes `test_voice_audio.py`, a model-backed audio
@@ -217,3 +220,13 @@ rejection, a 500 ms thinking pause, silent spoken interruption, and non-silent
 fixture validation. If the local production voice assets are not installed, these
 hardware integration cases report an explicit skip while the fast unit suite
 continues.
+
+`e2e_conversation_matrix.py` is the required deployed-service release gate. It
+uses production Kokoro audio as microphone input, sends wall-clock-paced 20 ms
+PCM frames through the real WebSocket, and requires actual Whisper transcripts,
+semantic decisions, local-model replies, and audible response PCM. It covers
+slow, natural, and fast speakers; broadband background noise; 250, 800, and
+1,800 ms intra-sentence gaps; a sentence committed as two separate
+transcriptions; a nonverbal backchannel; and user barge-in during a real model
+response. The split-sentence case must remain silent after its first fragment
+and answer the semantically assembled question after its second fragment.

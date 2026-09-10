@@ -7,7 +7,7 @@ import argparse
 import asyncio
 import base64
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 import json
 import inspect
@@ -99,6 +99,31 @@ TURN_UNDERSTANDING_SCHEMA = {
     ],
     "additionalProperties": False,
 }
+SEMANTIC_ENDPOINT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "complete": {"type": "boolean"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "reason": {"type": "string"},
+    },
+    "required": ["complete", "confidence", "reason"],
+    "additionalProperties": False,
+}
+FRAGMENT_RESOLUTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "relation": {
+            "type": "string",
+            "enum": ["new", "continuation", "correction"],
+        },
+        "complete": {"type": "boolean"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "assembled_text": {"type": "string"},
+        "reason": {"type": "string"},
+    },
+    "required": ["relation", "complete", "confidence", "assembled_text", "reason"],
+    "additionalProperties": False,
+}
 SPEECH_OUTPUT_SCHEMA["properties"].update(TURN_UNDERSTANDING_SCHEMA["properties"])
 SPEECH_OUTPUT_SCHEMA["required"].extend(TURN_UNDERSTANDING_SCHEMA["required"])
 CAPABILITY_CACHE_SECONDS = 60
@@ -108,9 +133,6 @@ PARTIAL_TRANSCRIPT_INTERVAL_SECONDS = 1.0
 ONLINE_ASR_WINDOW_SECONDS = 14.0
 ONLINE_ASR_OVERLAP_SECONDS = 2.0
 BACKCHANNEL_DISPLAY_TEXT = ""
-# eSpeak phoneme input keeps Kokoro from reading "mm-hm" as letters. This is
-# rendered as a short closed-mouth affirmative hum instead of visible speech.
-BACKCHANNEL_TTS_TEXT = "[[m: h m:]]"
 SMART_TURN_MODEL_PATH = os.environ.get(
     "SMART_TURN_MODEL_PATH",
     "/home/john/.openclaw/tools/pipecat-live-conversation/models/smart-turn-v3.2-cpu.onnx",
@@ -197,6 +219,32 @@ def tts_speed_for(text: str, route: str = "direct", base: float = 1.15) -> float
     if len(normalized) > 260:
         return min(1.20, base + 0.02)
     return base
+
+
+def affirmative_hum_pcm() -> bytes:
+    """Generate a short nonverbal two-part affirmative hum as PCM16.
+
+    Kokoro does not implement eSpeak's ``[[phoneme]]`` syntax and pronounced
+    that marker as letters. This signal never passes through a text model.
+    """
+    parts: list[np.ndarray] = []
+    for duration, start_hz, end_hz, amplitude in (
+        (0.20, 138.0, 148.0, 0.18),
+        (0.24, 158.0, 172.0, 0.21),
+    ):
+        count = round(OUTPUT_SAMPLE_RATE * duration)
+        frequency = np.linspace(start_hz, end_hz, count, dtype=np.float64)
+        phase = 2.0 * np.pi * np.cumsum(frequency) / OUTPUT_SAMPLE_RATE
+        voiced = (
+            np.sin(phase)
+            + 0.34 * np.sin(2.0 * phase + 0.15)
+            + 0.12 * np.sin(3.0 * phase + 0.35)
+        )
+        envelope = np.sin(np.linspace(0.0, np.pi, count, dtype=np.float64)) ** 1.4
+        parts.append(voiced * envelope * amplitude)
+        parts.append(np.zeros(round(OUTPUT_SAMPLE_RATE * 0.055), dtype=np.float64))
+    samples = np.concatenate(parts[:-1])
+    return np.clip(np.rint(samples * 32767.0), -32768, 32767).astype("<i2").tobytes()
 
 
 def conversation_entities(text: str) -> dict[str, list[str]]:
@@ -567,14 +615,15 @@ Never omit a key. `confidence` must be a JSON number from 0 through 1. `relation
 one of `new`, `continuation`, `correction`, or `meta`; incompleteness belongs only in `complete`.
 - `speech_act` must be exactly one of `request`, `question`, `answer`, `statement`, `correction`,
   `continuation`, `meta`, `control`, or `ambient`. Do not invent a synonym or a new category.
-- `complete` is true only when the speaker has expressed a complete communicative act. A fluent-sounding clause can still be incomplete. "What are the latest updates for the" is incomplete because its object is missing. Do not let punctuation, silence, or acoustic endpoint confidence override missing meaning.
+- `complete` evaluates whether the USER has finished expressing the current communicative act. It never requires the user to supply the answer to their own question. A self-contained question such as "What colour is a clear daytime sky?" is complete even if earlier dialogue contained unfinished tests. A fluent-sounding clause can still be incomplete: "What are the latest updates for the" is incomplete because its object is missing. Do not let punctuation, silence, acoustic endpoint confidence, or unrelated earlier turn patterns override the current meaning.
 - `speech_act` describes the whole utterance. `meta` means the speaker is asking about or correcting the assistant's immediately preceding behavior, plan, wording, or claim.
-- `relation` describes how this transcript relates to the unresolved fragment or recent dialogue. Use `continuation` when it completes the unresolved thought, `correction` when it replaces/repairs it, and `meta` for questions such as "What are you going to verify?"
+- `relation` describes how this transcript relates to the unresolved fragment or recent dialogue. Use `continuation` when it completes the unresolved thought, `correction` when it replaces/repairs it, and `meta` for questions such as "What are you going to verify?" A self-contained question with no unresolved reference is `new`; do not force it into an earlier test pattern merely because topics or wording repeat.
 - `actionable` is true only for an actual request, command, or unmistakable instruction to do work. Mentioning words such as latest, verify, agent, update, test, or fix is not authorization by itself.
 - `requires_grounding` is true only when answering the complete communicative act requires current/private/tool-backed evidence. A meta-question about what the assistant just said does not require grounding merely because it repeats "verify" or "latest".
 - `supersedes_previous` is true when this turn corrects, retracts, or replaces the prior turn or its planned response.
 - `clarification_needed` is true when the committed speech is too garbled, contradictory, or semantically incoherent to recover confidently. This is different from an intelligible unfinished thought: unfinished speech waits for a continuation, while unclear speech gets one brief request to repeat or rephrase it. Never use a backchannel as the answer to unclear speech.
 - `assembled_text` is the exact complete meaning to route. Combine the unresolved fragment with this transcript only when they form one coherent thought. If the current transcript is incomplete, preserve it verbatim. If it is a new unrelated turn, use only the current transcript.
+- When an unresolved fragment is nonempty, first test whether the current transcript can supply its missing subject, object, predicate, complement, condition, or proposition. Classify the current words alone only after rejecting that coherent assembly. A short noun phrase or clause may be a complete continuation even when it would be incomplete in isolation.
 - `reason` is a short semantic explanation, never a keyword citation.
 
 Complete examples (the reply wording may vary, but all keys are mandatory):
@@ -583,6 +632,9 @@ Current: "What are the latest updates for the"
 
 Pending: "What are the latest updates for the"; current: "Live Conversation project?"
 {{"route":"agent","reply":"I'll check the latest Live Conversation project updates.","session_key":null,"complete":true,"confidence":0.97,"speech_act":"question","relation":"continuation","actionable":true,"requires_grounding":true,"supersedes_previous":false,"clarification_needed":false,"assembled_text":"What are the latest updates for the Live Conversation project?","reason":"The second fragment supplies the missing subject and asks for current information."}}
+
+Pending: "Please answer only after both parts. What is the capital of?"; current: "The nation called Canada?"
+{{"route":"direct","reply":"Ottawa is the capital of Canada.","session_key":null,"complete":true,"confidence":0.99,"speech_act":"question","relation":"continuation","actionable":false,"requires_grounding":false,"supersedes_previous":false,"clarification_needed":false,"assembled_text":"What is the capital of the nation called Canada?","reason":"The second transcription supplies the missing object of the pending question, so the two fragments form one complete turn."}}
 
 Recent assistant: "I'll verify that"; current: "What are you going to verify?"
 {{"route":"direct","reply":"I was referring to the subject of your previous request, but that request was cut off before you named it.","session_key":null,"complete":true,"confidence":0.99,"speech_act":"meta","relation":"meta","actionable":false,"requires_grounding":false,"supersedes_previous":true,"clarification_needed":false,"assembled_text":"What are you going to verify?","reason":"This asks about the assistant's stated plan rather than requesting a new verification."}}
@@ -707,22 +759,40 @@ def parse_speech_model_output(text: str) -> tuple[str, str, str | None]:
 
 def parse_turn_understanding(text: str, transcript: str) -> TurnUnderstanding:
     """Parse safety fields strictly while normalizing descriptive taxonomy."""
+    cleaned = text.strip()
     try:
-        payload = json.loads(text.strip())
+        payload = json.loads(cleaned)
     except (TypeError, ValueError) as error:
-        # Preserve the legacy sentinel protocol during rolling upgrades. The
-        # current JSON-schema path always supplies the semantic fields.
-        route, _, _ = parse_speech_model_output(text)
-        if not any(marker in text for marker in (
-            AGENT_SENTINEL, NEW_AGENT_SENTINEL, SAY_SENTINEL, IGNORE_SENTINEL,
-            "[[OPENCLAW_SESSION:",
-        )):
-            raise ValueError("semantic controller returned invalid JSON") from error
-        action = route in {"agent", "new_agent", "session"}
-        return TurnUnderstanding(
-            True, 1.0, "request" if action else "statement", "new",
-            action, False, False, transcript, "legacy sentinel decision",
-        )
+        # Some local-model builds occasionally wrap schema-constrained output in
+        # a Markdown fence or a sentence. Accept one complete JSON object while
+        # keeping every field-level safety check below strict.
+        payload = None
+        decoder = json.JSONDecoder()
+        for start in (index for index, character in enumerate(cleaned) if character == "{"):
+            try:
+                candidate, _ = decoder.raw_decode(cleaned[start:])
+            except ValueError:
+                continue
+            if isinstance(candidate, dict):
+                payload = candidate
+                LOGGER.warning("semantic_controller_unwrapped_json")
+                break
+        if payload is not None:
+            error = None
+        else:
+            # Preserve the legacy sentinel protocol during rolling upgrades. The
+            # current JSON-schema path always supplies the semantic fields.
+            route, _, _ = parse_speech_model_output(text)
+            if not any(marker in text for marker in (
+                AGENT_SENTINEL, NEW_AGENT_SENTINEL, SAY_SENTINEL, IGNORE_SENTINEL,
+                "[[OPENCLAW_SESSION:",
+            )):
+                raise ValueError("semantic controller returned invalid JSON") from error
+            action = route in {"agent", "new_agent", "session"}
+            return TurnUnderstanding(
+                True, 1.0, "request" if action else "statement", "new",
+                action, False, False, transcript, "legacy sentinel decision",
+            )
     if not isinstance(payload, dict):
         raise ValueError("semantic controller returned a non-object")
     if "speech_act" not in payload and {"route", "reply", "session_key"} <= payload.keys():
@@ -1513,7 +1583,10 @@ class LiveConversationService:
         # A monotonic nanosecond suffix was a 15-to-19 digit number which could
         # leak into status speech and be dictated in full. A 48-bit opaque token
         # remains collision-resistant without looking like a giant cardinal.
-        return f"agent:main:live-conversation-{slug or 'task'}-{secrets.token_hex(6)}"
+        suffix = secrets.token_hex(6)
+        if suffix.isdigit():
+            suffix = "a" + suffix[1:]
+        return f"agent:main:live-conversation-{slug or 'task'}-{suffix}"
 
     def register_agent_session(
         self, session_key: str, request: str, origin_turn_id: str | None = None
@@ -1860,28 +1933,29 @@ class LiveConversationService:
     async def finalize_online_transcript(
         self, audio: bytes, state: OnlineTranscript
     ) -> str:
-        sample_count = len(audio) // 2
-        max_window_samples = round(ONLINE_ASR_WINDOW_SECONDS * SAMPLE_RATE)
-        # A final decode of a normal-length turn must include the actual onset.
-        # LocalAgreement advances decode_from_sample as prefixes stabilize; using
-        # that rolling offset here made the final pass 1-2 seconds shorter than
-        # the captured turn and could replace a correct partial with a transcript
-        # missing its first words. Long turns still use the bounded stable-prefix
-        # tail so input duration remains uncapped.
-        if sample_count <= max_window_samples:
-            hypothesis = await self.transcribe(audio, purpose="final")
-            return hypothesis or state.display()
-        start_sample = max(state.decode_from_sample, sample_count - max_window_samples)
-        hypothesis = await self.transcribe(
-            audio[start_sample * 2:],
-            purpose="final",
-            initial_prompt=" ".join(state.stable_words[-48:]),
-        )
-        return state.final(hypothesis)
+        # Online hypotheses remain windowed for latency, but final recognition
+        # must see the entire utterance. Reusing the rolling 14-second tail here
+        # discarded sentence beginnings whenever John spoke slowly or paused.
+        hypothesis = await self.transcribe(audio, purpose="final")
+        return hypothesis or state.display()
 
     async def endpoint_decision(self, audio: bytes, transcript: str = "") -> TurnDecision:
         if self.semantic_turn is not None:
-            return await asyncio.to_thread(self.semantic_turn.predict, audio)
+            acoustic = await asyncio.to_thread(self.semantic_turn.predict, audio)
+            if not acoustic.complete or not transcript.strip():
+                return acoustic
+            semantic = await self.semantic_endpoint_decision(transcript)
+            if semantic is None:
+                # Failure to establish semantic completeness must not cut the
+                # speaker off. The browser's hard endpoint remains a bounded
+                # fallback if no more speech arrives.
+                return TurnDecision(False, 0.0, f"{acoustic.source}+semantic-error")
+            complete, confidence = semantic
+            return TurnDecision(
+                complete and confidence >= 0.7,
+                min(acoustic.probability, confidence),
+                f"{acoustic.source}+semantic",
+            )
         # Conservative fallback is explicit and observable rather than being
         # misrepresented as model-based semantic endpointing.
         unfinished = bool(re.search(
@@ -1889,6 +1963,82 @@ class LiveConversationService:
             transcript.strip(), re.I,
         ))
         return TurnDecision(not unfinished, 0.5 if not unfinished else 0.0, "text-fallback")
+
+    async def semantic_endpoint_decision(
+        self, transcript: str
+    ) -> tuple[bool, float] | None:
+        """Veto premature acoustic endpoints with a meaning-level judgment."""
+        payload = {
+            "model": SPEECH_MODEL,
+            "keep_alive": SPEECH_MODEL_KEEP_ALIVE,
+            "stream": False,
+            "think": False,
+            "format": SEMANTIC_ENDPOINT_SCHEMA,
+            "messages": [
+                {"role": "system", "content": (
+                    "Judge whether the speaker has expressed a semantically complete "
+                    "turn that can be answered now. Meaning and discourse intent matter, "
+                    "not punctuation or a fixed word list. A grammatical clause is still "
+                    "incomplete when it promises, introduces, or explicitly reserves a "
+                    "question, condition, explanation, contrast, or continuation that has "
+                    "not yet been spoken. Ignore punctuation inserted by ASR and ask whether "
+                    "all required semantic arguments are present. For example, 'Which season "
+                    "comes immediately after?' is incomplete because what it comes after is "
+                    "missing; 'Which season comes immediately after spring?' is complete. "
+                    "'What is the usual colour of?' and 'Could you tell me whether?' are "
+                    "incomplete because their objects or propositions are missing. Return only "
+                    "the required JSON object."
+                )},
+                {"role": "user", "content": transcript},
+            ],
+            "options": {"temperature": 0, "num_predict": 96, "num_ctx": 1024},
+        }
+        timeout = aiohttp.ClientTimeout(total=4)
+        last_error: Exception | None = None
+        for attempt in range(2):
+            request_payload = payload
+            if attempt:
+                request_payload = {
+                    **payload,
+                    "messages": [
+                        *payload["messages"],
+                        {"role": "system", "content": (
+                            "The prior output did not match the schema. Return exactly "
+                            "one JSON object with boolean complete, numeric confidence, "
+                            "and string reason. No other keys or text."
+                        )},
+                    ],
+                }
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(
+                        SPEECH_MODEL_URL, json=request_payload
+                    ) as response:
+                        response.raise_for_status()
+                        result = await response.json()
+                content = str(result.get("message", {}).get("content", "")).strip()
+                parsed = json.loads(content)
+                complete = parsed.get("complete")
+                confidence = parsed.get("confidence")
+                if not isinstance(complete, bool):
+                    raise ValueError("missing complete")
+                if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+                    raise ValueError("missing confidence")
+                LOGGER.info(
+                    "semantic_endpoint_complete complete=%s confidence=%.3f reason=%r "
+                    "transcript=%r attempt=%d",
+                    complete, float(confidence), str(parsed.get("reason") or "")[:160],
+                    transcript, attempt + 1,
+                )
+                return complete, float(confidence)
+            except Exception as error:
+                last_error = error
+                LOGGER.warning(
+                    "semantic_endpoint_controller_retry attempt=%d error=%s",
+                    attempt + 1, error,
+                )
+        LOGGER.warning("semantic_endpoint_controller_failed error=%s", last_error)
+        return None
 
     async def prefetch_for_partial(self, stable_text: str) -> str | None:
         """Warm read-only authoritative context from immutable ASR text."""
@@ -2100,6 +2250,26 @@ class LiveConversationService:
                 except asyncio.TimeoutError:
                     pass
         capabilities = self.capabilities
+        controller_text = text
+        pending_for_prompt = self.pending_fragment
+        fragment_resolution: tuple[str, bool, float, str, str] | None = None
+        if self.pending_fragment:
+            fragment_resolution = await self.semantic_fragment_resolution(
+                self.pending_fragment, text
+            )
+            if fragment_resolution is not None:
+                relation, fragment_complete, confidence, assembled, reason = (
+                    fragment_resolution
+                )
+                LOGGER.info(
+                    "semantic_fragment_resolution relation=%s complete=%s "
+                    "confidence=%.3f pending=%r current=%r assembled=%r reason=%r",
+                    relation, fragment_complete, confidence, self.pending_fragment,
+                    text, assembled, reason,
+                )
+                if relation in {"continuation", "correction"} and confidence >= 0.7:
+                    controller_text = assembled
+                    pending_for_prompt = ""
         payload = {
             "model": SPEECH_MODEL,
             "keep_alive": SPEECH_MODEL_KEEP_ALIVE,
@@ -2116,12 +2286,12 @@ class LiveConversationService:
                     confirmation_required=self.confirmation_required,
                 )},
                 {"role": "system", "content": turn_understanding_prompt(
-                    text,
-                    pending_fragment=self.pending_fragment,
+                    controller_text,
+                    pending_fragment=pending_for_prompt,
                     recent_context=self.prompt_history(),
                 )},
                 *self.prompt_history(),
-                {"role": "user", "content": text},
+                {"role": "user", "content": controller_text},
             ],
             "options": {
                 "temperature": 0,
@@ -2192,7 +2362,56 @@ class LiveConversationService:
                 result.get("eval_duration", 0) / 1_000_000,
             )
             raw_decision = result.get("message", {}).get("content", "")
-            understanding = parse_turn_understanding(raw_decision, text)
+            try:
+                understanding = parse_turn_understanding(raw_decision, controller_text)
+            except ValueError as first_error:
+                if "invalid JSON" not in str(first_error):
+                    raise
+                LOGGER.warning(
+                    "semantic_controller_invalid_json_retry output_chars=%d",
+                    len(raw_decision),
+                )
+                repair_payload = {
+                    **payload,
+                    "stream": False,
+                    "messages": [
+                        *payload["messages"],
+                        {"role": "system", "content": (
+                            "Your previous response was not valid JSON. Return exactly one "
+                            "complete JSON object matching the supplied schema. Include every "
+                            "required field. For a complete direct question or statement, reply "
+                            "must contain the concise natural-language response to speak. Do not "
+                            "use Markdown or explanatory text."
+                        )},
+                    ],
+                    "options": {
+                        **payload["options"],
+                        "num_predict": SPEECH_RETRY_NUM_PREDICT,
+                    },
+                }
+                async with aiohttp.ClientSession(timeout=timeout) as repair_session:
+                    async with repair_session.post(
+                        SPEECH_MODEL_URL, json=repair_payload
+                    ) as repair_response:
+                        repair_response.raise_for_status()
+                        repair_result = await repair_response.json()
+                raw_decision = repair_result.get("message", {}).get("content", "")
+                understanding = parse_turn_understanding(raw_decision, controller_text)
+                result = repair_result
+                LOGGER.info("semantic_controller_json_retry_succeeded")
+            if fragment_resolution is not None:
+                relation, fragment_complete, confidence, assembled, reason = (
+                    fragment_resolution
+                )
+                if relation in {"continuation", "correction"} and confidence >= 0.7:
+                    understanding = replace(
+                        understanding,
+                        complete=fragment_complete and understanding.complete,
+                        confidence=min(confidence, understanding.confidence),
+                        relation=relation,
+                        assembled_text=assembled,
+                        reason=f"{reason}; {understanding.reason}",
+                    )
             self.last_turn_understanding = understanding
             LOGGER.info(
                 "turn_understanding complete=%s confidence=%.3f act=%s relation=%s "
@@ -2214,7 +2433,9 @@ class LiveConversationService:
                 )
                 return "direct", reply, None
             if not understanding.complete:
-                self.pending_fragment = text.strip()
+                self.pending_fragment = (
+                    understanding.assembled_text or controller_text
+                ).strip()
                 return "wait", "", None
             effective_text = understanding.assembled_text or text
             if self.pending_fragment:
@@ -2277,11 +2498,132 @@ class LiveConversationService:
             if route == "session" and target_session not in self.session_keys:
                 LOGGER.warning("speech_supervisor_invalid_session target=%s", target_session)
                 route, target_session = "agent", None
+            if route == "direct" and not reply:
+                LOGGER.warning("speech_supervisor_missing_direct_reply_generating_answer")
+                reply = await self.generate_direct_answer(effective_text)
             if route != "ignore" and not reply:
                 raise ValueError("speech model returned no speakable text")
             return route, reply, target_session
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
             raise RuntimeError(f"Speech supervisor unavailable: {error}") from error
+
+    async def semantic_fragment_resolution(
+        self, pending: str, current: str
+    ) -> tuple[str, bool, float, str, str] | None:
+        """Resolve separately committed speech fragments by meaning, not tokens."""
+        payload = {
+            "model": SPEECH_MODEL,
+            "keep_alive": SPEECH_MODEL_KEEP_ALIVE,
+            "stream": False,
+            "think": False,
+            # Ollama's schema-constrained decoder can prematurely stop after
+            # the first enum property on this small focused contract. JSON mode
+            # plus strict parsing below reliably returns and validates all five
+            # fields while preserving the same safety boundary.
+            "format": "json",
+            "messages": [
+                {"role": "system", "content": (
+                    "You resolve two consecutive speech transcriptions. Decide whether "
+                    "the newer transcription completes the unresolved earlier thought, "
+                    "corrects/replaces it, or starts an unrelated new turn. Judge their "
+                    "semantic roles and missing arguments; do not use a fixed connector-word "
+                    "list and do not trust ASR punctuation. Use continuation when the newer "
+                    "words supply a missing subject, object, predicate, complement, condition, "
+                    "or proposition. For continuation, assembled_text must express the full "
+                    "combined meaning naturally without the speaker's staging instructions. "
+                    "For correction, assembled_text must contain the corrected meaning. For "
+                    "new, assembled_text must contain only the newer turn. complete means the "
+                    "assembled user turn is now answerable or actionable. Return exactly one "
+                    "compact JSON object with the five keys relation, complete, confidence, "
+                    "assembled_text, and reason. Example shape: "
+                    "{\"relation\":\"continuation\",\"complete\":true,"
+                    "\"confidence\":0.99,\"assembled_text\":\"What is the capital of "
+                    "the nation called Canada?\",\"reason\":\"The newer phrase supplies "
+                    "the missing object.\"}"
+                )},
+                {"role": "user", "content": json.dumps({
+                    "unresolved_earlier_transcription": pending,
+                    "newer_transcription": current,
+                }, ensure_ascii=False)},
+            ],
+            "options": {"temperature": 0, "num_predict": 160, "num_ctx": 1536},
+        }
+        timeout = aiohttp.ClientTimeout(total=8)
+        last_error: Exception | None = None
+        for attempt in range(2):
+            request_payload = payload
+            if attempt:
+                request_payload = {
+                    **payload,
+                    "messages": [
+                        *payload["messages"],
+                        {"role": "system", "content": (
+                            "The prior output was invalid. Return exactly one schema-matching "
+                            "JSON object and no other text."
+                        )},
+                    ],
+                }
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(
+                        SPEECH_MODEL_URL, json=request_payload
+                    ) as response:
+                        response.raise_for_status()
+                        result = await response.json()
+                content = str(result.get("message", {}).get("content", "")).strip()
+                parsed = json.loads(content)
+                relation = parsed.get("relation")
+                complete = parsed.get("complete")
+                confidence = parsed.get("confidence")
+                assembled = parsed.get("assembled_text")
+                reason = parsed.get("reason")
+                if relation not in {"new", "continuation", "correction"}:
+                    raise ValueError("invalid fragment relation")
+                if not isinstance(complete, bool):
+                    raise ValueError("invalid fragment completeness")
+                if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+                    raise ValueError("invalid fragment confidence")
+                if not isinstance(assembled, str) or not assembled.strip():
+                    raise ValueError("missing assembled fragment text")
+                return (
+                    relation, complete, float(confidence), assembled.strip(),
+                    str(reason or "semantic fragment resolution")[:240],
+                )
+            except Exception as error:
+                last_error = error
+                LOGGER.warning(
+                    "semantic_fragment_controller_retry attempt=%d error=%s",
+                    attempt + 1, error,
+                )
+        LOGGER.warning("semantic_fragment_controller_failed error=%s", last_error)
+        return None
+
+    async def generate_direct_answer(self, text: str) -> str:
+        """Recover a missing direct reply using the real local conversation model."""
+        payload = {
+            "model": SPEECH_MODEL,
+            "keep_alive": SPEECH_MODEL_KEEP_ALIVE,
+            "stream": False,
+            "think": False,
+            "messages": [
+                {"role": "system", "content": (
+                    "You are Jarvis in a live spoken conversation. Respond directly and "
+                    "naturally to the user's complete turn in one or two concise spoken "
+                    "sentences. Do not mention routing, tools, agents, or this instruction."
+                )},
+                {"role": "user", "content": text},
+            ],
+            "options": {"temperature": 0.2, "num_predict": 128, "num_ctx": 2048},
+        }
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(SPEECH_MODEL_URL, json=payload) as response:
+                response.raise_for_status()
+                result = await response.json()
+        reply = str(result.get("message", {}).get("content", "")).strip()
+        if not reply:
+            raise ValueError("speech model returned no direct answer")
+        return reply
 
     async def send_spoken_response(
         self,
@@ -2292,6 +2634,7 @@ class LiveConversationService:
         message_type: str = "reply",
         expected_generation: int | None = None,
         display_text: str | None = None,
+        pcm_override: bytes | None = None,
     ) -> int:
         """Synthesize and stream one complete spoken response."""
         generation = (
@@ -2318,9 +2661,9 @@ class LiveConversationService:
                 )
                 return -1
             await socket.send_json({"type": "state", "state": "speaking", "route": route})
-            speech_parts = split_spoken_text(text)
+            speech_parts = [""] if pcm_override is not None else split_spoken_text(text)
             tts_started = time.perf_counter()
-            pcm = await self.tts.synthesize(
+            pcm = pcm_override if pcm_override is not None else await self.tts.synthesize(
                 speech_parts[0], tts_speed_for(speech_parts[0], route, self.tts.speed)
             )
             tts_ms = round((time.perf_counter() - tts_started) * 1000)
@@ -2337,7 +2680,7 @@ class LiveConversationService:
             interrupted = False
             for index, _ in enumerate(speech_parts):
                 next_synthesis: asyncio.Task[bytes] | None = None
-                if index + 1 < len(speech_parts):
+                if pcm_override is None and index + 1 < len(speech_parts):
                     next_text = speech_parts[index + 1]
                     next_synthesis = asyncio.create_task(self.tts.synthesize(
                         next_text, tts_speed_for(next_text, route, self.tts.speed)
@@ -2568,7 +2911,7 @@ def render_page() -> str:
 <title>Live Conversation</title><style>
 html,body{margin:0;min-height:100%;background:#060a10;color:#f4f8fc;font-family:system-ui,sans-serif}main{padding:18px 14px 28px;max-width:760px;margin:auto}h1{font-size:23px;margin:0 0 5px}.sub{color:#9aa9b8;margin:0 0 7px}.setting{color:#7fcbb4;font-size:12px;margin-bottom:16px}.state{font-size:18px;color:#54e0b4;margin:12px 0}.meter{height:14px;background:#101820;border:1px solid #304050;border-radius:8px;overflow:hidden}.meter div{height:100%;width:0;background:#00ab7e;transition:width 60ms}.buttons{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:14px 0}button{min-height:48px;border:1px solid #00ab7e;border-radius:8px;background:#1e2630;color:#fff;font-size:15px}.card{background:#0a0e14;border-radius:8px;padding:12px;margin-top:10px;min-height:48px}.label{color:#8797a8;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.metrics{font-size:12px;color:#aebdca;margin-top:12px}.route{display:inline-block;border:1px solid #36556a;border-radius:10px;padding:2px 7px;font-size:11px;margin-left:6px}.history{margin-top:18px}.history-list{display:flex;flex-direction:column;gap:8px;margin-top:8px}.history-empty{color:#718294;font-size:13px}.message{max-width:88%;padding:9px 11px;border-radius:12px;line-height:1.35;white-space:pre-wrap;overflow-wrap:anywhere}.message.user{align-self:flex-end;background:#0e5948}.message.assistant{align-self:flex-start;background:#182431}.message-role{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:#9db0bf;margin-bottom:3px}
 </style></head><body><main><h1>Live Conversation</h1><p class="sub">Accurate local speech recognition. Simple requests answer here; complex work routes to the right OpenClaw session.</p><div id="confirmation" class="setting">Action confirmation: loading…</div><div id="state" class="state">Ready</div><div class="meter"><div id="bar"></div></div><div class="buttons"><button id="start">Start conversation</button><button id="stop">Stop</button></div><div class="card"><div class="label">You</div><div id="user">—</div></div><div class="card"><div class="label">Assistant <span id="route" class="route">waiting</span></div><div id="assistant">—</div></div><div id="metrics" class="metrics"></div><section class="history"><div class="label">Recent messages · newest first · last 120</div><div id="history" class="history-list"><div class="history-empty">No conversation history yet.</div></div></section></main><script>
-const state=document.getElementById('state'),bar=document.getElementById('bar'),user=document.getElementById('user'),assistant=document.getElementById('assistant'),route=document.getElementById('route'),metrics=document.getElementById('metrics'),confirmation=document.getElementById('confirmation'),historyList=document.getElementById('history');const AUDIO_FRAME_MS=20,START_CONFIRM_MS=300,ONSET_PREROLL_MS=1500,PREBUFFER_FRAMES=Math.ceil((START_CONFIRM_MS+ONSET_PREROLL_MS)/AUDIO_FRAME_MS),MAX_DRAIN_FRAMES=12,SEMANTIC_CHECK_MS=350,HARD_ENDPOINT_MS=1900;let ws,timer,recording=false,awaitingResponse=false,responseActive=false,responseTailTimer=null,speechMs=0,silenceMs=0,candidateSpeechMs=0,pre=[],historyMessages=[],pendingTranscript='',endpointPending=false,nextEndpointAt=SEMANTIC_CHECK_MS,confirmationMode='automatic';const confirmationToggle=document.createElement('button');confirmationToggle.textContent='Toggle confirmation';confirmation.insertAdjacentElement('afterend',confirmationToggle);
+const state=document.getElementById('state'),bar=document.getElementById('bar'),user=document.getElementById('user'),assistant=document.getElementById('assistant'),route=document.getElementById('route'),metrics=document.getElementById('metrics'),confirmation=document.getElementById('confirmation'),historyList=document.getElementById('history');const AUDIO_FRAME_MS=20,START_CONFIRM_MS=300,ONSET_PREROLL_MS=2500,PREBUFFER_FRAMES=Math.ceil((START_CONFIRM_MS+ONSET_PREROLL_MS)/AUDIO_FRAME_MS),MAX_DRAIN_FRAMES=24,SEMANTIC_CHECK_MS=750,HARD_ENDPOINT_MS=3500;let ws,timer,recording=false,awaitingResponse=false,responseActive=false,responseTailTimer=null,speechMs=0,silenceMs=0,candidateSpeechMs=0,pre=[],historyMessages=[],pendingTranscript='',endpointPending=false,nextEndpointAt=SEMANTIC_CHECK_MS,confirmationMode='automatic';const confirmationToggle=document.createElement('button');confirmationToggle.textContent='Toggle confirmation';confirmation.insertAdjacentElement('afterend',confirmationToggle);
 function renderHistory(){historyList.replaceChildren();if(!historyMessages.length){const empty=document.createElement('div');empty.className='history-empty';empty.textContent='No conversation history yet.';historyList.appendChild(empty);return}for(const message of historyMessages.slice(-120).reverse()){const bubble=document.createElement('div');bubble.className='message '+message.role;const who=document.createElement('div');who.className='message-role';who.textContent=message.role==='user'?'You':'Assistant';const content=document.createElement('div');content.textContent=message.content;bubble.append(who,content);historyList.appendChild(bubble)}}
 function addHistory(role,content){if(!content)return;historyMessages.push({role,content});historyMessages=historyMessages.slice(-120);renderHistory()}
 function rms(b64){const s=atob(b64||'');let sum=0,n=0;for(let i=0;i+1<s.length;i+=2){let v=(s.charCodeAt(i)&255)|((s.charCodeAt(i+1)&255)<<8);if(v&32768)v-=65536;const f=v/32768;sum+=f*f;n++}return n?Math.sqrt(sum/n):0}
@@ -2898,11 +3241,12 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
                     ):
                         backchannel_used = True
                         await service.send_spoken_response(
-                            socket, BACKCHANNEL_TTS_TEXT, "backchannel",
+                            socket, "", "backchannel",
                             f"backchannel-{time.monotonic_ns()}",
                             message_type="backchannel",
                             expected_generation=service.speech_generation,
                             display_text=BACKCHANNEL_DISPLAY_TEXT,
+                            pcm_override=affirmative_hum_pcm(),
                         )
                 except Exception as error:
                     LOGGER.warning("semantic_endpoint_failed error=%s", error)

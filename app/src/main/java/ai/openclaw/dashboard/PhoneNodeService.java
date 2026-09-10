@@ -13,6 +13,7 @@ import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.net.ConnectivityManager;
 import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.os.Binder;
 import android.os.BatteryManager;
 import android.os.Build;
@@ -37,6 +38,8 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
     private static final String CHANNEL_ID = "openclaw_phone_node";
     private static final int NOTIFICATION_ID = 41002;
     private static final long MAX_RETRY_MS = 60_000L;
+    private static final long CONNECT_TIMEOUT_MS = 25_000L;
+    private static final long WATCHDOG_INTERVAL_MS = 15_000L;
 
     interface ActivityCommandHandler {
         JSONObject handle(String command, JSONObject params) throws Exception;
@@ -53,6 +56,7 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
     private final IBinder binder = new LocalBinder();
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable reconnectRunnable = this::connectNow;
+    private final Runnable watchdogRunnable = this::runConnectionWatchdog;
     private SharedPreferences prefs;
     private OpenClawClient client;
     private AndroidCapabilityBroker broker;
@@ -64,6 +68,9 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
     private boolean manualStop;
     private boolean connecting;
     private int retryAttempt;
+    private long connectStartedAtMs;
+    private long nextReconnectAtMs;
+    private String activeGatewayUrl = "";
 
     @Override public void onCreate() {
         super.onCreate();
@@ -79,6 +86,7 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
         client = new OpenClawClient(identityStore, this, this::handleCommand);
         createNotificationChannel();
         registerNetworkCallback();
+        handler.post(watchdogRunnable);
         updateState("starting", "", false);
         audit.record("node", "service_created", new JSONObject());
     }
@@ -89,6 +97,7 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
             prefs.edit().putBoolean("nodeEnabled", false).apply();
             manualStop = true;
             handler.removeCallbacks(reconnectRunnable);
+            handler.removeCallbacks(watchdogRunnable);
             client.disconnect();
             updateState("stopped", "Stopped by user", false);
             audit.record("node", "service_stopped", fields("reason", "user"));
@@ -100,12 +109,13 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
         prefs.edit().putBoolean("nodeEnabled", true).apply();
         manualStop = false;
         startForeground(NOTIFICATION_ID, buildNotification("Connecting"));
-        if (ACTION_RECONNECT.equals(action)) {
-            handler.removeCallbacks(reconnectRunnable);
-            client.disconnect();
-            connecting = false;
-            retryAttempt = 0;
+        String configuredGateway = prefs.getString("url", "");
+        boolean configurationChanged = !activeGatewayUrl.isEmpty()
+                && !activeGatewayUrl.equals(configuredGateway == null ? "" : configuredGateway.trim());
+        if (ACTION_RECONNECT.equals(action) || configurationChanged) {
+            resetConnection(ACTION_RECONNECT.equals(action) ? "manual_repair" : "configuration_changed");
         }
+        scheduleWatchdog();
         connectNow();
         return START_STICKY;
     }
@@ -115,6 +125,7 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
     @Override public void onDestroy() {
         manualStop = true;
         handler.removeCallbacks(reconnectRunnable);
+        handler.removeCallbacks(watchdogRunnable);
         if (client != null) client.disconnect();
         if (connectivityManager != null && networkCallback != null) {
             try { connectivityManager.unregisterNetworkCallback(networkCallback); } catch (Exception ignored) { }
@@ -145,14 +156,26 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
     void clearAudit() { audit.clear(); }
 
     private synchronized void connectNow() {
-        if (manualStop || connecting || client.isConnected()) return;
+        if (manualStop) return;
+        if (!hasUsableNetwork()) {
+            updateState("network_wait", "Network unavailable", false);
+            return;
+        }
         String rawUrl = prefs.getString("url", "");
         if (rawUrl == null || rawUrl.trim().isEmpty()) {
             updateState("waiting_for_configuration", "Gateway URL is missing", false);
             return;
         }
+        String configuredGateway = rawUrl.trim();
+        if (client.isConnected() && configuredGateway.equals(activeGatewayUrl)) return;
+        long now = System.currentTimeMillis();
+        if (connecting && now - connectStartedAtMs < CONNECT_TIMEOUT_MS) return;
+        if (connecting || client.isConnected()) resetConnection("stale_or_changed_connection");
         try {
             connecting = true;
+            connectStartedAtMs = now;
+            nextReconnectAtMs = 0L;
+            activeGatewayUrl = configuredGateway;
             updateState("connecting", "", false);
             audit.record("node", "connect_attempt", new JSONObject()
                     .put("attempt", retryAttempt + 1)
@@ -294,6 +317,8 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
 
     @Override public void onConnected(JSONObject hello) {
         connecting = false;
+        connectStartedAtMs = 0L;
+        nextReconnectAtMs = 0L;
         retryAttempt = 0;
         handler.removeCallbacks(reconnectRunnable);
         String nodeId = client.nodeId();
@@ -324,6 +349,7 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
         prefs.edit().putString("trace.node.lastError", message == null ? "" : message).apply();
         updateState("error", message, false);
         audit.record("node", "error", fields("message", message == null ? "" : message));
+        scheduleReconnect("client_error");
     }
 
     @Override public void onDisconnected(String reason) {
@@ -359,11 +385,14 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
 
     private void scheduleReconnect(String reason) {
         if (manualStop || !prefs.getBoolean("nodeEnabled", true)) return;
+        long now = System.currentTimeMillis();
+        if (nextReconnectAtMs > now) return;
         handler.removeCallbacks(reconnectRunnable);
         retryAttempt++;
         long base = Math.min(MAX_RETRY_MS, 1000L << Math.min(retryAttempt - 1, 6));
         long jitter = ThreadLocalRandom.current().nextLong(Math.max(1L, base / 4L));
         long delay = Math.min(MAX_RETRY_MS, base + jitter);
+        nextReconnectAtMs = now + delay;
         prefs.edit().putInt("trace.node.retryAttempt", retryAttempt).apply();
         updateState("retry_wait", reason, false);
         audit.record("node", "reconnect_scheduled", fields(
@@ -371,6 +400,50 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
                 "delayMs", delay,
                 "reason", reason));
         handler.postDelayed(reconnectRunnable, delay);
+    }
+
+    private synchronized void resetConnection(String reason) {
+        handler.removeCallbacks(reconnectRunnable);
+        client.disconnect();
+        connecting = false;
+        connectStartedAtMs = 0L;
+        nextReconnectAtMs = 0L;
+        retryAttempt = 0;
+        audit.record("node", "connection_reset", fields("reason", reason));
+    }
+
+    private void scheduleWatchdog() {
+        handler.removeCallbacks(watchdogRunnable);
+        handler.postDelayed(watchdogRunnable, WATCHDOG_INTERVAL_MS);
+    }
+
+    private boolean hasUsableNetwork() {
+        if (connectivityManager == null) return true;
+        Network network = connectivityManager.getActiveNetwork();
+        if (network == null) return false;
+        NetworkCapabilities capabilities = connectivityManager.getNetworkCapabilities(network);
+        return capabilities != null
+                && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+    }
+
+    private synchronized void runConnectionWatchdog() {
+        if (manualStop || !prefs.getBoolean("nodeEnabled", false)) return;
+        long now = System.currentTimeMillis();
+        String configured = prefs.getString("url", "");
+        configured = configured == null ? "" : configured.trim();
+        if (!activeGatewayUrl.isEmpty() && !activeGatewayUrl.equals(configured)) {
+            resetConnection("watchdog_configuration_changed");
+            connectNow();
+        } else if (connecting && now - connectStartedAtMs >= CONNECT_TIMEOUT_MS) {
+            audit.record("node", "connect_timeout", fields("elapsedMs", now - connectStartedAtMs));
+            resetConnection("connect_timeout");
+            connectNow();
+        } else if (!client.isConnected() && !connecting
+                && (nextReconnectAtMs == 0L || now >= nextReconnectAtMs)) {
+            audit.record("node", "watchdog_reconnect", new JSONObject());
+            connectNow();
+        }
+        scheduleWatchdog();
     }
 
     private void updateState(String state, String error, boolean connected) {
@@ -430,12 +503,13 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
         networkCallback = new ConnectivityManager.NetworkCallback() {
             @Override public void onAvailable(Network network) {
                 audit.record("network", "available", new JSONObject());
-                handler.removeCallbacks(reconnectRunnable);
+                resetConnection("network_available");
                 handler.post(reconnectRunnable);
             }
 
             @Override public void onLost(Network network) {
                 audit.record("network", "lost", new JSONObject());
+                resetConnection("network_lost");
                 updateState("network_lost", "Network unavailable", false);
             }
         };
