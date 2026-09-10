@@ -249,8 +249,7 @@ final class OpenClawClient {
         if (payload == null) return;
         String invokeId = payload.optString("invokeId", payload.optString("id", ""));
         String command = payload.optString("command", "");
-        JSONObject requestParams = payload.optJSONObject("params");
-        if (requestParams == null) requestParams = new JSONObject();
+        JSONObject requestParams = decodeInvokeParams(payload);
         JSONObject trace = requestParams.optJSONObject("_trace");
         String correlationId = requestParams.optString("correlationId", trace == null ? "" : trace.optString("correlationId", ""));
         if (correlationId.isEmpty()) correlationId = UUID.randomUUID().toString();
@@ -289,6 +288,24 @@ final class OpenClawClient {
                     .put("message", result.optString("message", "Android command failed")));
         }
         request("node.invoke.result", params, ignored -> listener.onLog("Handled " + command), error -> listener.onError("Invoke reply failed: " + error));
+    }
+
+    /**
+     * Gateway node.invoke events carry command arguments as serialized JSON in
+     * paramsJSON. Accept the legacy object-shaped params field as a fallback so
+     * older gateways and local test harnesses remain compatible.
+     */
+    static JSONObject decodeInvokeParams(JSONObject payload) throws Exception {
+        if (payload.has("paramsJSON") && !payload.isNull("paramsJSON")) {
+            Object encoded = payload.get("paramsJSON");
+            if (encoded instanceof JSONObject) return (JSONObject) encoded;
+            if (!(encoded instanceof String)) throw new Exception("Invalid node invoke paramsJSON type");
+            String json = ((String) encoded).trim();
+            if (json.isEmpty() || "null".equals(json)) return new JSONObject();
+            return new JSONObject(json);
+        }
+        JSONObject legacy = payload.optJSONObject("params");
+        return legacy == null ? new JSONObject() : legacy;
     }
 
     private JSONObject defaultResult(String command) throws Exception {
