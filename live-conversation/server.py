@@ -64,7 +64,7 @@ SPEECH_OUTPUT_SCHEMA = {
             "enum": ["direct", "agent", "new_agent", "session", "ignore"],
         },
         "reply": {"type": "string"},
-        "session_key": {"type": "string"},
+        "session_key": {"type": ["string", "null"]},
     },
     "required": ["route", "reply", "session_key"],
     "additionalProperties": False,
@@ -490,6 +490,55 @@ class TurnUnderstanding:
     reason: str
 
 
+VALID_SPEECH_ACTS = frozenset({
+    "request", "question", "answer", "statement", "correction",
+    "continuation", "meta", "control", "ambient",
+})
+SPEECH_ACT_ALIASES = {
+    "acknowledgement": "answer",
+    "acknowledgment": "answer",
+    "command": "request",
+    "instruction": "request",
+    "clarification": "correction",
+    "repair": "correction",
+    "observation": "statement",
+    "feedback": "statement",
+    "response": "answer",
+}
+
+
+def normalize_speech_act(value: Any, payload: dict[str, Any]) -> tuple[str, str | None]:
+    """Canonicalize descriptive controller labels without changing its route.
+
+    Speech-act taxonomy is diagnostic metadata. An otherwise valid semantic
+    decision must not fail merely because the model uses a synonymous label.
+    Unknown labels are derived from the controller's structured semantics,
+    never from transcript keywords.
+    """
+    raw = re.sub(r"[\s-]+", "_", str(value or "").strip().lower())
+    canonical = SPEECH_ACT_ALIASES.get(raw, raw)
+    if canonical in VALID_SPEECH_ACTS:
+        return canonical, raw if canonical != raw else None
+
+    relation = str(payload.get("relation") or "").strip().lower()
+    route = str(payload.get("route") or "").strip().lower()
+    if relation == "meta":
+        canonical = "meta"
+    elif relation == "correction":
+        canonical = "correction"
+    elif relation == "continuation":
+        canonical = "continuation"
+    elif payload.get("actionable") is True or route in {"agent", "new_agent", "session"}:
+        canonical = "request"
+    elif payload.get("requires_grounding") is True:
+        canonical = "question"
+    elif route == "ignore":
+        canonical = "ambient"
+    else:
+        canonical = "statement"
+    return canonical, raw or "missing"
+
+
 def turn_understanding_prompt(
     transcript: str,
     pending_fragment: str = "",
@@ -508,6 +557,8 @@ Return exactly one JSON object containing every one of these keys, even when a v
 `actionable`, `requires_grounding`, `supersedes_previous`, `assembled_text`, and `reason`.
 Never omit a key. `confidence` must be a JSON number from 0 through 1. `relation` must be exactly
 one of `new`, `continuation`, `correction`, or `meta`; incompleteness belongs only in `complete`.
+- `speech_act` must be exactly one of `request`, `question`, `answer`, `statement`, `correction`,
+  `continuation`, `meta`, `control`, or `ambient`. Do not invent a synonym or a new category.
 - `complete` is true only when the speaker has expressed a complete communicative act. A fluent-sounding clause can still be incomplete. "What are the latest updates for the" is incomplete because its object is missing. Do not let punctuation, silence, or acoustic endpoint confidence override missing meaning.
 - `speech_act` describes the whole utterance. `meta` means the speaker is asking about or correcting the assistant's immediately preceding behavior, plan, wording, or claim.
 - `relation` describes how this transcript relates to the unresolved fragment or recent dialogue. Use `continuation` when it completes the unresolved thought, `correction` when it replaces/repairs it, and `meta` for questions such as "What are you going to verify?"
@@ -643,7 +694,7 @@ def parse_speech_model_output(text: str) -> tuple[str, str, str | None]:
 
 
 def parse_turn_understanding(text: str, transcript: str) -> TurnUnderstanding:
-    """Parse the semantic controller strictly; fail closed on malformed output."""
+    """Parse safety fields strictly while normalizing descriptive taxonomy."""
     try:
         payload = json.loads(text.strip())
     except (TypeError, ValueError) as error:
@@ -669,13 +720,13 @@ def parse_turn_understanding(text: str, transcript: str) -> TurnUnderstanding:
             True, 1.0, "request" if action else "statement", "new",
             action, False, False, transcript, "legacy structured decision",
         )
-    speech_act = payload.get("speech_act")
+    speech_act, normalized_from = normalize_speech_act(payload.get("speech_act"), payload)
     relation = payload.get("relation")
-    if speech_act not in {
-        "request", "question", "answer", "statement", "correction",
-        "continuation", "meta", "control", "ambient",
-    }:
-        raise ValueError("semantic controller returned an invalid speech act")
+    if normalized_from:
+        LOGGER.warning(
+            "semantic_controller_normalized_speech_act raw=%r canonical=%s",
+            normalized_from, speech_act,
+        )
     if relation not in {"new", "continuation", "correction", "meta"}:
         raise ValueError("semantic controller returned an invalid relation")
     confidence = payload.get("confidence")

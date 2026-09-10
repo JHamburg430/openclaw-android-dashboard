@@ -437,6 +437,47 @@ class RoutingTests(unittest.TestCase):
         import asyncio
         asyncio.run(run_test())
 
+    def test_semantic_controller_normalizes_noncanonical_speech_act(self):
+        decision = semantic_decision(
+            "direct", "I heard that.", speech_act="acknowledgment",
+            assembled_text="That was one extra test.",
+        )
+        understanding = parse_turn_understanding(
+            json.dumps(decision), "That was one extra test."
+        )
+        self.assertEqual(understanding.speech_act, "answer")
+        self.assertTrue(understanding.complete)
+
+    def test_semantic_controller_derives_unknown_speech_act_from_structure(self):
+        decision = semantic_decision(
+            "agent", "I'll inspect it.", actionable=True,
+            speech_act="task_assignment", assembled_text="Please inspect it.",
+        )
+        understanding = parse_turn_understanding(
+            json.dumps(decision), "Please inspect it."
+        )
+        self.assertEqual(understanding.speech_act, "request")
+        self.assertTrue(understanding.actionable)
+
+    def test_noncanonical_speech_act_does_not_block_speech_reply(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.sessions_updated_at = time.monotonic()
+            service.capabilities_updated_at = time.monotonic()
+            decision = semantic_decision(
+                "direct", "I heard that.", speech_act="acknowledgment",
+                assembled_text="That was one extra test.",
+            )
+            client, _ = mock_semantic_model(decision)
+            with patch("server.aiohttp.ClientSession", return_value=client):
+                self.assertEqual(
+                    await service.speech_reply("That was one extra test."),
+                    ("direct", "I heard that.", None),
+                )
+
+        import asyncio
+        asyncio.run(run_test())
+
     def test_semantic_controller_distinguishes_meta_verify_from_lookup(self):
         async def run_test():
             service = LiveConversationService("agent:main:live-conversation", 1.15)
