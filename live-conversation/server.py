@@ -105,9 +105,8 @@ SEMANTIC_ENDPOINT_SCHEMA = {
     "properties": {
         "complete": {"type": "boolean"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-        "reason": {"type": "string"},
     },
-    "required": ["complete", "confidence", "reason"],
+    "required": ["complete", "confidence"],
     "additionalProperties": False,
 }
 FRAGMENT_RESOLUTION_SCHEMA = {
@@ -148,8 +147,11 @@ DEFAULT_DASHBOARD_REPO = "/home/john/openclaw-android-dashboard"
 MAX_HISTORY_MESSAGES = 120
 MAX_HISTORY_CHARS = 72_000
 MAX_CONVERSATION_EVENTS = 500
-PROMPT_HISTORY_MESSAGES = 32
-PROMPT_HISTORY_CHARS = 16_000
+# Routing only needs the immediate conversational neighborhood. A larger window
+# repeatedly filled the entire 8k model context, adding seconds of prompt
+# evaluation and duplicating history already supplied to the controller.
+PROMPT_HISTORY_MESSAGES = 8
+PROMPT_HISTORY_CHARS = 4_000
 WAKE_WORD = "jarvis"
 WAKE_WORD_ALIASES = frozenset(("jarvis", "jervis"))
 WAKE_WINDOW_SECONDS = 2.5
@@ -2219,7 +2221,7 @@ class LiveConversationService:
                     "missing; 'Which season comes immediately after spring?' is complete. "
                     "'What is the usual colour of?' and 'Could you tell me whether?' are "
                     "incomplete because their objects or propositions are missing. Return only "
-                    "the required JSON object."
+                    "the required compact JSON object with complete and confidence."
                 )},
                 {"role": "user", "content": transcript},
             ],
@@ -2227,7 +2229,7 @@ class LiveConversationService:
             # Asking Ollama for 1024 here evicted the warm 8192-token runner,
             # forcing a multi-second model reload during natural pauses.
             "options": {
-                "temperature": 0, "num_predict": 96,
+                "temperature": 0, "num_predict": 32,
                 "num_ctx": SPEECH_MODEL_CONTEXT,
             },
         }
@@ -2242,8 +2244,8 @@ class LiveConversationService:
                         *payload["messages"],
                         {"role": "system", "content": (
                             "The prior output did not match the schema. Return exactly "
-                            "one JSON object with boolean complete, numeric confidence, "
-                            "and string reason. No other keys or text."
+                            "one JSON object with boolean complete and numeric confidence. "
+                            "No other keys or text."
                         )},
                     ],
                 }
@@ -2263,10 +2265,9 @@ class LiveConversationService:
                 if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
                     raise ValueError("missing confidence")
                 LOGGER.info(
-                    "semantic_endpoint_complete complete=%s confidence=%.3f reason=%r "
+                    "semantic_endpoint_complete complete=%s confidence=%.3f "
                     "transcript=%r attempt=%d",
-                    complete, float(confidence), str(parsed.get("reason") or "")[:160],
-                    transcript, attempt + 1,
+                    complete, float(confidence), transcript, attempt + 1,
                 )
                 return complete, float(confidence)
             except Exception as error:
@@ -2526,7 +2527,9 @@ class LiveConversationService:
                 {"role": "system", "content": turn_understanding_prompt(
                     controller_text,
                     pending_fragment=pending_for_prompt,
-                    recent_context=self.prompt_history(),
+                    # The same history is supplied as chat messages immediately
+                    # below; embedding it here again wastes routing latency.
+                    recent_context=None,
                 )},
                 *self.prompt_history(),
                 {"role": "user", "content": controller_text},
@@ -2784,7 +2787,10 @@ class LiveConversationService:
                     "newer_transcription": current,
                 }, ensure_ascii=False)},
             ],
-            "options": {"temperature": 0, "num_predict": 160, "num_ctx": 1536},
+            "options": {
+                "temperature": 0, "num_predict": 160,
+                "num_ctx": SPEECH_MODEL_CONTEXT,
+            },
         }
         timeout = aiohttp.ClientTimeout(total=8)
         last_error: Exception | None = None
@@ -2851,7 +2857,10 @@ class LiveConversationService:
                 )},
                 {"role": "user", "content": text},
             ],
-            "options": {"temperature": 0.2, "num_predict": 128, "num_ctx": 2048},
+            "options": {
+                "temperature": 0.2, "num_predict": 128,
+                "num_ctx": SPEECH_MODEL_CONTEXT,
+            },
         }
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:

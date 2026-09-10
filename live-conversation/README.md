@@ -49,10 +49,13 @@ in the Android Dashboard plus menu.
    A loopback-only companion Ollama process on port 11439 isolates the live
    runner from the shared system Ollama scheduler, which otherwise evicted it
    even while its 30-minute keep-alive was active.
-   Only the newest 32 routing-relevant history messages are included, while up
-   to 120 messages remain persisted and visible. The
-   Ollama request keeps it warm for 30 minutes to avoid repeated cold starts
-   during a conversation. The model is also warmed when the service starts.
+   Only the newest 8 routing-relevant history messages (up to 4,000 characters)
+   are included once, while up to 120 messages remain persisted and visible.
+   Every auxiliary inference path uses the same 8k context allocation so an
+   endpoint, fragment-resolution, or answer-recovery call cannot evict and
+   reload the warm runner. The Ollama request keeps it warm for 30 minutes to
+   avoid repeated cold starts during a conversation. The model is also warmed
+   when the service starts.
    The decision/reply budget is 384 tokens rather than the former 80-token ceiling. If
    Ollama reports that the budget was exhausted (or returns exactly the capped
    token count), the request is retried once with 640 tokens instead of showing
@@ -83,7 +86,9 @@ in the Android Dashboard plus menu.
    eventual visible result. If the WebView disconnects while an agent works,
    the task continues and its final reply is queued for speech on the next Live
    Conversation connection.
-8. Ollama's NDJSON stream is decoded incrementally. Once the same decision has
+8. Semantic endpoint checks use a minimal two-field decision (completeness and
+   confidence), avoiding long diagnostic generations and retries before routing.
+   Ollama's NDJSON stream is decoded incrementally. Once the same decision has
    marked the thought complete and a direct route and stable spoken clause are
    available, Kokoro starts synthesizing that clause
    while later model tokens are still arriving. New confirmed speech cancels

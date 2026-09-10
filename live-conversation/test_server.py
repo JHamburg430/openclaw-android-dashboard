@@ -233,6 +233,28 @@ class RoutingTests(unittest.TestCase):
         self.assertIn('"num_ctx": SPEECH_MODEL_CONTEXT', source)
         self.assertNotIn('"num_ctx": 1024', source)
 
+    def test_semantic_endpoint_uses_minimal_decision_contract(self):
+        import server
+
+        self.assertEqual(
+            set(server.SEMANTIC_ENDPOINT_SCHEMA["required"]),
+            {"complete", "confidence"},
+        )
+        self.assertNotIn("reason", server.SEMANTIC_ENDPOINT_SCHEMA["properties"])
+
+    def test_all_speech_model_paths_reuse_one_context_size(self):
+        import inspect
+        import server
+
+        for method in (
+            server.LiveConversationService.semantic_endpoint_decision,
+            server.LiveConversationService.semantic_fragment_resolution,
+            server.LiveConversationService.generate_direct_answer,
+        ):
+            source = inspect.getsource(method)
+            self.assertIn('"num_ctx": SPEECH_MODEL_CONTEXT', source)
+            self.assertNotRegex(source, r'"num_ctx":\s*\d')
+
     def test_semantic_controller_requests_repeat_for_unclear_committed_speech(self):
         async def run_test():
             service = LiveConversationService("agent:main:test", 1.15)
@@ -1492,6 +1514,8 @@ class RoutingTests(unittest.TestCase):
                     ("direct", "Atlas is your robot.", None),
                 )
             messages = session.post.call_args.kwargs["json"]["messages"]
+            self.assertNotIn("Atlas", messages[1]["content"])
+            self.assertIn("Recent dialogue: []", messages[1]["content"])
             self.assertEqual(messages[-3], {"role": "user", "content": "My robot is named Atlas."})
             self.assertEqual(messages[-2], {"role": "assistant", "content": "I’ll remember that."})
             self.assertEqual(messages[-1], {"role": "user", "content": "What is my robot’s name?"})
