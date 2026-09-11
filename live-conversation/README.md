@@ -186,6 +186,17 @@ sanitized, while `/metrics` exports non-sensitive counters and rolling
 p50/p95/p99 stage latency. WebSocket handshakes enforce same-origin browser
 access and connection, message, turn-audio, and queue limits.
 
+Install the private ingress routes with:
+
+```bash
+./live-conversation/configure-private-ingress.sh
+```
+
+This creates the production HTTPS route on port 8443 and a tailnet-only TCP
+compatibility forward on port 8790 for already-installed dashboard APKs. The
+compatibility route is intentionally not a public Funnel and can be retired
+after all devices have upgraded to the HTTPS-capable release.
+
 The checked-in watchdog probes health every minute and performs one bounded
 service recovery attempt. Initial objectives are 99.5% availability, 99%
 successful turns, 99.5% correct routing, p95 speech-end-to-first-audio under two

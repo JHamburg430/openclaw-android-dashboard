@@ -17,6 +17,7 @@ class AndroidPhoneNodeReconnectTests(unittest.TestCase):
         cls.wake = (ROOT / "app/src/main/java/ai/openclaw/dashboard/JarvisVoiceInteractionService.java").read_text()
         cls.network_security = (ROOT / "app/src/main/res/xml/network_security_config.xml").read_text()
         cls.gradle = (ROOT / "app/build.gradle").read_text()
+        cls.ingress = (ROOT / "live-conversation/configure-private-ingress.sh").read_text()
 
     def test_service_is_sticky_and_independent_of_activity_task(self):
         self.assertIn("return START_STICKY;", self.service)
@@ -61,6 +62,18 @@ class AndroidPhoneNodeReconnectTests(unittest.TestCase):
         self.assertIn('new URI(\n                        "wss"', self.wake)
         self.assertIn('if (BuildConfig.DEBUG)', self.activity)
         self.assertIn('if (BuildConfig.DEBUG)', self.wake)
+
+    def test_live_conversation_lifecycle_recognizes_secure_and_legacy_ports(self):
+        self.assertIn(
+            "port == LIVE_CONVERSATION_PORT || port == LIVE_CONVERSATION_HTTPS_PORT",
+            self.activity,
+        )
+
+    def test_private_ingress_preserves_installed_client_compatibility(self):
+        self.assertIn("--https=8443", self.ingress)
+        self.assertIn("--tcp=8790", self.ingress)
+        self.assertIn("tcp://127.0.0.1:8790", self.ingress)
+        self.assertNotIn("--funnel", self.ingress)
 
     def test_voice_playback_owns_and_releases_transient_audio_focus(self):
         self.assertIn("new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)", self.activity)

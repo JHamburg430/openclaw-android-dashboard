@@ -57,7 +57,9 @@ control state to its diagnostic stream. Agent speech requests transient audio
 focus, stops immediately on focus loss, and releases focus after playback.
 
 The production Live Conversation backend binds to loopback and is published to
-the tailnet through Tailscale Serve on HTTPS port 8443. Browser WebSockets are
+the tailnet through Tailscale Serve on HTTPS port 8443. A tailnet-only TCP
+forward on port 8790 keeps already-installed pre-HTTPS APKs working during the
+upgrade window. Browser WebSockets are
 same-origin checked, payloads and queues are bounded, and public health excludes
 local paths, session identities, and diagnostic contents.
 

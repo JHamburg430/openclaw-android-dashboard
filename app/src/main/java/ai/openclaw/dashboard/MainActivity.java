@@ -675,7 +675,13 @@ public final class MainActivity extends Activity {
     }
 
     private boolean isLiveConversationOpen() {
-        return webView != null && webView.getUrl() != null && webView.getUrl().contains(":" + LIVE_CONVERSATION_PORT);
+        if (webView == null || webView.getUrl() == null) return false;
+        try {
+            int port = java.net.URI.create(webView.getUrl()).getPort();
+            return port == LIVE_CONVERSATION_PORT || port == LIVE_CONVERSATION_HTTPS_PORT;
+        } catch (IllegalArgumentException ignored) {
+            return false;
+        }
     }
 
     private void stopLiveConversationForLock() {
