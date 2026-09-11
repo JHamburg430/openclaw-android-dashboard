@@ -213,14 +213,7 @@ final class OpenClawClient {
                 .put("minProtocol", 4)
                 .put("maxProtocol", 4)
                 .put("client", client)
-                .put("caps", new JSONArray()
-                        .put("android.dashboard")
-                        .put("android.node")
-                        .put("apps")
-                        .put("device")
-                        .put("files")
-                        .put("notifications")
-                        .put("talk"))
+                .put("caps", nodeCapabilities())
                 .put("commands", nodeCommands())
                 .put("auth", auth.length() == 0 ? JSONObject.NULL : auth)
                 .put("role", role)
@@ -371,6 +364,25 @@ final class OpenClawClient {
                 .put("talk.ptt.stop")
                 .put("talk.ptt.cancel")
                 .put("talk.ptt.once");
+    }
+
+    static JSONArray nodeCapabilities() {
+        JSONArray capabilities = new JSONArray();
+        for (String capability : nodeCapabilityNames()) capabilities.put(capability);
+        return capabilities;
+    }
+
+    static String[] nodeCapabilityNames() {
+        return new String[] {
+                "android.dashboard",
+                "android.node",
+                "apps",
+                "device",
+                "files",
+                "mobileUI",
+                "notifications",
+                "talk"
+        };
     }
 
     private void call(String method, JSONObject params, Callback callback) {
