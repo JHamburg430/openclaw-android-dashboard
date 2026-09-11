@@ -168,9 +168,31 @@ committed microphone turn is saved on the OpenClaw host under
 
 Capturing before ASR intentionally preserves clipped starts, room noise,
 misrecognitions, interruptions, and ignored ambient turns. Wake-word windows
-are never recorded. Disabling the toggle stops new capture immediately; it does
-not delete prior recordings. The files remain local and are not exposed by an
-HTTP download route.
+are never recorded. Disabling the toggle stops new capture immediately. Captures
+are retained for 30 days by default and debug bundles for 14 days, with
+independent disk quotas. The page provides a confirmed **Delete all recordings**
+control. Directories and files use owner-only permissions; no HTTP download
+route exists. Configure the policy with
+`LIVE_CONVERSATION_RECORDING_RETENTION_DAYS`,
+`LIVE_CONVERSATION_DEBUG_RETENTION_DAYS`,
+`LIVE_CONVERSATION_RECORDING_MAX_BYTES`, and
+`LIVE_CONVERSATION_DEBUG_MAX_BYTES`.
+
+## Production operations
+
+The service binds to `127.0.0.1:8790`; expose it only through an authenticated
+private TLS ingress such as Tailscale Serve. `/health` is deliberately
+sanitized, while `/metrics` exports non-sensitive counters and rolling
+p50/p95/p99 stage latency. WebSocket handshakes enforce same-origin browser
+access and connection, message, turn-audio, and queue limits.
+
+The checked-in watchdog probes health every minute and performs one bounded
+service recovery attempt. Initial objectives are 99.5% availability, 99%
+successful turns, 99.5% correct routing, p95 speech-end-to-first-audio under two
+seconds while GPU-accelerated, and dependency-restart recovery within 30
+seconds. Deployment requires the complete Python/Android/JavaScript suite plus
+a real-device synthetic turn and rollback to the last known-good tag if the
+gate fails.
 
 To replay up to the latest 20 consented phone captures through the production
 Whisper model as part of the regression suite:

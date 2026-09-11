@@ -8,7 +8,10 @@ const method = source.slice(methodStart, methodEnd);
 
 assert.ok(source.includes("LIVE_CONVERSATION_PORT = 8790"));
 assert.ok(method.includes("openLiveConversation(false)"));
-assert.ok(source.includes("buildSiblingAppUrl(LIVE_CONVERSATION_PORT)"));
+assert.ok(source.includes("buildLiveConversationUrl()"));
+assert.ok(source.includes('return "https://" + host + ":" + LIVE_CONVERSATION_HTTPS_PORT'));
+assert.ok(source.includes("new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)"));
+assert.ok(source.includes("abandonAudioFocusRequest(speechAudioFocusRequest)"));
 assert.equal(method.includes("buildLiveConversationHtml()"), false);
 assert.ok(source.includes("public void prepareAgentResponsePlayback()"));
 assert.ok(source.includes('prepareSpeakerPlaybackRoute(audioManager, "response_prepare")'));

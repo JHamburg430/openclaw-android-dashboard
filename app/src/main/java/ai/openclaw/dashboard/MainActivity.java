@@ -22,6 +22,7 @@ import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.drawable.GradientDrawable;
 import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.AudioFormat;
 import android.media.AudioDeviceInfo;
@@ -106,6 +107,7 @@ public final class MainActivity extends Activity {
     private static final int MAX_DIAGNOSTIC_LINES = 120;
     private static final int TALK_FRAME_MS = 10;
     private static final int LIVE_CONVERSATION_PORT = 8790;
+    private static final int LIVE_CONVERSATION_HTTPS_PORT = 8443;
     private static final String NOTIFICATION_CHANNEL_ID = "openclaw_updates";
     private static final int NOTIFICATION_ID = 41001;
     private static final String PREF_NOTIFICATION_COUNT = "notification_count";
@@ -653,7 +655,7 @@ public final class MainActivity extends Activity {
         pauseJarvisWakeListener();
         setAppsDrawerVisible(false);
         try {
-            String url = buildSiblingAppUrl(LIVE_CONVERSATION_PORT) + (autostart ? "?autostart=1" : "");
+            String url = buildLiveConversationUrl() + (autostart ? "?autostart=1" : "");
             webView.stopLoading();
             webView.loadUrl(url);
             setConnectedUiVisible(true);
@@ -779,6 +781,21 @@ public final class MainActivity extends Activity {
         // user services on plain HTTP ports, even when Control UI is reached
         // through a secure Tailscale/OpenClaw dashboard URL.
         return "http://" + host + ":" + port + "/";
+    }
+
+    private String buildLiveConversationUrl() {
+        java.net.URI uri = java.net.URI.create(buildDashboardUrl());
+        String host = uri.getHost();
+        if (host == null || host.trim().isEmpty()) {
+            throw new IllegalStateException("Dashboard host is missing.");
+        }
+        if ("https".equalsIgnoreCase(uri.getScheme())) {
+            return "https://" + host + ":" + LIVE_CONVERSATION_HTTPS_PORT + "/";
+        }
+        if (BuildConfig.DEBUG) {
+            return "http://" + host + ":" + LIVE_CONVERSATION_PORT + "/";
+        }
+        throw new IllegalStateException("Live Conversation requires a secure HTTPS dashboard URL.");
     }
 
     private String buildNativePageBaseUrl(String pageName) {
@@ -2339,6 +2356,8 @@ public final class MainActivity extends Activity {
         private AcousticEchoCanceler acousticEchoCanceler;
         private NoiseSuppressor noiseSuppressor;
         private AutomaticGainControl automaticGainControl;
+        private AudioFocusRequest speechAudioFocusRequest;
+        private boolean speechAudioFocusHeld;
 
         @JavascriptInterface
         public boolean isAvailable() {
@@ -2437,6 +2456,10 @@ public final class MainActivity extends Activity {
         public void prepareAgentResponsePlayback() {
             outputInterrupted.set(false);
             outputComplete.set(false);
+            if (!requestSpeechAudioFocus()) {
+                recordDiagnostic("native_audio_output.focus_denied", "response_prepare");
+                return;
+            }
             AudioDeviceInfo bluetoothOutput = preferBluetoothAudioRoute(false, "response_prepare");
             AudioManager audioManager = getAudioManager();
             if (audioManager != null && bluetoothOutput == null) {
@@ -2457,6 +2480,7 @@ public final class MainActivity extends Activity {
                 if (outputThread != null) outputThread.interrupt();
                 outputLock.notifyAll();
             }
+            abandonSpeechAudioFocus();
             recordDiagnostic("native_audio_output.cleared", "speech_started");
         }
 
@@ -2485,6 +2509,10 @@ public final class MainActivity extends Activity {
 
         private void playPcm16Base64(String base64Pcm16, int sampleRateHz, String routeReason) {
             if (base64Pcm16 == null || base64Pcm16.isEmpty()) return;
+            if (!requestSpeechAudioFocus()) {
+                recordDiagnostic("native_audio_output.focus_denied", routeReason);
+                return;
+            }
             int outputSampleRate = sampleRateHz > 0 ? sampleRateHz : OUTPUT_SAMPLE_RATE;
             byte[] pcm;
             try {
@@ -2684,8 +2712,44 @@ public final class MainActivity extends Activity {
                         startPcmOutputThreadLocked(sampleRateHz, "queued_response");
                     }
                 }
+                abandonSpeechAudioFocus();
                 restoreCommunicationAudioRouteIfIdle();
             }
+        }
+
+        private boolean requestSpeechAudioFocus() {
+            AudioManager audioManager = getAudioManager();
+            if (audioManager == null) return false;
+            if (speechAudioFocusHeld) return true;
+            AudioAttributes attributes = new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build();
+            speechAudioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                    .setAudioAttributes(attributes)
+                    .setAcceptsDelayedFocusGain(false)
+                    .setWillPauseWhenDucked(true)
+                    .setOnAudioFocusChangeListener(change -> {
+                        if (change == AudioManager.AUDIOFOCUS_LOSS
+                                || change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT
+                                || change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK) {
+                            interruptAgentResponsePlayback();
+                        }
+                    })
+                    .build();
+            int result = audioManager.requestAudioFocus(speechAudioFocusRequest);
+            speechAudioFocusHeld = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
+            recordDiagnostic("native_audio_output.focus", "result=" + result);
+            return speechAudioFocusHeld;
+        }
+
+        private void abandonSpeechAudioFocus() {
+            AudioManager audioManager = getAudioManager();
+            if (!speechAudioFocusHeld || audioManager == null || speechAudioFocusRequest == null) return;
+            audioManager.abandonAudioFocusRequest(speechAudioFocusRequest);
+            speechAudioFocusHeld = false;
+            speechAudioFocusRequest = null;
+            recordDiagnostic("native_audio_output.focus_abandoned", "idle");
         }
 
         private void logPlaybackStreamVolume(AudioManager audioManager) {

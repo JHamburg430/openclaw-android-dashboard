@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
-from collections import deque
+from collections import Counter, deque
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 import json
@@ -19,6 +19,7 @@ import secrets
 import struct
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable
+from urllib.parse import urlsplit
 import wave
 from zoneinfo import ZoneInfo
 
@@ -157,6 +158,16 @@ DEFAULT_DASHBOARD_REPO = "/home/john/openclaw-android-dashboard"
 MAX_HISTORY_MESSAGES = 120
 MAX_HISTORY_CHARS = 72_000
 MAX_CONVERSATION_EVENTS = 500
+DEFAULT_RECORDING_RETENTION_DAYS = 30
+DEFAULT_DEBUG_RETENTION_DAYS = 14
+DEFAULT_RECORDING_MAX_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_DEBUG_MAX_BYTES = 512 * 1024 * 1024
+MAX_HTTP_BODY_BYTES = 64 * 1024
+MAX_WS_MESSAGE_BYTES = 512 * 1024
+MAX_TURN_AUDIO_BYTES = SAMPLE_RATE * 2 * 10 * 60
+MAX_PENDING_TURNS = 4
+MAX_LIVE_CONNECTIONS = 4
+MAX_WAKE_CONNECTIONS = 2
 # Routing only needs the immediate conversational neighborhood. A larger window
 # repeatedly filled the entire 8k model context, adding seconds of prompt
 # evaluation and duplicating history already supplied to the controller.
@@ -166,6 +177,42 @@ WAKE_WORD = "jarvis"
 WAKE_WORD_ALIASES = frozenset(("jarvis", "jervis"))
 WAKE_WINDOW_SECONDS = 2.5
 WAKE_COOLDOWN_SECONDS = 5.0
+
+
+def _secure_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.chmod(0o700)
+
+
+def _secure_atomic_write(path: Path, content: str) -> None:
+    _secure_directory(path.parent)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.chmod(0o600)
+    temporary.replace(path)
+    path.chmod(0o600)
+
+
+def _origin_matches_request(request: web.Request) -> bool:
+    """Accept native clients without Origin and same-origin browser clients only."""
+    origin = request.headers.get("Origin")
+    if not origin:
+        return True
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    return parsed.scheme in {"http", "https"} and parsed.netloc == request.host
+
+
+def _prometheus_name(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_:]", "_", value)
+
+
+def _increment_metric(service: Any, name: str, value: int = 1) -> None:
+    counters = getattr(service, "metric_counters", None)
+    if counters is not None:
+        counters[name] += value
 
 
 def _words(text: str) -> list[str]:
@@ -1612,6 +1659,10 @@ class LiveConversationService:
         settings_path: str | None = None,
         recordings_path: str | None = None,
         debug_path: str | None = None,
+        recording_retention_days: int = DEFAULT_RECORDING_RETENTION_DAYS,
+        debug_retention_days: int = DEFAULT_DEBUG_RETENTION_DAYS,
+        recording_max_bytes: int = DEFAULT_RECORDING_MAX_BYTES,
+        debug_max_bytes: int = DEFAULT_DEBUG_MAX_BYTES,
     ):
         self.session_key = session_key
         self.stt: WhisperSTTService | None = None
@@ -1650,10 +1701,30 @@ class LiveConversationService:
         self.settings_path = Path(settings_path) if settings_path else None
         self.recordings_path = Path(recordings_path) if recordings_path else None
         self.debug_path = Path(debug_path) if debug_path else None
+        self.recording_retention_days = max(1, recording_retention_days)
+        self.debug_retention_days = max(1, debug_retention_days)
+        self.recording_max_bytes = max(1, recording_max_bytes)
+        self.debug_max_bytes = max(1, debug_max_bytes)
+        self.metric_counters: Counter[str] = Counter()
+        self.metric_samples: dict[str, deque[float]] = {
+            name: deque(maxlen=1000)
+            for name in ("asr_ms", "response_ms", "routing_ms", "tts_ms", "total_ms")
+        }
+        self.started_at = time.time()
         self.history: deque[dict[str, str]] = deque(maxlen=MAX_HISTORY_MESSAGES)
         self.events: deque[dict[str, Any]] = deque(maxlen=MAX_CONVERSATION_EVENTS)
+        for private_root in (self.recordings_path, self.debug_path):
+            if private_root and private_root.exists():
+                _secure_directory(private_root)
+        for private_file in (self.settings_path, self.history_path):
+            if private_file and private_file.exists():
+                try:
+                    private_file.chmod(0o600)
+                except OSError as error:
+                    LOGGER.warning("private_data_permissions_failed path=%s error=%s", private_file, error)
         self._load_settings()
         self._load_history()
+        self.prune_private_data()
 
     def _load_settings(self) -> None:
         if not self.settings_path or not self.settings_path.exists():
@@ -1695,9 +1766,8 @@ class LiveConversationService:
         if not self.settings_path:
             return
         try:
-            self.settings_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.settings_path.with_suffix(".tmp")
-            temporary.write_text(
+            _secure_atomic_write(
+                self.settings_path,
                 json.dumps({
                     "action_confirmation": (
                         "confirm" if self.confirmation_required else "automatic"
@@ -1706,9 +1776,7 @@ class LiveConversationService:
                     "audio_capture": self.audio_capture_enabled,
                     "debug_status": self.debug_status,
                 }, indent=2),
-                encoding="utf-8",
             )
-            temporary.replace(self.settings_path)
         except OSError as error:
             LOGGER.warning("conversation_settings_save_failed error=%s", error)
 
@@ -1729,9 +1797,117 @@ class LiveConversationService:
                 "confirm" if self.confirmation_required else "automatic"
             ),
             "audio_capture": self.audio_capture_enabled,
-            "audio_capture_path": str(self.recordings_path) if self.recordings_path else "",
+            "audio_capture_retention_days": self.recording_retention_days,
             "debug_status": dict(self.debug_status),
         }
+
+    def observe_turn_metrics(self, metrics: TurnMetrics) -> None:
+        self.metric_counters["turns_total"] += 1
+        if metrics.route:
+            self.metric_counters[f"route_{_prometheus_name(metrics.route)}_total"] += 1
+        for name, samples in self.metric_samples.items():
+            value = getattr(metrics, name, None)
+            if isinstance(value, (int, float)):
+                samples.append(float(value))
+
+    @staticmethod
+    def _prune_tree(root: Path | None, retention_days: int, max_bytes: int) -> tuple[int, int]:
+        if not root or not root.exists():
+            return 0, 0
+        for directory in (root, *(path for path in root.rglob("*") if path.is_dir())):
+            try:
+                directory.chmod(0o700)
+            except OSError as error:
+                LOGGER.warning("private_data_permissions_failed path=%s error=%s", directory, error)
+        cutoff = time.time() - retention_days * 86400
+        files = [path for path in root.rglob("*") if path.is_file() and not path.is_symlink()]
+        removed_files = 0
+        removed_bytes = 0
+        for path in files:
+            try:
+                stat = path.stat()
+                if stat.st_mtime < cutoff:
+                    path.unlink()
+                    removed_files += 1
+                    removed_bytes += stat.st_size
+                else:
+                    path.chmod(0o600)
+            except OSError as error:
+                LOGGER.warning("private_data_retention_failed path=%s error=%s", path, error)
+        remaining = []
+        for path in root.rglob("*"):
+            try:
+                if path.is_file() and not path.is_symlink():
+                    stat = path.stat()
+                    remaining.append((stat.st_mtime, stat.st_size, path))
+            except OSError:
+                continue
+        total = sum(size for _, size, _ in remaining)
+        for _, size, path in sorted(remaining):
+            if total <= max_bytes:
+                break
+            try:
+                path.unlink()
+                total -= size
+                removed_files += 1
+                removed_bytes += size
+            except OSError as error:
+                LOGGER.warning("private_data_quota_failed path=%s error=%s", path, error)
+        for directory in sorted(
+            (path for path in root.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts), reverse=True,
+        ):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        return removed_files, removed_bytes
+
+    def prune_private_data(self) -> dict[str, int]:
+        recordings, recording_bytes = self._prune_tree(
+            self.recordings_path, self.recording_retention_days, self.recording_max_bytes
+        )
+        debug, debug_bytes = self._prune_tree(
+            self.debug_path, self.debug_retention_days, self.debug_max_bytes
+        )
+        removed = recordings + debug
+        if removed:
+            LOGGER.info(
+                "private_data_pruned files=%s bytes=%s recordings=%s debug=%s",
+                removed, recording_bytes + debug_bytes, recordings, debug,
+            )
+        self.metric_counters["retention_files_deleted_total"] += removed
+        self.metric_counters["retention_bytes_deleted_total"] += recording_bytes + debug_bytes
+        return {"recordings": recordings, "debug": debug, "bytes": recording_bytes + debug_bytes}
+
+    def delete_audio_captures(self) -> dict[str, int]:
+        if not self.recordings_path or not self.recordings_path.exists():
+            return {"files": 0, "bytes": 0}
+        files = [
+            path for path in self.recordings_path.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        ]
+        removed_files = 0
+        removed_bytes = 0
+        for path in files:
+            try:
+                size = path.stat().st_size
+                path.unlink()
+                removed_files += 1
+                removed_bytes += size
+            except OSError as error:
+                LOGGER.warning("audio_capture_delete_failed path=%s error=%s", path, error)
+        for directory in sorted(
+            (path for path in self.recordings_path.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts), reverse=True,
+        ):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        self.metric_counters["recording_files_deleted_total"] += removed_files
+        self.metric_counters["recording_bytes_deleted_total"] += removed_bytes
+        return {"files": removed_files, "bytes": removed_bytes}
 
     def set_debug_status(self, state: str, **fields: Any) -> dict[str, Any]:
         allowed = {"idle", "collecting", "working", "fixed", "release_available", "gateway_updated", "failed"}
@@ -1797,7 +1973,8 @@ class LiveConversationService:
             raise RuntimeError("Live Conversation debug storage is not configured")
         now = datetime.now(ZoneInfo("America/Detroit"))
         directory = self.debug_path / now.strftime("%Y%m%d")
-        directory.mkdir(parents=True, exist_ok=True)
+        self.prune_private_data()
+        _secure_directory(directory)
         baseline, dashboard_status, voice_logs, gateway_logs = await asyncio.gather(
             self.system_update_snapshot(),
             self._diagnostic_command(
@@ -1851,12 +2028,10 @@ class LiveConversationService:
             "gateway_logs": gateway_logs,
         }
         path = directory / f"{request_id}.json"
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(
+        _secure_atomic_write(
+            path,
             self.redact_diagnostics(json.dumps(bundle, ensure_ascii=False, indent=2)),
-            encoding="utf-8",
         )
-        temporary.replace(path)
         return path, baseline
 
     def begin_audio_capture(
@@ -1875,13 +2050,15 @@ class LiveConversationService:
         capture_id = f"{now:%Y%m%dT%H%M%S.%f}-{sequence}-{secrets.token_hex(3)}"
         day = self.recordings_path / now.strftime("%Y%m%d")
         try:
-            day.mkdir(parents=True, exist_ok=True)
+            self.prune_private_data()
+            _secure_directory(day)
             wav_path = day / f"{capture_id}-user.wav"
             with wave.open(str(wav_path), "wb") as recording:
                 recording.setnchannels(1)
                 recording.setsampwidth(2)
                 recording.setframerate(SAMPLE_RATE)
                 recording.writeframes(pcm)
+            wav_path.chmod(0o600)
             samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
             rms = float(np.sqrt(np.mean(np.square(samples / 32768.0)))) if len(samples) else 0.0
             user_agent = str((client_context or {}).get("user_agent") or "")
@@ -1929,10 +2106,7 @@ class LiveConversationService:
 
     def _write_capture_manifest(self, capture_id: str, payload: dict[str, Any]) -> None:
         manifest = self._capture_manifest_path(capture_id)
-        manifest.parent.mkdir(parents=True, exist_ok=True)
-        temporary = manifest.with_suffix(".tmp")
-        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        temporary.replace(manifest)
+        _secure_atomic_write(manifest, json.dumps(payload, indent=2, sort_keys=True))
 
     def _load_history(self) -> None:
         if not self.history_path or not self.history_path.exists():
@@ -1966,17 +2140,14 @@ class LiveConversationService:
         if not self.history_path:
             return
         try:
-            self.history_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.history_path.with_suffix(".tmp")
-            temporary.write_text(
+            _secure_atomic_write(
+                self.history_path,
                 json.dumps({
                     "schema_version": 2,
                     "messages": list(self.history),
                     "events": list(self.events),
                 }, ensure_ascii=False, indent=2),
-                encoding="utf-8",
             )
-            temporary.replace(self.history_path)
         except OSError as error:
             LOGGER.warning("conversation_history_save_failed error=%s", error)
 
@@ -3589,6 +3760,7 @@ class LiveConversationService:
                     expected_generation=turn_generation,
                 )
             metrics.total_ms = round((time.perf_counter() - started) * 1000)
+            self.observe_turn_metrics(metrics)
             self.update_audio_capture(
                 capture_id, tts_ms=metrics.tts_ms, total_ms=metrics.total_ms,
             )
@@ -3597,6 +3769,7 @@ class LiveConversationService:
                 return prepared_handoff[0], reply, prepared_handoff[1]
             await socket.send_json({"type": "state", "state": "listening"})
         except Exception as error:
+            self.metric_counters["turn_errors_total"] += 1
             self.update_audio_capture(capture_id, status="error", error=str(error))
             if incremental_speech is not None:
                 await incremental_speech.cancel()
@@ -3610,6 +3783,7 @@ def render_page() -> str:
 html,body{margin:0;min-height:100%;background:#060a10;color:#f4f8fc;font-family:system-ui,sans-serif}main{padding:18px 14px 28px;max-width:760px;margin:auto}h1{font-size:23px;margin:0 0 5px}.sub{color:#9aa9b8;margin:0 0 7px}.setting{color:#7fcbb4;font-size:12px;margin-bottom:16px}.state{font-size:18px;color:#54e0b4;margin:12px 0}.meter{height:14px;background:#101820;border:1px solid #304050;border-radius:8px;overflow:hidden}.meter div{height:100%;width:0;background:#00ab7e;transition:width 60ms}.buttons{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:14px 0}button{min-height:48px;border:1px solid #00ab7e;border-radius:8px;background:#1e2630;color:#fff;font-size:15px}button:disabled{opacity:.55}.debug-card{border:1px solid #31475a}.debug-line{display:flex;align-items:center;gap:8px;margin:5px 0 10px}.debug-icon{width:12px;height:12px;border-radius:50%;background:#708090;box-shadow:0 0 8px currentColor}.debug-icon.collecting,.debug-icon.working{background:#e0a84f;color:#e0a84f}.debug-icon.fixed{background:#54e0b4;color:#54e0b4}.debug-icon.release_available{background:#59a9ff;color:#59a9ff}.debug-icon.gateway_updated{background:#bf8cff;color:#bf8cff}.debug-icon.failed{background:#ff6b72;color:#ff6b72}.card{background:#0a0e14;border-radius:8px;padding:12px;margin-top:10px;min-height:48px}.label{color:#8797a8;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.metrics{font-size:12px;color:#aebdca;margin-top:12px}.route{display:inline-block;border:1px solid #36556a;border-radius:10px;padding:2px 7px;font-size:11px;margin-left:6px}.history{margin-top:18px}.history-list{display:flex;flex-direction:column;gap:8px;margin-top:8px}.history-empty{color:#718294;font-size:13px}.message{max-width:88%;padding:9px 11px;border-radius:12px;line-height:1.35;white-space:pre-wrap;overflow-wrap:anywhere}.message.user{align-self:flex-end;background:#0e5948}.message.assistant{align-self:flex-start;background:#182431}.message-role{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:#9db0bf;margin-bottom:3px}
 </style></head><body><main><h1>Live Conversation</h1><p class="sub">Accurate local speech recognition. Simple requests answer here; complex work routes to the right OpenClaw session.</p><div id="confirmation" class="setting">Action confirmation: loading…</div><div id="recording" class="setting">Test audio capture: loading…</div><p class="sub">Audio capture is off by default. When enabled, microphone turns and test metadata are saved locally on the OpenClaw host for regression testing.</p><div class="card debug-card"><div class="label">Conversation diagnostics</div><div class="debug-line"><span id="debugIcon" class="debug-icon idle" aria-hidden="true"></span><span id="debugStatus" role="status">No debug submission pending.</span></div><button id="sendDebug">Send for Debug</button></div><div id="state" class="state">Ready</div><div class="meter"><div id="bar"></div></div><div class="buttons"><button id="start">Start conversation</button><button id="stop">Stop</button></div><div class="card"><div class="label">You</div><div id="user">—</div></div><div class="card"><div class="label">Assistant <span id="route" class="route">waiting</span></div><div id="assistant">—</div></div><div id="metrics" class="metrics"></div><section class="history"><div class="label">Recent messages · newest first · last 120</div><div id="history" class="history-list"><div class="history-empty">No conversation history yet.</div></div></section></main><script>
 const state=document.getElementById('state'),bar=document.getElementById('bar'),user=document.getElementById('user'),assistant=document.getElementById('assistant'),route=document.getElementById('route'),metrics=document.getElementById('metrics'),confirmation=document.getElementById('confirmation'),recordingSetting=document.getElementById('recording'),debugIcon=document.getElementById('debugIcon'),debugStatus=document.getElementById('debugStatus'),sendDebug=document.getElementById('sendDebug'),historyList=document.getElementById('history');const AUDIO_FRAME_MS=20,START_CONFIRM_MS=300,BARGE_IN_CONFIRM_MS=300,ONSET_PREROLL_MS=2500,PREBUFFER_FRAMES=Math.ceil((START_CONFIRM_MS+ONSET_PREROLL_MS)/AUDIO_FRAME_MS),MAX_DRAIN_FRAMES=24,SEMANTIC_CHECK_MS=750,HARD_ENDPOINT_MS=3500;let ws,timer,recording=false,awaitingResponse=false,responseActive=false,responseTailTimer=null,speechMs=0,silenceMs=0,candidateSpeechMs=0,pre=[],historyMessages=[],pendingTranscript='',endpointPending=false,nextEndpointAt=SEMANTIC_CHECK_MS,confirmationMode='automatic',audioCapture=false,pendingMessages=[];const confirmationToggle=document.createElement('button');confirmationToggle.textContent='Toggle confirmation';confirmation.insertAdjacentElement('afterend',confirmationToggle);const recordingToggle=document.createElement('button');recordingToggle.textContent='Enable test audio capture';recordingSetting.insertAdjacentElement('afterend',recordingToggle);
+const deleteRecordings=document.createElement('button');deleteRecordings.textContent='Delete all recordings';deleteRecordings.ariaLabel='Delete all locally retained microphone recordings';recordingToggle.insertAdjacentElement('afterend',deleteRecordings);
 function renderHistory(){historyList.replaceChildren();if(!historyMessages.length){const empty=document.createElement('div');empty.className='history-empty';empty.textContent='No conversation history yet.';historyList.appendChild(empty);return}for(const message of historyMessages.slice(-120).reverse()){const bubble=document.createElement('div');bubble.className='message '+message.role;const who=document.createElement('div');who.className='message-role';who.textContent=message.role==='user'?'You':'Assistant';const content=document.createElement('div');content.textContent=message.content;bubble.append(who,content);historyList.appendChild(bubble)}}
 function addHistory(role,content){if(!content)return;historyMessages.push({role,content});historyMessages=historyMessages.slice(-120);renderHistory()}
 function rms(b64){const s=atob(b64||'');let sum=0,n=0;for(let i=0;i+1<s.length;i+=2){let v=(s.charCodeAt(i)&255)|((s.charCodeAt(i+1)&255)<<8);if(v&32768)v-=65536;const f=v/32768;sum+=f*f;n++}return n?Math.sqrt(sum/n):0}
@@ -3625,6 +3799,7 @@ function start(){if(ws&&(ws.readyState===0||ws.readyState===1))return;ws=new Web
 let realtimeListenerSocket=null;
 function installRealtimeListeners(){if(!ws||realtimeListenerSocket===ws)return;realtimeListenerSocket=ws;ws.addEventListener('message',event=>{const m=JSON.parse(event.data);if(m.type==='settings'){confirmationMode=m.action_confirmation;confirmationToggle.textContent=confirmationMode==='confirm'?'Turn confirmation off':'Turn confirmation on'}if(m.type==='endpoint_decision'){endpointPending=false;report('semantic_endpoint',m.source+':'+m.probability);if(recording&&m.complete)finishTurn()}if(m.type==='backchannel'){assistant.textContent=m.text;route.textContent='listening'}});setTimeout(()=>{try{report('voice_processing',OpenClawNativeAudio.getVoiceProcessingStatus())}catch(e){report('voice_processing','unavailable')}},250)}
 const originalStart=start;start=function(){originalStart();installRealtimeListeners()};confirmationToggle.onclick=()=>sendWhenConnected({type:'set_confirmation',required:confirmationMode!=='confirm'});recordingToggle.onclick=()=>sendWhenConnected({type:'set_audio_capture',enabled:!audioCapture});sendDebug.onclick=()=>sendWhenConnected({type:'send_for_debug'});renderDebugStatus({state:'idle'});
+deleteRecordings.onclick=()=>{if(window.confirm('Delete all locally retained microphone recordings? This cannot be undone.'))sendWhenConnected({type:'delete_audio_captures'})};
 function stop(){if(timer)clearInterval(timer);timer=null;if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=null;try{OpenClawNativeAudio.stopCapture()}catch(e){}if(ws)ws.close();ws=null;recording=false;awaitingResponse=false;responseActive=false;candidateSpeechMs=0;bar.style.width='0%';state.textContent='Stopped'}
 document.getElementById('start').onclick=start;document.getElementById('stop').onclick=()=>{stop();try{OpenClawNativeApp.liveConversationStopped()}catch(e){}};window.addEventListener('pagehide',stop);if(new URLSearchParams(location.search).get('autostart')==='1')start();
 </script></body></html>"""
@@ -3636,45 +3811,81 @@ async def index(_: web.Request) -> web.Response:
 
 async def health(request: web.Request) -> web.Response:
     service: LiveConversationService = request.app["service"]
+    router_mode = (
+        "gpu" if service.speech_model_accelerated is True
+        else "degraded_cpu" if service.speech_model_accelerated is False
+        else "unknown"
+    )
     return web.json_response({
         "ok": service.stt is not None,
-        "pipecat": "1.8.1",
-        "stt": service.stt_description,
-        "online_asr": "local-agreement-stable-prefix",
-        "semantic_turn": service.semantic_turn_description,
+        "status": "healthy" if service.stt is not None else "starting",
+        "uptime_seconds": round(time.time() - service.started_at),
         "speech_router": {
-            "model": SPEECH_MODEL,
             "accelerated": service.speech_model_accelerated,
-            "mode": (
-                "gpu" if service.speech_model_accelerated is True
-                else "degraded_cpu" if service.speech_model_accelerated is False
-                else "unknown"
-            ),
+            "mode": router_mode,
         },
-        "tts": service.tts_backend_description,
-        "history_messages": len(service.history),
-        "conversation_events": len(service.events),
-        "session_catalog": {
-            "fresh": service.sessions_error is None,
-            "last_success_epoch": service.sessions_last_success_wall or None,
-            "error": service.sessions_error,
+        "components": {
+            "asr": service.stt is not None,
+            "semantic_turn": service.semantic_turn is not None,
+            "tts": bool(service.tts_backend_description),
+            "session_catalog": service.sessions_error is None,
         },
-        "action_confirmation": (
-            "confirm" if service.confirmation_required else "automatic"
-        ),
-        "audio_capture": {
-            "enabled": service.audio_capture_enabled,
-            "path": str(service.recordings_path) if service.recordings_path else "",
+        "privacy": {
+            "audio_capture_enabled": service.audio_capture_enabled,
+            "recording_retention_days": service.recording_retention_days,
+            "debug_retention_days": service.debug_retention_days,
         },
-        "debug_status": dict(service.debug_status),
     })
+
+
+async def metrics(request: web.Request) -> web.Response:
+    service: LiveConversationService = request.app["service"]
+    lines = [
+        "# HELP openclaw_live_conversation_uptime_seconds Service uptime.",
+        "# TYPE openclaw_live_conversation_uptime_seconds gauge",
+        f"openclaw_live_conversation_uptime_seconds {time.time() - service.started_at:.3f}",
+    ]
+    for name, value in sorted(service.metric_counters.items()):
+        metric = f"openclaw_live_conversation_{_prometheus_name(name)}"
+        lines.extend((f"# TYPE {metric} counter", f"{metric} {value}"))
+    for name, samples in service.metric_samples.items():
+        if not samples:
+            continue
+        metric = f"openclaw_live_conversation_{name}"
+        ordered = sorted(samples)
+        for percentile, position in (("p50", .50), ("p95", .95), ("p99", .99)):
+            index = min(len(ordered) - 1, max(0, int(len(ordered) * position) - 1))
+            lines.append(f'{metric}{{quantile="{percentile}"}} {ordered[index]:.3f}')
+    return web.Response(text="\n".join(lines) + "\n", content_type="text/plain")
+
+
+@web.middleware
+async def security_headers(request: web.Request, handler: Callable[..., Awaitable[web.StreamResponse]]) -> web.StreamResponse:
+    response = await handler(request)
+    response.headers.update({
+        "Content-Security-Policy": "default-src 'self'; connect-src 'self'; style-src 'unsafe-inline'",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Permissions-Policy": "camera=(), geolocation=(), payment=(), usb=()",
+        "Server": "OpenClaw",
+    })
+    return response
 
 
 async def wake_websocket(request: web.Request) -> web.WebSocketResponse:
     """Detect the configured wake word from rolling raw 16 kHz PCM windows."""
     service: LiveConversationService = request.app["service"]
-    socket = web.WebSocketResponse(heartbeat=20)
+    if not _origin_matches_request(request):
+        raise web.HTTPForbidden(text="WebSocket Origin is not allowed.")
+    sockets: set[web.WebSocketResponse] | None = request.app.get("wake_sockets")
+    if sockets is None:
+        sockets = set()
+    if len(sockets) >= MAX_WAKE_CONNECTIONS:
+        raise web.HTTPServiceUnavailable(text="Wake listener capacity reached.")
+    socket = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_WS_MESSAGE_BYTES)
     await socket.prepare(request)
+    sockets.add(socket)
     audio = bytearray()
     window_bytes = round(SAMPLE_RATE * 2 * WAKE_WINDOW_SECONDS)
     retain_bytes = SAMPLE_RATE * 2
@@ -3682,6 +3893,9 @@ async def wake_websocket(request: web.Request) -> web.WebSocketResponse:
     async for message in socket:
         if message.type != WSMsgType.BINARY:
             continue
+        if len(message.data) > MAX_WS_MESSAGE_BYTES:
+            await socket.close(code=1009, message=b"Wake audio frame too large")
+            break
         audio.extend(message.data)
         if len(audio) < window_bytes:
             continue
@@ -3693,13 +3907,23 @@ async def wake_websocket(request: web.Request) -> web.WebSocketResponse:
             last_trigger = time.monotonic()
             await socket.send_json({"type": "wake", "word": WAKE_WORD})
             LOGGER.info("wake_word_detected word=%s", WAKE_WORD)
+    sockets.discard(socket)
     return socket
 
 
 async def websocket(request: web.Request) -> web.WebSocketResponse:
     service: LiveConversationService = request.app["service"]
-    socket = web.WebSocketResponse(heartbeat=20)
+    if not _origin_matches_request(request):
+        raise web.HTTPForbidden(text="WebSocket Origin is not allowed.")
+    sockets: set[web.WebSocketResponse] | None = request.app.get("live_sockets")
+    if sockets is None:
+        sockets = set()
+    if len(sockets) >= MAX_LIVE_CONNECTIONS:
+        raise web.HTTPServiceUnavailable(text="Conversation capacity reached.")
+    socket = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_WS_MESSAGE_BYTES)
     await socket.prepare(request)
+    sockets.add(socket)
+    _increment_metric(service, "websocket_connections_total")
     await socket.send_json({"type": "history", "messages": service.recent_history()})
     await socket.send_json(service.settings_payload())
     while service.pending_spoken_replies:
@@ -3708,7 +3932,9 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
             socket, reply, "agent", f"agent-reconnect-{time.monotonic_ns()}"
         )
     audio = bytearray()
-    turn_queue: asyncio.Queue[tuple[bytes, int, str | None, str | None]] = asyncio.Queue()
+    turn_queue: asyncio.Queue[tuple[bytes, int, str | None, str | None]] = asyncio.Queue(
+        maxsize=MAX_PENDING_TURNS
+    )
     turn_worker: asyncio.Task[None] | None = None
     partial_task: asyncio.Task[None] | None = None
     silent_stop_detected = False
@@ -3986,7 +4212,16 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
     async for message in socket:
         if message.type != WSMsgType.TEXT:
             continue
-        payload = json.loads(message.data)
+        try:
+            payload = json.loads(message.data)
+        except (ValueError, TypeError):
+            _increment_metric(service, "invalid_messages_total")
+            await socket.send_json({"type": "error", "message": "Invalid JSON message."})
+            continue
+        if not isinstance(payload, dict):
+            _increment_metric(service, "invalid_messages_total")
+            await socket.send_json({"type": "error", "message": "Message must be an object."})
+            continue
         kind = payload.get("type")
         if kind == "input_audio_buffer.speech_started":
             user_input_active = True
@@ -3999,6 +4234,9 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
         elif kind == "set_audio_capture":
             service.set_audio_capture_enabled(bool(payload.get("enabled")))
             await socket.send_json(service.settings_payload())
+        elif kind == "delete_audio_captures":
+            deleted = service.delete_audio_captures()
+            await socket.send_json({"type": "recordings_deleted", **deleted})
         elif kind == "send_for_debug":
             if service.debug_status.get("state") in {"collecting", "working"}:
                 await socket.send_json(service.settings_payload())
@@ -4023,7 +4261,20 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
                 SAMPLE_RATE * 2 * PARTIAL_TRANSCRIPT_INTERVAL_SECONDS
             )
         elif kind == "audio":
-            audio.extend(base64.b64decode(payload.get("audioBase64", ""), validate=True))
+            try:
+                chunk = base64.b64decode(payload.get("audioBase64", ""), validate=True)
+            except (ValueError, TypeError):
+                _increment_metric(service, "invalid_audio_frames_total")
+                await socket.send_json({"type": "error", "message": "Invalid audio frame."})
+                continue
+            if len(chunk) > MAX_WS_MESSAGE_BYTES or len(audio) + len(chunk) > MAX_TURN_AUDIO_BYTES:
+                audio.clear()
+                _increment_metric(service, "audio_limit_rejections_total")
+                await socket.send_json({
+                    "type": "error", "message": "Audio turn exceeded the production safety limit."
+                })
+                continue
+            audio.extend(chunk)
             if (
                 len(audio) >= next_partial_bytes
                 and (not partial_task or partial_task.done())
@@ -4112,18 +4363,28 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
                 final_transcript = await service.finalize_online_transcript(
                     turn, online_transcript
                 )
-            turn_queue.put_nowait(
-                (turn, service.speech_generation, final_transcript or None, capture_id)
-            )
+            try:
+                turn_queue.put_nowait(
+                    (turn, service.speech_generation, final_transcript or None, capture_id)
+                )
+            except asyncio.QueueFull:
+                _increment_metric(service, "turn_queue_rejections_total")
+                await socket.send_json({
+                    "type": "error", "message": "Conversation is busy. Please retry this turn."
+                })
         elif kind == "client_event":
-            event = str(payload.get("event", ""))
-            detail = str(payload.get("detail", ""))
+            event = str(payload.get("event", ""))[:80]
+            detail = str(payload.get("detail", ""))[:2000]
             if event in {"voice_processing", "speech_started", "barge_in"}:
                 client_context[event] = detail
             LOGGER.info("client_event event=%s detail=%s", payload.get("event", ""), payload.get("detail", ""))
+        else:
+            _increment_metric(service, "invalid_messages_total")
+            await socket.send_json({"type": "error", "message": "Unsupported message type."})
     if turn_worker and not turn_worker.done():
         turn_worker.cancel()
     conversation_idle.set()
+    sockets.discard(socket)
     # Agent tasks deliberately survive a WebView disconnect. Their final reply
     # is persisted and queued for speech when Live Conversation reconnects.
     return socket
@@ -4136,12 +4397,19 @@ async def build_app(args: argparse.Namespace) -> web.Application:
         getattr(args, "settings_path", DEFAULT_SETTINGS_PATH),
         getattr(args, "recordings_path", DEFAULT_RECORDINGS_PATH),
         getattr(args, "debug_path", DEFAULT_DEBUG_PATH),
+        getattr(args, "recording_retention_days", DEFAULT_RECORDING_RETENTION_DAYS),
+        getattr(args, "debug_retention_days", DEFAULT_DEBUG_RETENTION_DAYS),
+        getattr(args, "recording_max_bytes", DEFAULT_RECORDING_MAX_BYTES),
+        getattr(args, "debug_max_bytes", DEFAULT_DEBUG_MAX_BYTES),
     )
     await service.start()
-    app = web.Application()
+    app = web.Application(client_max_size=MAX_HTTP_BODY_BYTES, middlewares=[security_headers])
     app["service"] = service
+    app["live_sockets"] = set()
+    app["wake_sockets"] = set()
     app.router.add_get("/", index)
     app.router.add_get("/health", health)
+    app.router.add_get("/metrics", metrics)
     app.router.add_get("/wake", wake_websocket)
     app.router.add_get("/ws", websocket)
     async def cleanup(_: web.Application) -> None:
@@ -4154,13 +4422,29 @@ async def build_app(args: argparse.Namespace) -> web.Application:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--session-key", default=DEFAULT_SESSION_KEY)
     parser.add_argument("--history-path", default=DEFAULT_HISTORY_PATH)
     parser.add_argument("--settings-path", default=DEFAULT_SETTINGS_PATH)
     parser.add_argument("--recordings-path", default=DEFAULT_RECORDINGS_PATH)
     parser.add_argument("--debug-path", default=DEFAULT_DEBUG_PATH)
+    parser.add_argument(
+        "--recording-retention-days", type=int,
+        default=int(os.environ.get("LIVE_CONVERSATION_RECORDING_RETENTION_DAYS", DEFAULT_RECORDING_RETENTION_DAYS)),
+    )
+    parser.add_argument(
+        "--debug-retention-days", type=int,
+        default=int(os.environ.get("LIVE_CONVERSATION_DEBUG_RETENTION_DAYS", DEFAULT_DEBUG_RETENTION_DAYS)),
+    )
+    parser.add_argument(
+        "--recording-max-bytes", type=int,
+        default=int(os.environ.get("LIVE_CONVERSATION_RECORDING_MAX_BYTES", DEFAULT_RECORDING_MAX_BYTES)),
+    )
+    parser.add_argument(
+        "--debug-max-bytes", type=int,
+        default=int(os.environ.get("LIVE_CONVERSATION_DEBUG_MAX_BYTES", DEFAULT_DEBUG_MAX_BYTES)),
+    )
     parser.add_argument("--tts-speed", type=float, default=1.08)
     args = parser.parse_args()
     web.run_app(build_app(args), host=args.host, port=args.port, print=None)

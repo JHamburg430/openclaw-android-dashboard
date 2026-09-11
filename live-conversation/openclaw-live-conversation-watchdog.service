@@ -1,0 +1,12 @@
+[Unit]
+Description=Verify and recover OpenClaw Live Conversation
+After=openclaw-live-conversation.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/john/openclaw-android-dashboard/live-conversation/health-watchdog.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

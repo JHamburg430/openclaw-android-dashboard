@@ -32,7 +32,7 @@ Notes:
 - `ws://` and `wss://` gateway URLs are converted to the matching dashboard `http://` or `https://` URL automatically.
 - When a setup code includes both a raw gateway URL and a secure public URL, the app prefers the secure public URL automatically.
 - The app injects native Control UI auth into the embedded `WebView`, including the gateway password when provided, instead of relying on URL query parameters.
-- Cleartext `http://` gateways are allowed because many local OpenClaw setups, including this one, are not TLS-enabled.
+- Release builds require HTTPS for Live Conversation. Cleartext is denied by default and is limited to private `ts.net`/`openclaw.local` sibling tools; debug builds may still use a direct development endpoint.
 - Realtime Talk on Android WebView requires a secure `https://` dashboard origin, or `http://localhost` during local emulator-only testing. For real devices, use your Tailscale/MagicDNS Control UI hostname rather than a raw LAN or tailnet IP.
 
 If the gateway reports pairing is required, approve the pending request from the host:
@@ -53,7 +53,13 @@ The phone node runs as an opted-in foreground service, reconnects with bounded e
 
 Live Conversation capture uses Android's voice-communication path and reports
 the active acoustic echo cancellation, noise suppression, and automatic gain
-control state to its diagnostic stream.
+control state to its diagnostic stream. Agent speech requests transient audio
+focus, stops immediately on focus loss, and releases focus after playback.
+
+The production Live Conversation backend binds to loopback and is published to
+the tailnet through Tailscale Serve on HTTPS port 8443. Browser WebSockets are
+same-origin checked, payloads and queues are bounded, and public health excludes
+local paths, session identities, and diagnostic contents.
 
 The custom node uses OpenClaw's canonical `openclaw-android` protocol client ID because Gateway client IDs are a closed protocol enum. It remains distinguishable from the stock app by its stable device identity, **John's S25 Ultra — Dashboard** display name, Dashboard product metadata, app version, and expanded command list.
 

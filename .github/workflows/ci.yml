@@ -1,0 +1,66 @@
+name: Production gates
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+      - name: Unit, lint, and debug package
+        run: gradle --no-daemon test lint assembleDebug
+      - name: Verify release cannot silently use the debug certificate
+        run: |
+          ! grep -q 'signingConfigs.debug' app/build.gradle
+          gradle --no-daemon assembleRelease
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+  live-conversation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu -r live-conversation/requirements-ci.txt
+      - name: Python and browser regression suites
+        env:
+          PYTHONPATH: live-conversation
+        run: |
+          python -m compileall -q live-conversation
+          python -m unittest discover -s live-conversation -p 'test_*.py'
+          for suite in scripts/test-*.mjs; do node "$suite"; done
+      - name: Dependency vulnerability audit
+        run: |
+          python -m pip install pip-audit
+          # NLTK is a transitive, unused Pipecat dependency with no fixed
+          # release for PYSEC-2026-3740. Keep every actionable finding fatal.
+          pip-audit -r live-conversation/requirements-ci.txt --ignore-vuln PYSEC-2026-3740

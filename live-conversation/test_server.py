@@ -1,7 +1,9 @@
 import unittest
 from datetime import datetime
 import json
+import os
 from pathlib import Path
+import stat
 import tempfile
 import time
 import wave
@@ -31,6 +33,7 @@ from server import (
     QwenVllmTtsClient,
     TurnDecision,
     TurnUnderstanding,
+    TurnMetrics,
     MAX_HISTORY_MESSAGES,
     PROMPT_HISTORY_CHARS,
     confirmation_answer,
@@ -2847,6 +2850,121 @@ class RoutingTests(unittest.TestCase):
 
         import asyncio
         asyncio.run(run_test())
+
+class ProductionHardeningTests(unittest.TestCase):
+    def test_private_data_retention_removes_expired_files_and_preserves_recent_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recordings = root / "recordings" / "20260101"
+            debug = root / "debug" / "20260101"
+            recordings.mkdir(parents=True)
+            debug.mkdir(parents=True)
+            old_recording = recordings / "old.wav"
+            old_debug = debug / "old.json"
+            recent = recordings / "recent.wav"
+            old_recording.write_bytes(b"old")
+            old_debug.write_bytes(b"old")
+            recent.write_bytes(b"recent")
+            old = time.time() - 40 * 86400
+            os.utime(old_recording, (old, old))
+            os.utime(old_debug, (old, old))
+
+            LiveConversationService(
+                "agent:main:live-conversation", 1.15,
+                recordings_path=str(root / "recordings"),
+                debug_path=str(root / "debug"),
+                recording_retention_days=30,
+                debug_retention_days=14,
+            )
+
+            self.assertFalse(old_recording.exists())
+            self.assertFalse(old_debug.exists())
+            self.assertTrue(recent.exists())
+
+    def test_private_files_use_owner_only_permissions_and_can_be_deleted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = LiveConversationService(
+                "agent:main:live-conversation", 1.15,
+                settings_path=str(root / "settings.json"),
+                history_path=str(root / "history.json"),
+                recordings_path=str(root / "recordings"),
+            )
+            service.set_audio_capture_enabled(True)
+            capture_id = service.begin_audio_capture(b"\0\0" * 320, 1)
+            service.history.append({"role": "user", "content": "private test"})
+            service._save_history()
+            manifest = service._capture_manifest_path(capture_id)
+            wav = manifest.with_name(f"{capture_id}-user.wav")
+            for path in (root / "settings.json", root / "history.json", manifest, wav):
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            result = service.delete_audio_captures()
+            self.assertEqual(result["files"], 2)
+            self.assertFalse(manifest.exists())
+            self.assertFalse(wav.exists())
+
+    def test_health_is_sanitized_and_metrics_are_prometheus_compatible(self):
+        async def run_test():
+            from aiohttp.test_utils import TestClient, TestServer
+            from aiohttp import web
+            from server import health, metrics
+
+            service = LiveConversationService("agent:main:secret-session", 1.15)
+            service.stt = object()
+            service.stt_description = "/private/model/path"
+            service.speech_model_accelerated = True
+            service.observe_turn_metrics(TurnMetrics(asr_ms=10, total_ms=100, route="direct"))
+            app = web.Application()
+            app["service"] = service
+            app.router.add_get("/health", health)
+            app.router.add_get("/metrics", metrics)
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                health_payload = await (await client.get("/health")).json()
+                self.assertTrue(health_payload["ok"])
+                serialized = json.dumps(health_payload)
+                self.assertNotIn("secret-session", serialized)
+                self.assertNotIn("/private/model/path", serialized)
+                self.assertNotIn("debug_status", health_payload)
+                metrics_text = await (await client.get("/metrics")).text()
+                self.assertIn("openclaw_live_conversation_turns_total 1", metrics_text)
+                self.assertIn('openclaw_live_conversation_total_ms{quantile="p95"} 100.000', metrics_text)
+            finally:
+                await client.close()
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_websocket_rejects_cross_origin_browser(self):
+        async def run_test():
+            from aiohttp.test_utils import TestClient, TestServer
+            from aiohttp import web
+            from server import websocket
+
+            app = web.Application()
+            app["service"] = object()
+            app["live_sockets"] = set()
+            app.router.add_get("/ws", websocket)
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.get(
+                    "/ws", headers={"Origin": "https://attacker.invalid"}
+                )
+                self.assertEqual(response.status, 403)
+            finally:
+                await client.close()
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_page_exposes_confirmed_recording_deletion_control(self):
+        page = render_page()
+        self.assertIn("Delete all recordings", page)
+        self.assertIn("window.confirm", page)
+        self.assertIn("delete_audio_captures", page)
+
 
 if __name__ == "__main__":
     unittest.main()

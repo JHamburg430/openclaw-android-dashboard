@@ -2,6 +2,8 @@
 Description=OpenClaw Pipecat Live Conversation
 After=network-online.target openclaw-gateway.service openclaw-live-ollama.service openclaw-qwen3-tts.service
 Wants=openclaw-live-ollama.service openclaw-qwen3-tts.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -9,10 +11,28 @@ WorkingDirectory=/home/john/openclaw-android-dashboard/live-conversation
 Environment=CUDA_VISIBLE_DEVICES=0
 Environment=LIVE_CONVERSATION_TTS_BACKEND=qwen
 Environment=QWEN_TTS_STARTUP_WAIT_SECONDS=120
+Environment=LIVE_CONVERSATION_RECORDING_RETENTION_DAYS=30
+Environment=LIVE_CONVERSATION_DEBUG_RETENTION_DAYS=14
 Environment=LD_LIBRARY_PATH=/home/john/.openclaw/tools/pipecat-live-conversation/venv/lib/python3.13/site-packages/nvidia/cublas/lib:/home/john/.openclaw/tools/pipecat-live-conversation/venv/lib/python3.13/site-packages/nvidia/cudnn/lib:/home/john/.openclaw/tools/pipecat-live-conversation/venv/lib/python3.13/site-packages/nvidia/cuda_nvrtc/lib
-ExecStart=/home/john/.openclaw/tools/pipecat-live-conversation/venv/bin/python /home/john/openclaw-android-dashboard/live-conversation/server.py --port 8790
+ExecStart=/home/john/.openclaw/tools/pipecat-live-conversation/venv/bin/python /home/john/openclaw-android-dashboard/live-conversation/server.py --host 127.0.0.1 --port 8790
 Restart=on-failure
 RestartSec=3
+TimeoutStopSec=20
+KillSignal=SIGINT
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/john/.openclaw/state
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=8G
+TasksMax=512
+LimitNOFILE=4096
 
 [Install]
 WantedBy=default.target

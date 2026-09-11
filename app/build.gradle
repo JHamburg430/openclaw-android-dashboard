@@ -2,6 +2,17 @@ plugins {
     id "com.android.application"
 }
 
+def releaseStorePath = providers.gradleProperty("openclaw.release.storeFile")
+        .orElse(providers.environmentVariable("OPENCLAW_RELEASE_STORE_FILE")).orNull
+def releaseStorePassword = providers.gradleProperty("openclaw.release.storePassword")
+        .orElse(providers.environmentVariable("OPENCLAW_RELEASE_STORE_PASSWORD")).orNull
+def releaseKeyAlias = providers.gradleProperty("openclaw.release.keyAlias")
+        .orElse(providers.environmentVariable("OPENCLAW_RELEASE_KEY_ALIAS"))
+        .orElse("openclaw-dashboard").get()
+def releaseKeyPassword = providers.gradleProperty("openclaw.release.keyPassword")
+        .orElse(providers.environmentVariable("OPENCLAW_RELEASE_KEY_PASSWORD")).orNull
+        ?: releaseStorePassword
+
 android {
     namespace "ai.openclaw.dashboard"
     compileSdk 35
@@ -14,14 +25,35 @@ android {
         applicationId "ai.openclaw.dashboard"
         minSdk 31
         targetSdk 35
-        versionCode 77
-        versionName "1.0.77"
+        versionCode 78
+        versionName "1.0.78"
+    }
+
+    signingConfigs {
+        if (releaseStorePath && releaseStorePassword && releaseKeyAlias && releaseKeyPassword) {
+            release {
+                storeFile file(releaseStorePath)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+                enableV1Signing true
+                enableV2Signing true
+                enableV3Signing true
+                enableV4Signing true
+            }
+        }
     }
 
     buildTypes {
         release {
-            signingConfig signingConfigs.debug
+            signingConfig signingConfigs.findByName("release")
+            minifyEnabled false
         }
+    }
+
+    lint {
+        abortOnError true
+        checkReleaseBuilds true
     }
 }
 

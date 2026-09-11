@@ -13,6 +13,7 @@ assert.ok(activity.includes("openLiveConversation(true)"));
 assert.ok(activity.includes("boolean jarvisLaunch"));
 assert.ok(activity.indexOf("if (jarvisLaunch)") < activity.indexOf("restoreWebViewState(savedInstanceState)"));
 assert.ok(activity.includes("?autostart=1"));
+assert.ok(service.includes('"wss", null, source.getHost(), LIVE_CONVERSATION_HTTPS_PORT'));
 assert.ok(service.includes('new URI("ws", null, source.getHost(), 8790, "/wake"'));
 assert.ok(service.includes("handler.postDelayed"));
 assert.ok(service.includes("MediaRecorder.AudioSource.VOICE_RECOGNITION"));

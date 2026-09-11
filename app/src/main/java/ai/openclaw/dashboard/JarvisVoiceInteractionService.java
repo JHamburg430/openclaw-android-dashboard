@@ -30,6 +30,7 @@ public final class JarvisVoiceInteractionService extends VoiceInteractionService
     public static final String ACTION_PAUSE = "ai.openclaw.dashboard.action.PAUSE_JARVIS_WAKE";
     private static final String TAG = "JarvisWake";
     private static final String PREFS = "openclaw_dashboard";
+    private static final int LIVE_CONVERSATION_HTTPS_PORT = 8443;
     private final AtomicBoolean listening = new AtomicBoolean(false);
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final OkHttpClient client = new OkHttpClient.Builder().pingInterval(15, TimeUnit.SECONDS).build();
@@ -97,7 +98,16 @@ public final class JarvisVoiceInteractionService extends VoiceInteractionService
         try {
             URI source = URI.create(configured);
             if (source.getHost() == null) return null;
-            return new URI("ws", null, source.getHost(), 8790, "/wake", null, null).toString();
+            if ("https".equalsIgnoreCase(source.getScheme())) {
+                return new URI(
+                        "wss", null, source.getHost(), LIVE_CONVERSATION_HTTPS_PORT,
+                        "/wake", null, null).toString();
+            }
+            if (BuildConfig.DEBUG) {
+                return new URI("ws", null, source.getHost(), 8790, "/wake", null, null).toString();
+            }
+            Log.w(TAG, "Secure dashboard URL is required for Jarvis wake listening");
+            return null;
         } catch (Exception error) {
             Log.w(TAG, "Invalid gateway URL for Jarvis", error);
             return null;

@@ -13,6 +13,10 @@ class AndroidPhoneNodeReconnectTests(unittest.TestCase):
         cls.auth = (ROOT / "app/src/main/java/ai/openclaw/dashboard/GatewayConnectAuth.java").read_text()
         cls.receiver = (ROOT / "app/src/main/java/ai/openclaw/dashboard/PhoneNodeBootReceiver.java").read_text()
         cls.manifest = (ROOT / "app/src/main/AndroidManifest.xml").read_text()
+        cls.activity = (ROOT / "app/src/main/java/ai/openclaw/dashboard/MainActivity.java").read_text()
+        cls.wake = (ROOT / "app/src/main/java/ai/openclaw/dashboard/JarvisVoiceInteractionService.java").read_text()
+        cls.network_security = (ROOT / "app/src/main/res/xml/network_security_config.xml").read_text()
+        cls.gradle = (ROOT / "app/build.gradle").read_text()
 
     def test_service_is_sticky_and_independent_of_activity_task(self):
         self.assertIn("return START_STICKY;", self.service)
@@ -46,6 +50,29 @@ class AndroidPhoneNodeReconnectTests(unittest.TestCase):
         self.assertIn("token == null && normalizedPassword == null && deviceToken != null", self.auth)
         self.assertIn('auth.put("deviceToken", selectedAuth.deviceToken)', self.client)
         self.assertNotIn('auth.put("token", authToken)', self.client)
+
+    def test_release_transport_uses_tls_and_cleartext_is_narrowly_scoped(self):
+        self.assertIn('android:allowBackup="false"', self.manifest)
+        self.assertIn('android:usesCleartextTraffic="false"', self.manifest)
+        self.assertIn('android:networkSecurityConfig="@xml/network_security_config"', self.manifest)
+        self.assertIn('<base-config cleartextTrafficPermitted="false"', self.network_security)
+        self.assertIn('<domain includeSubdomains="true">ts.net</domain>', self.network_security)
+        self.assertIn('return "https://" + host + ":" + LIVE_CONVERSATION_HTTPS_PORT', self.activity)
+        self.assertIn('new URI(\n                        "wss"', self.wake)
+        self.assertIn('if (BuildConfig.DEBUG)', self.activity)
+        self.assertIn('if (BuildConfig.DEBUG)', self.wake)
+
+    def test_voice_playback_owns_and_releases_transient_audio_focus(self):
+        self.assertIn("new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)", self.activity)
+        self.assertIn(".setWillPauseWhenDucked(true)", self.activity)
+        self.assertIn("AUDIOFOCUS_LOSS_TRANSIENT", self.activity)
+        self.assertIn("abandonAudioFocusRequest(speechAudioFocusRequest)", self.activity)
+
+    def test_release_signing_never_falls_back_to_debug_certificate(self):
+        release_block = self.gradle.split("buildTypes", 1)[1]
+        self.assertNotIn("signingConfigs.debug", release_block)
+        self.assertIn('OPENCLAW_RELEASE_STORE_FILE', self.gradle)
+        self.assertIn('signingConfig signingConfigs.findByName("release")', self.gradle)
 
 
 if __name__ == "__main__":
