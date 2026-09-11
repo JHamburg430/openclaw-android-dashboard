@@ -18,7 +18,7 @@ import wave
 from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transcriptions.language import Language
 
-from server import LiveConversationService, SAMPLE_RATE
+from server import LiveConversationService, SAMPLE_RATE, is_gateway_status_question
 
 
 def _words(text: str) -> set[str]:
@@ -117,6 +117,33 @@ class RecordedPhoneAudioTests(unittest.TestCase):
             {"live", "conversation", "agent"}.issubset(words),
             f"quiet requested subject was clipped from captured phone audio: {actual!r}",
         )
+
+    def test_status_indicator_delegation_is_not_a_gateway_status_question(self) -> None:
+        """Replay the capture whose UI wording triggered the status shortcut."""
+        capture_id = "20260910T193957.715784-2-95bafe"
+        manifest_path = next(
+            (path for path in self.manifests if path.stem == capture_id), None
+        )
+        if manifest_path is None:
+            self.skipTest(f"captured Android regression audio {capture_id} is unavailable")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        wav_path = manifest_path.parent / manifest["user_audio"]
+
+        async def replay() -> str:
+            service = LiveConversationService("agent:main:status-indicator-regression", 1.15)
+            service.stt = self.stt
+            with wave.open(str(wav_path), "rb") as recording:
+                pcm = recording.readframes(recording.getnframes())
+            return await service.transcribe(pcm, purpose="final")
+
+        actual = asyncio.run(replay())
+        words = _words(actual)
+        self.assertTrue(
+            {"agent", "status", "indicator", "acknowledge", "correction", "install"}
+            .issubset(words),
+            f"captured delegation lost required terms: {actual!r}",
+        )
+        self.assertFalse(is_gateway_status_question(actual), actual)
 
 
 if __name__ == "__main__":

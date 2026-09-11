@@ -62,6 +62,7 @@ SPEECH_MODEL_KEEP_ALIVE = "30m"
 SPEECH_MODEL_CONTEXT = 8_192
 SPEECH_NUM_PREDICT = 384
 SPEECH_RETRY_NUM_PREDICT = 640
+DEGRADED_SPEECH_TIMEOUT_SECONDS = 8
 AGENT_SENTINEL = "[[OPENCLAW_AGENT]]"
 NEW_AGENT_SENTINEL = "[[OPENCLAW_NEW]]"
 SAY_SENTINEL = "[[SAY]]"
@@ -473,7 +474,7 @@ def has_explicit_action_request(transcript: str) -> bool:
     return bool(
         re.search(r"\b(?:can|could|would|will) you\b|\bplease\b", normalized)
         or re.search(r"\b(?:i need|i want) you to\b", normalized)
-        or re.search(r"\b(?:have|ask|tell|assign|get)\b.*\bagent\b", normalized)
+        or re.search(r"\b(?:have|ask|tell|task|assign|get)\b.*\bagent\b", normalized)
         or re.match(
             r"^(?:also )?(?:fix|change|update|monitor|verify|review|inspect|check|"
             r"start|spawn|launch|create|assign|send|set|add|remove|stop|run|build|deploy)\b",
@@ -484,6 +485,38 @@ def has_explicit_action_request(transcript: str) -> bool:
             normalized,
         )
     )
+
+
+def requires_tool_backed_action(transcript: str) -> bool:
+    """Identify explicit operations for the deterministic degraded router.
+
+    ``has_explicit_action_request`` intentionally treats polite request language
+    as authorization once the semantic model has classified a tool route.  The
+    degraded router has no semantic classification, so it must not interpret a
+    conversational request such as "please answer briefly" as permission to
+    launch an agent.
+    """
+    normalized = re.sub(r"[^a-z0-9']+", " ", transcript.lower()).strip()
+    if is_explicit_new_agent_request(normalized):
+        return True
+    if re.search(r"\b(?:have|ask|tell|task|assign|get)\b.*\b(?:agent|subagent)\b", normalized):
+        return True
+    operational = (
+        r"fix|change|update|monitor|verify|review|inspect|check|investigate|"
+        r"start|spawn|launch|create|assign|send|set|add|remove|stop|run|build|"
+        r"deploy|install|configure|search|find|look up"
+    )
+    if re.match(rf"^(?:also |please )?(?:{operational})\b", normalized):
+        return True
+    if re.search(
+        rf"\b(?:can|could|would|will) you (?:please )?(?:{operational})\b",
+        normalized,
+    ):
+        return True
+    return bool(re.search(
+        r"\bneeds? (?:to be )?(?:fixed|changed|updated|reviewed|checked|investigated)\b",
+        normalized,
+    ))
 
 
 def requires_authoritative_lookup(transcript: str) -> bool:
@@ -648,6 +681,7 @@ one of `new`, `continuation`, `correction`, or `meta`; incompleteness belongs on
 - `speech_act` describes the whole utterance. `meta` means the speaker is asking about or correcting the assistant's immediately preceding behavior, plan, wording, or claim.
 - `relation` describes how this transcript relates to the unresolved fragment or recent dialogue. Use `continuation` when it completes the unresolved thought, `correction` when it replaces/repairs it, and `meta` for questions such as "What are you going to verify?" A self-contained question with no unresolved reference is `new`; do not force it into an earlier test pattern merely because topics or wording repeat.
 - `actionable` is true only for an actual request, command, or unmistakable instruction to do work. Mentioning words such as latest, verify, agent, update, test, or fix is not authorization by itself.
+- Requests to answer, explain, define, describe, calculate, or name timeless knowledge directly are not tool actions; set `actionable` false unless they also require current, private, or tool-backed evidence.
 - `requires_grounding` is true only when answering the complete communicative act requires current/private/tool-backed evidence. A meta-question about what the assistant just said does not require grounding merely because it repeats "verify" or "latest".
 - `supersedes_previous` is true when this turn corrects, retracts, or replaces the prior turn or its planned response.
 - `clarification_needed` is true when the committed speech is too garbled, contradictory, or semantically incoherent to recover confidently. This is different from an intelligible unfinished thought: unfinished speech waits for a continuation, while unclear speech gets one brief request to repeat or rephrase it. Never use a backchannel as the answer to unclear speech.
@@ -1608,6 +1642,8 @@ class LiveConversationService:
         self.pending_fragment = ""
         self.pending_fragment_turn_id: str | None = None
         self.last_turn_understanding: TurnUnderstanding | None = None
+        self.speech_model_accelerated: bool | None = None
+        self.speech_model_acceleration_checked_at = 0.0
         self.superseded_turn_ids: set[str] = set()
         self.recent_agent_sessions: deque[dict[str, Any]] = deque(maxlen=12)
         self.history_path = Path(history_path) if history_path else None
@@ -2279,14 +2315,98 @@ class LiveConversationService:
                     response.raise_for_status()
                     await response.read()
             LOGGER.info("speech_model_warm model=%s", SPEECH_MODEL)
+            await self.refresh_speech_model_acceleration(force=True)
         except Exception as error:
             LOGGER.warning("speech_model_warm_failed error=%s", error)
+
+    async def refresh_speech_model_acceleration(self, force: bool = False) -> bool | None:
+        """Report whether Ollama actually placed the speech router in VRAM.
+
+        Ollama can accept a CUDA device, fail to initialize it, and silently
+        reload the model on CPU. Its chat endpoint remains healthy in that
+        state, but the full conversation prompt misses every latency deadline.
+        """
+        now = time.monotonic()
+        if not force and now - self.speech_model_acceleration_checked_at < 2:
+            return self.speech_model_accelerated
+        ps_url = SPEECH_MODEL_URL.rsplit("/api/chat", 1)[0] + "/api/ps"
+        try:
+            timeout = aiohttp.ClientTimeout(total=0.75)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(ps_url) as response:
+                    response.raise_for_status()
+                    payload = await response.json()
+            matching = [
+                item for item in payload.get("models", [])
+                if item.get("name") == SPEECH_MODEL or item.get("model") == SPEECH_MODEL
+            ]
+            accelerated = bool(matching and int(matching[0].get("size_vram") or 0) > 0)
+            if accelerated != self.speech_model_accelerated:
+                LOGGER.warning(
+                    "speech_model_acceleration_changed accelerated=%s size_vram=%s",
+                    accelerated,
+                    matching[0].get("size_vram") if matching else "model-not-loaded",
+                )
+            self.speech_model_accelerated = accelerated
+            self.speech_model_acceleration_checked_at = now
+            return accelerated
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as error:
+            LOGGER.warning("speech_model_acceleration_check_failed error=%s", error)
+            return self.speech_model_accelerated
+
+    async def degraded_speech_reply(self, text: str) -> tuple[str, str, str | None]:
+        """Keep voice routing useful when the dedicated model loses GPU use."""
+        normalized = re.sub(r"\s+", " ", text).strip()
+        lowered = normalized.casefold()
+        if re.match(r"^(?:i am|i'm|just )?(?:testing|trying out|testing out)\b", lowered):
+            return "direct", "I hear you. Go ahead with the test.", None
+        if requires_tool_backed_action(normalized):
+            route = "new_agent" if is_explicit_new_agent_request(normalized) else "agent"
+            return route, "I'll have the agent handle that.", None
+        if requires_authoritative_lookup(normalized):
+            return "agent", "I'll verify that against a current source.", None
+
+        payload = {
+            "model": SPEECH_MODEL,
+            "keep_alive": SPEECH_MODEL_KEEP_ALIVE,
+            "stream": False,
+            "think": False,
+            "messages": [
+                {"role": "system", "content": (
+                    "Answer the user directly in one concise, natural spoken sentence. "
+                    "Never claim to perform an action or know changing current facts."
+                )},
+                {"role": "user", "content": normalized},
+            ],
+            "options": {
+                "temperature": 0,
+                "num_predict": 96,
+                "num_ctx": SPEECH_MODEL_CONTEXT,
+            },
+        }
+        try:
+            timeout = aiohttp.ClientTimeout(total=DEGRADED_SPEECH_TIMEOUT_SECONDS)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(SPEECH_MODEL_URL, json=payload) as response:
+                    response.raise_for_status()
+                    result = await response.json()
+            reply = str(result.get("message", {}).get("content", "")).strip()
+            if reply:
+                reply = remove_unrequested_action_promises(reply)
+                LOGGER.warning("speech_supervisor_degraded_direct_reply chars=%d", len(reply))
+                return "direct", reply, None
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as error:
+            LOGGER.warning("speech_supervisor_degraded_reply_failed error=%s", error)
+        return "direct", "I couldn't process that quickly. Please try again.", None
 
     async def poll_sessions(self) -> None:
         while True:
             await asyncio.sleep(SESSION_POLL_SECONDS)
             try:
-                await self.refresh_sessions()
+                await asyncio.gather(
+                    self.refresh_sessions(),
+                    self.refresh_speech_model_acceleration(force=True),
+                )
             except Exception as error:
                 LOGGER.warning("session_poll_failed error=%s", error)
 
@@ -2410,6 +2530,9 @@ class LiveConversationService:
         self, transcript: str
     ) -> tuple[bool, float] | None:
         """Veto premature acoustic endpoints with a meaning-level judgment."""
+        if self.speech_model_accelerated is False:
+            LOGGER.warning("semantic_endpoint_skipped_degraded_speech_model")
+            return None
         payload = {
             "model": SPEECH_MODEL,
             "keep_alive": SPEECH_MODEL_KEEP_ALIVE,
@@ -2685,6 +2808,10 @@ class LiveConversationService:
                     ), None
             return "direct", summarize_gateway_status(self.sessions, agent_pending), None
 
+        if self.speech_model_accelerated is False:
+            LOGGER.warning("speech_supervisor_using_degraded_route")
+            return await self.degraded_speech_reply(text)
+
         if time.monotonic() - self.capabilities_updated_at >= CAPABILITY_CACHE_SECONDS:
             if not self.capability_refresh_task or self.capability_refresh_task.done():
                 self.capability_refresh_task = asyncio.create_task(self.refresh_capabilities())
@@ -2904,6 +3031,15 @@ class LiveConversationService:
                 self.pending_fragment_turn_id = None
 
             route, reply, target_session = parse_speech_model_output(raw_decision)
+            if (
+                route in {"agent", "new_agent", "session"}
+                and understanding.actionable
+                and not understanding.requires_grounding
+                and not requires_tool_backed_action(effective_text)
+            ):
+                LOGGER.warning("speech_supervisor_repaired_direct_knowledge_request")
+                route, target_session = "direct", None
+                reply = await self.generate_direct_answer(effective_text)
             if is_referential_agent_question(effective_text) and understanding.actionable:
                 tracked = self.resolve_agent_session(effective_text)
                 if tracked:
@@ -2954,6 +3090,12 @@ class LiveConversationService:
                 raise ValueError("speech model returned no speakable text")
             return route, reply, target_session
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+            if await self.refresh_speech_model_acceleration(force=True) is False:
+                LOGGER.warning(
+                    "speech_supervisor_failed_over_to_degraded_route error=%s",
+                    error or error.__class__.__name__,
+                )
+                return await self.degraded_speech_reply(text)
             raise RuntimeError(f"Speech supervisor unavailable: {error}") from error
 
     async def semantic_fragment_resolution(
@@ -3486,6 +3628,15 @@ async def health(request: web.Request) -> web.Response:
         "stt": service.stt_description,
         "online_asr": "local-agreement-stable-prefix",
         "semantic_turn": service.semantic_turn_description,
+        "speech_router": {
+            "model": SPEECH_MODEL,
+            "accelerated": service.speech_model_accelerated,
+            "mode": (
+                "gpu" if service.speech_model_accelerated is True
+                else "degraded_cpu" if service.speech_model_accelerated is False
+                else "unknown"
+            ),
+        },
         "tts": service.tts_backend_description,
         "history_messages": len(service.history),
         "conversation_events": len(service.events),

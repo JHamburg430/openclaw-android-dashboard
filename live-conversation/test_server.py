@@ -56,6 +56,7 @@ from server import (
     normalize_spoken_text,
     latest_assistant_text,
     remove_unrequested_action_promises,
+    requires_tool_backed_action,
     requires_authoritative_lookup,
     render_page,
     split_spoken_text,
@@ -142,6 +143,87 @@ class RoutingTests(unittest.TestCase):
         )
         self.assertIn("model operating Live Conversation", direct_voice_surface_reply("Who are you?"))
         self.assertIsNone(direct_voice_surface_reply("Can you check the RAG app?"))
+
+    def test_degraded_router_answers_captured_test_turn_without_full_model(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:degraded-test", 1.15)
+            service.speech_model_accelerated = False
+            with patch("server.aiohttp.ClientSession") as session:
+                route, reply, target = await service.speech_reply(
+                    "testing out the live conversation."
+                )
+            self.assertEqual((route, reply, target), (
+                "direct", "I hear you. Go ahead with the test.", None
+            ))
+            session.assert_not_called()
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_degraded_router_preserves_explicit_action_authorization(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:degraded-action", 1.15)
+            service.speech_model_accelerated = False
+            route, reply, target = await service.speech_reply(
+                "Task an agent with fixing the live conversation."
+            )
+            self.assertEqual(route, "agent")
+            self.assertIn("agent", reply)
+            self.assertIsNone(target)
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_degraded_router_keeps_polite_knowledge_request_direct(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:degraded-question", 1.15)
+            service.speech_model_accelerated = False
+            session_context, _ = mock_semantic_model("The sky appears blue.")
+            with patch("server.aiohttp.ClientSession", return_value=session_context):
+                route, reply, target = await service.speech_reply(
+                    "Please answer briefly. What colour is a clear daytime sky?"
+                )
+            self.assertEqual((route, reply, target), (
+                "direct", "The sky appears blue.", None
+            ))
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_degraded_tool_action_classifier_separates_answers_from_operations(self):
+        self.assertFalse(requires_tool_backed_action(
+            "Please answer briefly. What is two plus two?"
+        ))
+        self.assertTrue(requires_tool_backed_action("Please fix the response latency."))
+        self.assertTrue(requires_tool_backed_action("Can you check the service logs?"))
+        self.assertTrue(requires_tool_backed_action(
+            "Task an agent with fixing the live conversation."
+        ))
+
+    def test_semantic_router_repairs_timeless_explanation_misclassified_as_action(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:direct-explanation", 1.15)
+            service.sessions_updated_at = time.monotonic()
+            service.capabilities_updated_at = time.monotonic()
+            decision = semantic_decision(
+                "agent", "I'll have the agent explain it.", actionable=True,
+                speech_act="request", assembled_text=(
+                    "Please explain photosynthesis in five sentences."
+                ),
+            )
+            client, _ = mock_semantic_model(
+                decision, "Photosynthesis converts light into chemical energy."
+            )
+            with patch("server.aiohttp.ClientSession", return_value=client):
+                route, reply, target = await service.speech_reply(
+                    "Please explain photosynthesis in five sentences."
+                )
+            self.assertEqual((route, reply, target), (
+                "direct", "Photosynthesis converts light into chemical energy.", None
+            ))
+
+        import asyncio
+        asyncio.run(run_test())
 
     def test_online_transcript_separates_stable_and_revisable_prefixes(self):
         state = OnlineTranscript.empty()

@@ -351,6 +351,10 @@ async def run_matrix(url: str) -> dict:
                 and contains_words(e.get("text", ""), ("photosynthesis",))
             )
             first_reply = await live.wait(lambda e: e.get("type") == "reply")
+            if first_reply.get("route") != "direct":
+                raise AssertionError(
+                    f"timeless explanation unexpectedly delegated: {first_reply}"
+                )
             await live.wait(
                 lambda e: e.get("type") == "response.output_audio.delta"
                 and e.get("responseId") == first_reply.get("responseId")
