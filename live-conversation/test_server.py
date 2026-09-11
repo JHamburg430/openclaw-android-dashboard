@@ -1198,6 +1198,33 @@ class RoutingTests(unittest.TestCase):
             self.assertNotIn("hidden", redacted)
             self.assertEqual(redacted.count("[REDACTED]"), 3)
 
+    def test_in_flight_debug_status_becomes_interrupted_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            service = LiveConversationService(
+                "agent:main:live-conversation", 1.15,
+                settings_path=str(settings_path),
+            )
+            service.set_debug_status(
+                "working", request_id="debug-123", bundle_path="/tmp/debug.json",
+                message="Correction agent is diagnosing the captured conversation.",
+            )
+
+            restarted = LiveConversationService(
+                "agent:main:live-conversation", 1.15,
+                settings_path=str(settings_path),
+            )
+
+            self.assertEqual(restarted.debug_status["state"], "failed")
+            self.assertEqual(restarted.debug_status["request_id"], "debug-123")
+            self.assertEqual(restarted.debug_status["bundle_path"], "/tmp/debug.json")
+            self.assertIn("interrupted", restarted.debug_status["message"])
+            self.assertIn("completed_at", restarted.debug_status)
+            self.assertEqual(
+                json.loads(settings_path.read_text(encoding="utf-8"))["debug_status"]["state"],
+                "failed",
+            )
+
     def test_debug_bundle_contains_conversation_audio_and_system_context(self):
         async def run_test():
             with tempfile.TemporaryDirectory() as directory:

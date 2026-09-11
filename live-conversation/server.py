@@ -1658,6 +1658,7 @@ class LiveConversationService:
     def _load_settings(self) -> None:
         if not self.settings_path or not self.settings_path.exists():
             return
+        interrupted_debug = False
         try:
             payload = json.loads(self.settings_path.read_text(encoding="utf-8"))
             self.confirmation_required = payload.get("action_confirmation") == "confirm"
@@ -1665,6 +1666,17 @@ class LiveConversationService:
             debug_status = payload.get("debug_status")
             if isinstance(debug_status, dict) and isinstance(debug_status.get("state"), str):
                 self.debug_status = dict(debug_status)
+                if self.debug_status.get("state") in {"collecting", "working"}:
+                    self.debug_status.update({
+                        "state": "failed",
+                        "completed_at": int(time.time()),
+                        "message": (
+                            "The correction session was interrupted before completion. "
+                            "The diagnostic bundle was retained."
+                        ),
+                        "error": "Correction session interrupted by service restart.",
+                    })
+                    interrupted_debug = True
             tracked = payload.get("recent_agent_sessions", [])
             if isinstance(tracked, list):
                 for item in tracked[-12:]:
@@ -1674,6 +1686,8 @@ class LiveConversationService:
                         and isinstance(item.get("request"), str)
                     ):
                         self.recent_agent_sessions.append(dict(item))
+            if interrupted_debug:
+                self._save_settings()
         except (OSError, ValueError, TypeError) as error:
             LOGGER.warning("conversation_settings_load_failed error=%s", error)
 
