@@ -32,6 +32,12 @@ from server import (
 
 
 FRAME_BYTES = SAMPLE_RATE * 2 // 50
+LATENCY_LIMIT_MS = {
+    "asr_ms": 2_500,
+    "routing_ms": 30_000,
+    "tts_ms": 4_000,
+    "total_ms": 35_000,
+}
 
 
 def silence(milliseconds: int) -> bytes:
@@ -73,6 +79,18 @@ def contains_words(text: str, words: tuple[str, ...]) -> bool:
         ).split()
     }
     return all(aliases.get(word.lower(), word.lower()) in heard for word in words)
+
+
+def assert_latency_budget(metrics: dict) -> None:
+    """Fail the release gate when a healthy local pipeline regresses badly."""
+    for field, limit in LATENCY_LIMIT_MS.items():
+        value = metrics.get(field)
+        if not isinstance(value, (int, float)):
+            raise AssertionError(f"missing numeric latency metric {field}: {metrics}")
+        if value > limit:
+            raise AssertionError(
+                f"{field} exceeded the {limit} ms release budget: {value} ms"
+            )
 
 
 @dataclass
@@ -163,6 +181,7 @@ async def finish_turn(live: LiveSocket, expected: tuple[str, ...]) -> TurnResult
         and e.get("responseId") == response_id
     )
     metrics = await live.wait(lambda e: e.get("type") == "metrics")
+    assert_latency_budget(metrics)
     relevant = live.all_events[start_index:]
     pcm = b"".join(
         base64.b64decode(event["audioBase64"])

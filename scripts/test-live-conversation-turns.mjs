@@ -288,10 +288,17 @@ function harness() {
 {
   const app = harness();
   app.socket.server({ type: "output_audio_buffer.started", responseId: "one" });
+  app.run(0.040, 14);
+  app.run(0.001, 10);
+  assert.equal(app.count("start"), 0,
+    "a short listener acknowledgment does not falsely interrupt playback");
+  assert.equal(app.interrupts, 0, "a false interruption never reaches native playback");
   app.run(0.020, 30);
   assert.equal(app.count("start"), 0, "moderate playback/background energy does not self-interrupt");
-  app.run(0.040, 10);
+  app.run(0.040, 15);
   assert.equal(app.count("start"), 1, "confirmed user speech interrupts assistant playback");
+  app.run(0.040, 50);
+  assert.equal(app.count("start"), 1, "one sustained barge-in creates exactly one user turn");
   assert.equal(app.interrupts, 1, "native playback is interrupted once");
   assert.ok(app.sent.some((message) => message.type === "client_event" && message.event === "barge_in"));
 }

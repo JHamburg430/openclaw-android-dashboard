@@ -83,6 +83,32 @@ def _mix_pcm(foreground: bytes, background: bytes, background_gain: float = 0.25
     return np.clip(front + back * background_gain, -32768, 32767).astype("<i2").tobytes()
 
 
+def _gain_pcm(pcm: bytes, gain: float) -> bytes:
+    """Model handset gain changes and hard limiter clipping."""
+    samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
+    return np.clip(np.rint(samples * gain), -32768, 32767).astype("<i2").tobytes()
+
+
+def _drop_realtime_frames(pcm: bytes, every: int = 23) -> bytes:
+    """Replace deterministic 20 ms microphone frames with packet-loss gaps."""
+    frame_samples = SAMPLE_RATE // 50
+    samples = np.frombuffer(pcm, dtype="<i2").copy()
+    for frame in range(every - 1, math.ceil(len(samples) / frame_samples), every):
+        start = frame * frame_samples
+        samples[start:start + frame_samples] = 0
+    return samples.tobytes()
+
+
+def _room_echo(pcm: bytes, delay_ms: int = 120, gain: float = 0.28) -> bytes:
+    """Add a delayed reflection representative of a hard-walled room."""
+    samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
+    delayed = round(SAMPLE_RATE * delay_ms / 1000)
+    output = samples.copy()
+    if delayed < len(samples):
+        output[delayed:] += samples[:-delayed] * gain
+    return np.clip(np.rint(output), -32768, 32767).astype("<i2").tobytes()
+
+
 def _rms(pcm: bytes) -> float:
     samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
     return float(math.sqrt(float(np.mean(samples * samples)))) if len(samples) else 0.0
@@ -204,6 +230,24 @@ class VoiceModelAudioIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         transcript = await service.transcribe(echo_mix)
         self.assert_words_heard(transcript, "third", "tomorrow")
+
+    async def test_real_audio_survives_mobile_channel_impairments(self) -> None:
+        """Exercise gain, clipping, packet loss, and room reflections together."""
+        service = self.service()
+        cases = {
+            "quiet_agc_with_noise": _mix_noise(
+                _gain_pcm(self.audio["second"], 0.38), rms=0.0025, seed=431
+            ),
+            "hard_limiter_clipping": _gain_pcm(self.audio["second"], 2.6),
+            "five_percent_frame_loss": _drop_realtime_frames(
+                self.audio["second"], every=20
+            ),
+            "room_reverberation": _room_echo(self.audio["second"]),
+        }
+        for impairment, pcm in cases.items():
+            with self.subTest(impairment=impairment):
+                transcript = await service.transcribe(pcm)
+                self.assert_words_heard(transcript, "second", "weather")
 
     async def test_natural_thinking_pause_remains_one_complete_input(self) -> None:
         service = self.service()

@@ -200,6 +200,49 @@ class RoutingTests(unittest.TestCase):
             "Task an agent with fixing the live conversation."
         ))
 
+    def test_adversarial_routing_corpus_preserves_least_powerful_route(self):
+        conversational = (
+            "Please answer briefly. What color is the sky?",
+            "Could you explain acoustic echo cancellation?",
+            "Would you define semantic endpointing?",
+            "Please name the largest planet.",
+            "I'm testing the agent status indicator.",
+            "Don't fix anything yet.",
+            "The dashboard needs no changes.",
+        )
+        operational = (
+            "Please investigate the audio cutoff.",
+            "Would you check the Android logs?",
+            "Set an alarm for six tomorrow.",
+            "Find the latest release notes.",
+            "Task an agent with reviewing this conversation.",
+        )
+        for transcript in conversational:
+            with self.subTest(route="direct", transcript=transcript):
+                self.assertFalse(requires_tool_backed_action(transcript))
+        for transcript in operational:
+            with self.subTest(route="tool", transcript=transcript):
+                self.assertTrue(requires_tool_backed_action(transcript))
+
+    def test_agent_status_word_collisions_never_consume_delegations(self):
+        status_questions = (
+            "What agents are currently running?",
+            "Give me the status of active agent sessions.",
+            "Are any agent tasks still working?",
+        )
+        delegations = (
+            "Task an agent with fixing the status indicator.",
+            "Assign an agent to update the session status display.",
+            "Please have an agent review the active-task progress UI.",
+        )
+        for transcript in status_questions:
+            with self.subTest(kind="status", transcript=transcript):
+                self.assertTrue(is_gateway_status_question(transcript))
+        for transcript in delegations:
+            with self.subTest(kind="delegation", transcript=transcript):
+                self.assertFalse(is_gateway_status_question(transcript))
+                self.assertTrue(has_explicit_action_request(transcript))
+
     def test_semantic_router_repairs_timeless_explanation_misclassified_as_action(self):
         async def run_test():
             service = LiveConversationService("agent:main:direct-explanation", 1.15)
@@ -2647,7 +2690,11 @@ class RoutingTests(unittest.TestCase):
     def test_playback_vad_rejects_echo_and_covers_native_tail(self):
         page = render_page()
         self.assertIn("const speechThreshold=responseActive?.025:.012", page)
-        self.assertIn("const speechRequiredMs=responseActive?200:START_CONFIRM_MS", page)
+        self.assertIn("START_CONFIRM_MS=300,BARGE_IN_CONFIRM_MS=300", page)
+        self.assertIn(
+            "const speechRequiredMs=responseActive?BARGE_IN_CONFIRM_MS:START_CONFIRM_MS",
+            page,
+        )
         self.assertIn("SEMANTIC_CHECK_MS=750", page)
         self.assertIn("HARD_ENDPOINT_MS=3500", page)
         self.assertIn("send({type:'endpoint_candidate'})", page)
