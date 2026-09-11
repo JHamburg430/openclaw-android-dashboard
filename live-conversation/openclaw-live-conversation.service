@@ -1,12 +1,14 @@
 [Unit]
 Description=OpenClaw Pipecat Live Conversation
-After=network-online.target openclaw-gateway.service openclaw-live-ollama.service
-Wants=openclaw-live-ollama.service
+After=network-online.target openclaw-gateway.service openclaw-live-ollama.service openclaw-qwen3-tts.service
+Wants=openclaw-live-ollama.service openclaw-qwen3-tts.service
 
 [Service]
 Type=simple
 WorkingDirectory=/home/john/openclaw-android-dashboard/live-conversation
 Environment=CUDA_VISIBLE_DEVICES=0
+Environment=LIVE_CONVERSATION_TTS_BACKEND=qwen
+Environment=QWEN_TTS_STARTUP_WAIT_SECONDS=120
 Environment=LD_LIBRARY_PATH=/home/john/.openclaw/tools/pipecat-live-conversation/venv/lib/python3.13/site-packages/nvidia/cublas/lib:/home/john/.openclaw/tools/pipecat-live-conversation/venv/lib/python3.13/site-packages/nvidia/cudnn/lib:/home/john/.openclaw/tools/pipecat-live-conversation/venv/lib/python3.13/site-packages/nvidia/cuda_nvrtc/lib
 ExecStart=/home/john/.openclaw/tools/pipecat-live-conversation/venv/bin/python /home/john/openclaw-android-dashboard/live-conversation/server.py --port 8790
 Restart=on-failure

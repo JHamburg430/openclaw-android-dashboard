@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+for attempt in $(seq 1 150); do
+  if curl -fsS http://127.0.0.1:8792/health >/dev/null 2>&1; then
+    break
+  fi
+  if [[ "$attempt" -eq 150 ]]; then
+    echo "Qwen3-TTS did not become healthy before warm-up" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+curl --fail --silent --show-error --max-time 180 \
+  --header 'Content-Type: application/json' \
+  --data '{"model":"Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice","input":"Ready.","voice":"aiden","instructions":"Speak naturally as a calm, concise personal assistant.","language":"English","response_format":"pcm","stream":true,"stream_format":"audio","initial_codec_chunk_frames":10}' \
+  --output /dev/null \
+  http://127.0.0.1:8792/v1/audio/speech

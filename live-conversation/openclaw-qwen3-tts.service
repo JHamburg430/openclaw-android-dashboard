@@ -1,0 +1,16 @@
+[Unit]
+Description=OpenClaw Qwen3-TTS vLLM-Omni Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/john/openclaw-android-dashboard/live-conversation
+ExecStart=/home/john/openclaw-android-dashboard/live-conversation/run-qwen3-tts-vllm-omni
+ExecStartPost=/home/john/openclaw-android-dashboard/live-conversation/warm-qwen3-tts-vllm-omni
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

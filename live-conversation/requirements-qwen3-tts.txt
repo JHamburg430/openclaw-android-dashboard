@@ -1,0 +1,5 @@
+vllm==0.28.0
+vllm-omni==0.28.0
+nvidia-cuda-nvcc==13.2.78
+nvidia-cuda-nvrtc==13.2.78
+nvidia-nvjitlink==13.2.78

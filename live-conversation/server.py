@@ -18,7 +18,7 @@ import re
 import secrets
 import struct
 import time
-from typing import Any, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 import wave
 from zoneinfo import ZoneInfo
 
@@ -43,6 +43,15 @@ DEFAULT_TTS_WORKER = str(Path(__file__).with_name("openclaw-kokoro-tts-worker"))
 DEFAULT_TTS_RUNTIME = "/home/john/.openclaw/tools/sherpa-onnx-tts/runtime"
 DEFAULT_TTS_MODEL_DIR = "/home/john/.openclaw/tools/sherpa-onnx-tts/models/kokoro-en-v0_19"
 DEFAULT_TTS_SPEAKER_ID = 9  # bm_george, a British male voice
+DEFAULT_TTS_BACKEND = "kokoro"
+DEFAULT_QWEN_TTS_URL = "http://127.0.0.1:8792/v1/audio/speech"
+DEFAULT_QWEN_TTS_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+DEFAULT_QWEN_TTS_VOICE = "aiden"
+DEFAULT_QWEN_TTS_INSTRUCTIONS = (
+    "Speak naturally as a calm, concise personal assistant. Use conversational "
+    "pacing, clear phrasing, and subtle warmth without sounding theatrical."
+)
+DEFAULT_QWEN_INITIAL_CHUNK_FRAMES = 10
 SPEECH_MODEL_URL = "http://127.0.0.1:11439/api/chat"
 # Large enough for materially better natural-language supervision while staying
 # within the sub-second warm-response budget on the local Ollama GPUs.
@@ -213,7 +222,7 @@ class OnlineTranscript:
         return tail
 
 
-def tts_speed_for(text: str, route: str = "direct", base: float = 1.15) -> float:
+def tts_speed_for(text: str, route: str = "direct", base: float = 1.08) -> float:
     """Choose restrained conversational cadence supported by Kokoro."""
     normalized = text.strip()
     if route == "backchannel":
@@ -409,6 +418,20 @@ def remove_unrequested_action_promises(text: str) -> str:
 def is_gateway_status_question(transcript: str) -> bool:
     """Recognize broad requests for currently running gateway work."""
     normalized = re.sub(r"[^a-z0-9]+", " ", transcript.lower()).strip()
+    # An action can mention both a task/agent and a UI "status" or "update"
+    # without asking for gateway-session state. Keep explicit delegation out of
+    # this deterministic shortcut so the semantic router receives the request.
+    delegation = (
+        re.search(r"^(?:please )?(?:task|assign)\b.*\b(?:agent|subagent)\b", normalized)
+        or re.search(
+            r"\b(?:have|ask|tell)\b.{0,80}\b(?:agent|subagent)\b.{0,40}"
+            r"\b(?:to|with)\b.{0,40}\b(?:fix|change|update|review|inspect|check|"
+            r"investigate|add|remove|build|deploy)\w*\b",
+            normalized,
+        )
+    )
+    if delegation:
+        return False
     subject = re.search(r"\b(?:sessions?|agents?|subagents?|tasks?|runs?)\b", normalized)
     status = re.search(r"\b(?:status|running|active|progress|update|working)\b", normalized)
     return bool(subject and status and not re.search(r"\b(?:start|launch|create)\b", normalized))
@@ -692,6 +715,26 @@ Return one JSON object matching the required schema. Choose `route` before writi
 - `ignore`: only speech clearly not addressed to you and having no plausible conversational meaning. Use an empty reply.
 For every action route (`agent`, `new_agent`, or `session`), `reply` is a brief, natural acknowledgment. Say what you are about to do; never imply the action already happened or include an unverified result. Once routing and authorization are final, the bridge dispatches the action while the acknowledgment is spoken. A silent stop command is the sole exception because its purpose is to stop speech immediately.
 Use an empty `session_key` for every route except `session`. A question about status or currently running work is `direct`; answer it from the session summary. If a transcript is semantically unfinished, set `complete` false, use `direct` with an empty reply, and take no action; the bridge will keep listening for the continuation. Imperfect grammar alone is not grounds to ignore a turn.
+
+Choose the answer shape before writing `reply`, based on John's request and the
+amount of explanation genuinely needed:
+- MICRO: use one word or one short clause for yes/no answers, acknowledgments,
+  names, simple arithmetic, and other atomic facts. Do not pad it with a preamble.
+- BRIEF: this is the default. Give the answer first, then at most one useful
+  qualifying sentence. Prefer about 10–35 spoken words.
+- SUMMARY: for status, comparisons, or multi-part results, lead with the outcome,
+  then give two or three short sentences containing only the decisive points.
+- DETAILED: use only when John asks for detail or the subject needs careful
+  explanation. Start with a one-sentence orientation, develop one idea per short
+  sentence, and use clear transitions. Do not compress several ideas into one breath.
+Never announce the mode or say "here is a summary." Do not repeat the question.
+Avoid filler, throat-clearing, Markdown, headings, parenthetical chains, semicolon
+chains, and dense spoken lists. For up to three list items, use natural ordinal
+transitions and a full sentence for each item. For a longer list, state the count,
+say only the most important items, and offer the remainder if John wants it.
+Write punctuation for speech: commas mark a light pause; periods separate complete
+thoughts; a new sentence should sound intentional rather than rushed. Vary sentence
+length naturally, but keep every sentence easy to say aloud in one breath.
 The current local date and time is {clock.strftime('%A, %B %-d, %Y, %-I:%M %p')} America/Detroit; time and date questions can be answered directly.
 Available OpenClaw capabilities (cached and refreshed automatically):
 {capabilities or 'Capability catalog is temporarily unavailable; delegate capability questions to the agent.'}
@@ -1248,7 +1291,9 @@ class IncrementalSpeechStream:
         async with self.service.speech_lock:
             if self.generation != self.service.speech_generation:
                 return
-            if not self.started:
+            async def begin_audio() -> None:
+                if self.started:
+                    return
                 await self.socket.send_json({
                     "type": "state", "state": "speaking", "route": "direct"
                 })
@@ -1256,25 +1301,69 @@ class IncrementalSpeechStream:
                     "type": "output_audio_buffer.started", "responseId": self.response_id
                 })
                 self.started = True
-            tts_started = time.perf_counter()
-            pcm = await self.service.tts.synthesize(
-                text, tts_speed_for(text, "direct", self.service.tts.speed)
-            )
-            self.tts_ms += round((time.perf_counter() - tts_started) * 1000)
-            chunk_bytes = OUTPUT_SAMPLE_RATE * 2 // 10
-            prefill_bytes = round(OUTPUT_SAMPLE_RATE * 2 * PLAYBACK_PREFILL_SECONDS)
-            for offset in range(0, len(pcm), chunk_bytes):
+
+            async def send_chunk(chunk: bytes, total_bytes: int) -> bool:
                 if self.generation != self.service.speech_generation:
-                    return
-                chunk = pcm[offset:offset + chunk_bytes]
+                    return False
                 await self.socket.send_json({
                     "type": "response.output_audio.delta",
                     "responseId": self.response_id,
                     "sampleRate": OUTPUT_SAMPLE_RATE,
                     "audioBase64": base64.b64encode(chunk).decode("ascii"),
                 })
-                if offset + len(chunk) > prefill_bytes:
+                if total_bytes > round(
+                    OUTPUT_SAMPLE_RATE * 2 * PLAYBACK_PREFILL_SECONDS
+                ):
                     await asyncio.sleep(len(chunk) / (OUTPUT_SAMPLE_RATE * 2))
+                return True
+
+            tts_started = time.perf_counter()
+            chunk_bytes = OUTPUT_SAMPLE_RATE * 2 // 10
+            total_bytes = 0
+            if hasattr(self.service.tts, "stream_synthesize"):
+                pending_pcm = bytearray()
+                stream = self.service.tts.stream_synthesize(
+                    text, tts_speed_for(text, "direct", self.service.tts.speed)
+                )
+                first_audio = True
+                try:
+                    async for raw_chunk in stream:
+                        if first_audio:
+                            first_audio = False
+                            first_ms = round((time.perf_counter() - tts_started) * 1000)
+                            self.tts_ms += first_ms
+                            await begin_audio()
+                            LOGGER.info(
+                                "incremental_stream_start id=%s chars=%d backend=qwen first_tts_ms=%d",
+                                self.response_id, len(text), first_ms,
+                            )
+                        pending_pcm.extend(raw_chunk)
+                        while len(pending_pcm) >= chunk_bytes:
+                            chunk = bytes(pending_pcm[:chunk_bytes])
+                            del pending_pcm[:chunk_bytes]
+                            total_bytes += len(chunk)
+                            if not await send_chunk(chunk, total_bytes):
+                                return
+                    if first_audio:
+                        raise RuntimeError("Qwen TTS returned no audio")
+                    if pending_pcm:
+                        total_bytes += len(pending_pcm)
+                        await send_chunk(bytes(pending_pcm), total_bytes)
+                finally:
+                    close = getattr(stream, "aclose", None)
+                    if close is not None:
+                        await close()
+            else:
+                pcm = await self.service.tts.synthesize(
+                    text, tts_speed_for(text, "direct", self.service.tts.speed)
+                )
+                self.tts_ms += round((time.perf_counter() - tts_started) * 1000)
+                await begin_audio()
+                for offset in range(0, len(pcm), chunk_bytes):
+                    chunk = pcm[offset:offset + chunk_bytes]
+                    total_bytes += len(chunk)
+                    if not await send_chunk(chunk, total_bytes):
+                        return
 
     async def finish(self, reply: str, route: str) -> int:
         await self.socket.send_json({
@@ -1300,7 +1389,7 @@ class IncrementalSpeechStream:
 
 
 class PersistentTtsWorker:
-    def __init__(self, command: str, runtime_dir: str, model_dir: str, speed: float = 1.15):
+    def __init__(self, command: str, runtime_dir: str, model_dir: str, speed: float = 1.08):
         self.command = command
         self.runtime_dir = runtime_dir
         self.model_dir = model_dir
@@ -1372,6 +1461,114 @@ class PersistentTtsWorker:
         self.process = None
 
 
+class QwenVllmTtsClient:
+    """Streaming PCM client for vLLM-Omni's OpenAI-compatible speech API."""
+
+    def __init__(
+        self,
+        url: str = DEFAULT_QWEN_TTS_URL,
+        model: str = DEFAULT_QWEN_TTS_MODEL,
+        voice: str = DEFAULT_QWEN_TTS_VOICE,
+        instructions: str = DEFAULT_QWEN_TTS_INSTRUCTIONS,
+        speed: float = 1.0,
+        initial_chunk_frames: int = DEFAULT_QWEN_INITIAL_CHUNK_FRAMES,
+        startup_wait_seconds: float = 0.0,
+    ):
+        self.url = url
+        self.model = model
+        self.voice = voice
+        self.instructions = instructions
+        self.speed = speed
+        self.initial_chunk_frames = initial_chunk_frames
+        self.startup_wait_seconds = startup_wait_seconds
+        self.session: aiohttp.ClientSession | None = None
+
+    async def start(self) -> None:
+        if self.session and not self.session.closed:
+            return
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=3, sock_read=30)
+        self.session = aiohttp.ClientSession(timeout=timeout)
+        health_url = self.url.rsplit("/v1/audio/speech", 1)[0] + "/health"
+        deadline = time.monotonic() + self.startup_wait_seconds
+        while True:
+            try:
+                async with self.session.get(health_url) as response:
+                    response.raise_for_status()
+                return
+            except asyncio.CancelledError:
+                await self.stop()
+                raise
+            except Exception:
+                if time.monotonic() >= deadline:
+                    await self.stop()
+                    raise
+                await asyncio.sleep(1)
+
+    def request_payload(self, text: str) -> dict[str, Any]:
+        return {
+            "model": self.model,
+            "input": text,
+            "voice": self.voice,
+            "instructions": self.instructions,
+            "language": "English",
+            "response_format": "pcm",
+            "stream": True,
+            "stream_format": "audio",
+            "initial_codec_chunk_frames": self.initial_chunk_frames,
+        }
+
+    async def stream_synthesize(
+        self, text: str, speed: float | None = None
+    ) -> AsyncIterator[bytes]:
+        # Qwen3-TTS does not currently expose reliable native rate control. The
+        # argument is accepted for parity with Kokoro; prosody comes from the
+        # per-request voice instruction instead.
+        del speed
+        await self.start()
+        assert self.session
+        async with self.session.post(self.url, json=self.request_payload(text)) as response:
+            response.raise_for_status()
+            async for chunk in response.content.iter_chunked(64 * 1024):
+                if chunk:
+                    yield bytes(chunk)
+
+    async def synthesize(self, text: str, speed: float | None = None) -> bytes:
+        pcm = bytearray()
+        async for chunk in self.stream_synthesize(text, speed):
+            pcm.extend(chunk)
+        return bytes(pcm)
+
+    async def stop(self) -> None:
+        if self.session and not self.session.closed:
+            await self.session.close()
+        self.session = None
+
+
+def configured_tts_backend(speed: float) -> PersistentTtsWorker | QwenVllmTtsClient:
+    backend = os.environ.get("LIVE_CONVERSATION_TTS_BACKEND", DEFAULT_TTS_BACKEND).strip().lower()
+    if backend == "qwen":
+        return QwenVllmTtsClient(
+            url=os.environ.get("QWEN_TTS_URL", DEFAULT_QWEN_TTS_URL),
+            model=os.environ.get("QWEN_TTS_MODEL", DEFAULT_QWEN_TTS_MODEL),
+            voice=os.environ.get("QWEN_TTS_VOICE", DEFAULT_QWEN_TTS_VOICE),
+            instructions=os.environ.get(
+                "QWEN_TTS_INSTRUCTIONS", DEFAULT_QWEN_TTS_INSTRUCTIONS
+            ),
+            speed=1.0,
+            initial_chunk_frames=int(os.environ.get(
+                "QWEN_TTS_INITIAL_CHUNK_FRAMES", DEFAULT_QWEN_INITIAL_CHUNK_FRAMES
+            )),
+            startup_wait_seconds=float(os.environ.get(
+                "QWEN_TTS_STARTUP_WAIT_SECONDS", "0"
+            )),
+        )
+    if backend != "kokoro":
+        raise ValueError(f"Unsupported LIVE_CONVERSATION_TTS_BACKEND: {backend}")
+    return PersistentTtsWorker(
+        DEFAULT_TTS_WORKER, DEFAULT_TTS_RUNTIME, DEFAULT_TTS_MODEL_DIR, speed
+    )
+
+
 class LiveConversationService:
     def __init__(
         self,
@@ -1387,7 +1584,8 @@ class LiveConversationService:
         self.stt_description = "not loaded"
         self.semantic_turn: SemanticTurnDetector | None = None
         self.semantic_turn_description = "fallback"
-        self.tts = PersistentTtsWorker(DEFAULT_TTS_WORKER, DEFAULT_TTS_RUNTIME, DEFAULT_TTS_MODEL_DIR, tts_speed)
+        self.tts = configured_tts_backend(tts_speed)
+        self.tts_backend_description = type(self.tts).__name__
         self.speech_lock = asyncio.Lock()
         self.transcribe_lock = asyncio.Lock()
         self.capabilities = ""
@@ -2038,7 +2236,17 @@ class LiveConversationService:
                 compute_type="int8",
             )
             self.stt_description = "faster-whisper small.en cpu-int8 fallback"
-        await self.tts.start()
+        try:
+            await self.tts.start()
+        except Exception as error:
+            if not isinstance(self.tts, QwenVllmTtsClient):
+                raise
+            LOGGER.error("qwen_tts_unavailable_falling_back_to_kokoro error=%s", error)
+            self.tts = PersistentTtsWorker(
+                DEFAULT_TTS_WORKER, DEFAULT_TTS_RUNTIME, DEFAULT_TTS_MODEL_DIR, 1.08
+            )
+            self.tts_backend_description = "PersistentTtsWorker (Qwen fallback)"
+            await self.tts.start()
         try:
             self.semantic_turn = await asyncio.to_thread(
                 SemanticTurnDetector, SMART_TURN_MODEL_PATH
@@ -2908,54 +3116,103 @@ class LiveConversationService:
                 )
                 return -1
             await socket.send_json({"type": "state", "state": "speaking", "route": route})
-            speech_parts = [""] if pcm_override is not None else split_spoken_text(text)
             tts_started = time.perf_counter()
-            pcm = pcm_override if pcm_override is not None else await self.tts.synthesize(
-                speech_parts[0], tts_speed_for(speech_parts[0], route, self.tts.speed)
-            )
-            tts_ms = round((time.perf_counter() - tts_started) * 1000)
-            LOGGER.info(
-                "response_stream_start id=%s route=%s chars=%d parts=%d first_pcm_bytes=%d first_tts_ms=%d",
-                response_id, route, len(text), len(speech_parts), len(pcm), tts_ms,
-            )
-            await socket.send_json({"type": "output_audio_buffer.started", "responseId": response_id})
             chunk_bytes = OUTPUT_SAMPLE_RATE * 2 // 10
             prefill_bytes = round(
                 OUTPUT_SAMPLE_RATE * 2 * PLAYBACK_PREFILL_SECONDS
             )
             total_pcm_bytes = 0
             interrupted = False
-            for index, _ in enumerate(speech_parts):
-                next_synthesis: asyncio.Task[bytes] | None = None
-                if pcm_override is None and index + 1 < len(speech_parts):
-                    next_text = speech_parts[index + 1]
-                    next_synthesis = asyncio.create_task(self.tts.synthesize(
-                        next_text, tts_speed_for(next_text, route, self.tts.speed)
-                    ))
-                for offset in range(0, len(pcm), chunk_bytes):
-                    if generation != self.speech_generation:
-                        interrupted = True
+            tts_ms = 0
+
+            async def send_chunk(chunk: bytes) -> bool:
+                nonlocal total_pcm_bytes
+                if generation != self.speech_generation:
+                    return False
+                await socket.send_json({
+                    "type": "response.output_audio.delta",
+                    "responseId": response_id,
+                    "sampleRate": OUTPUT_SAMPLE_RATE,
+                    "audioBase64": base64.b64encode(chunk).decode("ascii"),
+                })
+                total_pcm_bytes += len(chunk)
+                # Keep a small PCM lead ahead of Android's AudioTrack. Sending
+                # exactly one 100 ms delta every 100 ms left no jitter margin.
+                if total_pcm_bytes > prefill_bytes:
+                    await asyncio.sleep(len(chunk) / (OUTPUT_SAMPLE_RATE * 2))
+                return True
+
+            if pcm_override is None and hasattr(self.tts, "stream_synthesize"):
+                # Qwen arrives as arbitrary HTTP chunks. Reframe it into the
+                # same 100 ms deltas used by Android, keeping enough initial
+                # audio queued to bridge the model's next codec chunk.
+                pending_pcm = bytearray()
+                stream = self.tts.stream_synthesize(
+                    text, tts_speed_for(text, route, self.tts.speed)
+                )
+                audio_started = False
+                try:
+                    async for raw_chunk in stream:
+                        if not audio_started:
+                            tts_ms = round((time.perf_counter() - tts_started) * 1000)
+                            LOGGER.info(
+                                "response_stream_start id=%s route=%s chars=%d backend=qwen first_pcm_bytes=%d first_tts_ms=%d",
+                                response_id, route, len(text), len(raw_chunk), tts_ms,
+                            )
+                            await socket.send_json({
+                                "type": "output_audio_buffer.started",
+                                "responseId": response_id,
+                            })
+                            audio_started = True
+                        pending_pcm.extend(raw_chunk)
+                        while len(pending_pcm) >= chunk_bytes:
+                            chunk = bytes(pending_pcm[:chunk_bytes])
+                            del pending_pcm[:chunk_bytes]
+                            if not await send_chunk(chunk):
+                                interrupted = True
+                                break
+                        if interrupted:
+                            break
+                    if not interrupted and pending_pcm:
+                        interrupted = not await send_chunk(bytes(pending_pcm))
+                    if not audio_started and not interrupted:
+                        raise RuntimeError("Qwen TTS returned no audio")
+                finally:
+                    close = getattr(stream, "aclose", None)
+                    if close is not None:
+                        await close()
+            else:
+                speech_parts = [""] if pcm_override is not None else split_spoken_text(text)
+                pcm = pcm_override if pcm_override is not None else await self.tts.synthesize(
+                    speech_parts[0], tts_speed_for(speech_parts[0], route, self.tts.speed)
+                )
+                tts_ms = round((time.perf_counter() - tts_started) * 1000)
+                LOGGER.info(
+                    "response_stream_start id=%s route=%s chars=%d parts=%d backend=kokoro first_pcm_bytes=%d first_tts_ms=%d",
+                    response_id, route, len(text), len(speech_parts), len(pcm), tts_ms,
+                )
+                await socket.send_json({
+                    "type": "output_audio_buffer.started", "responseId": response_id
+                })
+                for index, _ in enumerate(speech_parts):
+                    next_synthesis: asyncio.Task[bytes] | None = None
+                    if pcm_override is None and index + 1 < len(speech_parts):
+                        next_text = speech_parts[index + 1]
+                        next_synthesis = asyncio.create_task(self.tts.synthesize(
+                            next_text, tts_speed_for(next_text, route, self.tts.speed)
+                        ))
+                    for offset in range(0, len(pcm), chunk_bytes):
+                        if not await send_chunk(pcm[offset:offset + chunk_bytes]):
+                            interrupted = True
+                            break
+                    if interrupted:
+                        if next_synthesis is not None:
+                            next_synthesis.cancel()
                         break
-                    chunk = pcm[offset:offset + chunk_bytes]
-                    await socket.send_json({
-                        "type": "response.output_audio.delta",
-                        "responseId": response_id,
-                        "sampleRate": OUTPUT_SAMPLE_RATE,
-                        "audioBase64": base64.b64encode(chunk).decode("ascii"),
-                    })
-                    total_pcm_bytes += len(chunk)
-                    # Keep a small PCM lead ahead of Android's AudioTrack. Sending
-                    # exactly one 100 ms delta every 100 ms left no jitter margin,
-                    # so ordinary WebView/network scheduling pauses sounded like
-                    # the reply was being cut off every few seconds.
-                    if total_pcm_bytes > prefill_bytes:
-                        await asyncio.sleep(len(chunk) / (OUTPUT_SAMPLE_RATE * 2))
-                if interrupted:
-                    break
-                if next_synthesis is not None:
-                    wait_started = time.perf_counter()
-                    pcm = await next_synthesis
-                    tts_ms += round((time.perf_counter() - wait_started) * 1000)
+                    if next_synthesis is not None:
+                        wait_started = time.perf_counter()
+                        pcm = await next_synthesis
+                        tts_ms += round((time.perf_counter() - wait_started) * 1000)
             await socket.send_json({"type": "response.output_audio.done", "responseId": response_id})
             LOGGER.info(
                 "response_stream_done id=%s route=%s pcm_bytes=%d tts_wait_ms=%d lock_wait_ms=%d interrupted=%s",
@@ -3032,6 +3289,11 @@ class LiveConversationService:
                 else:
                     route, reply, target_session = "direct", "Okay, I won't take that action.", None
             else:
+                # speech_reply has deterministic fast paths which intentionally
+                # bypass semantic-model classification. Clear the per-turn side
+                # channel before every call so one of those paths cannot reuse
+                # the previous turn's assembled meaning.
+                self.last_turn_understanding = None
                 routing_task = asyncio.create_task(self.speech_reply(
                     transcript, agent_pending=agent_pending,
                     stream_callback=incremental_speech.feed,
@@ -3224,6 +3486,7 @@ async def health(request: web.Request) -> web.Response:
         "stt": service.stt_description,
         "online_asr": "local-agreement-stable-prefix",
         "semantic_turn": service.semantic_turn_description,
+        "tts": service.tts_backend_description,
         "history_messages": len(service.history),
         "conversation_events": len(service.events),
         "session_catalog": {
@@ -3733,7 +3996,7 @@ def main() -> None:
     parser.add_argument("--settings-path", default=DEFAULT_SETTINGS_PATH)
     parser.add_argument("--recordings-path", default=DEFAULT_RECORDINGS_PATH)
     parser.add_argument("--debug-path", default=DEFAULT_DEBUG_PATH)
-    parser.add_argument("--tts-speed", type=float, default=1.15)
+    parser.add_argument("--tts-speed", type=float, default=1.08)
     args = parser.parse_args()
     web.run_app(build_app(args), host=args.host, port=args.port, print=None)
 

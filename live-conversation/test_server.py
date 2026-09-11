@@ -24,14 +24,18 @@ from server import (
     DEFAULT_OPENCLAW_MODULE,
     DEFAULT_TTS_MODEL_DIR,
     DEFAULT_TTS_SPEAKER_ID,
+    DEFAULT_QWEN_INITIAL_CHUNK_FRAMES,
     LiveConversationService,
     IncrementalSpeechStream,
     OnlineTranscript,
+    QwenVllmTtsClient,
     TurnDecision,
+    TurnUnderstanding,
     MAX_HISTORY_MESSAGES,
     PROMPT_HISTORY_CHARS,
     confirmation_answer,
     confirmation_policy_command,
+    configured_tts_backend,
     conversation_entities,
     affirmative_hum_pcm,
     direct_voice_surface_reply,
@@ -120,6 +124,12 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("Conversation history is memory for continuity", prompt)
         self.assertIn("Refresh the authoritative source", prompt)
         self.assertIn("dispatches the action while the acknowledgment is spoken", prompt)
+        self.assertIn("MICRO: use one word or one short clause", prompt)
+        self.assertIn("BRIEF: this is the default", prompt)
+        self.assertIn("SUMMARY: for status, comparisons, or multi-part results", prompt)
+        self.assertIn("DETAILED: use only when John asks for detail", prompt)
+        self.assertIn("develop one idea per short", prompt)
+        self.assertIn("periods separate complete", prompt)
 
     def test_hearing_and_identity_checks_are_deterministic(self):
         self.assertEqual(
@@ -546,6 +556,11 @@ class RoutingTests(unittest.TestCase):
             "Can you tell me the status of the running sessions?"
         ))
         self.assertFalse(is_gateway_status_question("Start another agent."))
+        self.assertFalse(is_gateway_status_question(
+            "Task another agent with updating the Conversation Diagnostics status "
+            "indicator to have an acknowledge button when a correction has completed, "
+            "but no new install is required."
+        ))
         self.assertTrue(is_referential_agent_question("How is this agent running?"))
         self.assertTrue(is_referential_agent_question("Tell that agent to check audio too."))
         self.assertEqual(
@@ -1299,6 +1314,47 @@ class RoutingTests(unittest.TestCase):
         import asyncio
         asyncio.run(run_test())
 
+    def test_incremental_direct_reply_streams_qwen_chunks_without_full_synthesis(self):
+        async def run_test():
+            class StreamingTts:
+                speed = 1.0
+
+                async def stream_synthesize(self, _text, _speed):
+                    yield b"\0" * 7_000
+                    yield b"\0" * 12_200
+
+                async def synthesize(self, _text, _speed):
+                    raise AssertionError("streaming backend must not use full synthesis")
+
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.tts = StreamingTts()
+            socket = AsyncMock()
+            stream = IncrementalSpeechStream(service, socket, "response-stream", 0)
+
+            with patch("server.asyncio.sleep", AsyncMock()):
+                await stream.feed(
+                    '{"route":"direct","complete":true,"reply":"This streamed sentence is ready. The next'
+                )
+                await asyncio.sleep(0)
+                await stream.finish(
+                    "This streamed sentence is ready. The next sentence is complete.",
+                    "direct",
+                )
+
+            payloads = [call.args[0] for call in socket.send_json.await_args_list]
+            self.assertEqual(
+                sum(item.get("type") == "output_audio_buffer.started" for item in payloads),
+                1,
+            )
+            self.assertGreaterEqual(
+                sum(item.get("type") == "response.output_audio.delta" for item in payloads),
+                4,
+            )
+            self.assertEqual(payloads[-1]["type"], "response.output_audio.done")
+
+        import asyncio
+        asyncio.run(run_test())
+
     def test_speech_model_warmup_uses_the_live_context_size(self):
         import inspect
         source = inspect.getsource(LiveConversationService.warm_speech_model)
@@ -1927,6 +1983,43 @@ class RoutingTests(unittest.TestCase):
         import asyncio
         asyncio.run(run_test())
 
+    def test_deterministic_reply_does_not_reuse_previous_assembled_text(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.last_turn_understanding = TurnUnderstanding(
+                complete=True,
+                confidence=1.0,
+                speech_act="request",
+                relation="new",
+                actionable=True,
+                requires_grounding=False,
+                supersedes_previous=False,
+                assembled_text=(
+                    "Can you task an agent with identifying why the response is taking so long?"
+                ),
+                reason="Prior turn.",
+            )
+            service.refresh_sessions = AsyncMock()
+            service.sessions = "No active sessions."
+            service.sessions_last_success_wall = time.time()
+            service.transcribe = AsyncMock(
+                return_value="Can you tell me which sessions are running currently?"
+            )
+            service.tts.synthesize = AsyncMock(return_value=b"")
+            socket = AsyncMock()
+
+            await service.process_turn(socket, b"audio")
+
+            user_event = service.events[-2]
+            self.assertEqual(
+                user_event["metadata"]["assembled_text"],
+                "Can you tell me which sessions are running currently?",
+            )
+            self.assertIsNone(service.last_turn_understanding)
+
+        import asyncio
+        asyncio.run(run_test())
+
     def test_confirmation_mode_blocks_action_until_explicit_yes(self):
         async def run_test():
             service = LiveConversationService("agent:main:live-conversation", 1.15)
@@ -2378,12 +2471,12 @@ class RoutingTests(unittest.TestCase):
         self.assertNotIn("turn_task.cancel()", source)
         self.assertNotIn("len(audio) < SAMPLE_RATE * 2 * 30", source)
 
-    def test_default_tts_speed_is_faster(self):
+    def test_default_tts_speed_is_conversational(self):
         import inspect
         from server import PersistentTtsWorker
 
         default = inspect.signature(PersistentTtsWorker).parameters["speed"].default
-        self.assertEqual(default, 1.15)
+        self.assertEqual(default, 1.08)
 
     def test_higher_quality_kokoro_british_voice_is_selected(self):
         self.assertTrue(DEFAULT_TTS_MODEL_DIR.endswith("/kokoro-en-v0_19"))
@@ -2518,6 +2611,83 @@ class RoutingTests(unittest.TestCase):
                 4,
             )
             self.assertEqual(payloads[-1]["type"], "response.output_audio.done")
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_qwen_backend_builds_raw_chunked_pcm_request(self):
+        client = QwenVllmTtsClient()
+        payload = client.request_payload("Hello from Jarvis.")
+        self.assertEqual(payload["response_format"], "pcm")
+        self.assertEqual(payload["stream_format"], "audio")
+        self.assertTrue(payload["stream"])
+        self.assertEqual(
+            payload["initial_codec_chunk_frames"], DEFAULT_QWEN_INITIAL_CHUNK_FRAMES
+        )
+        self.assertEqual(payload["voice"], "aiden")
+
+    def test_tts_backend_switch_is_explicit_and_reversible(self):
+        with patch.dict("server.os.environ", {"LIVE_CONVERSATION_TTS_BACKEND": "qwen"}):
+            self.assertIsInstance(configured_tts_backend(1.08), QwenVllmTtsClient)
+        with patch.dict("server.os.environ", {"LIVE_CONVERSATION_TTS_BACKEND": "kokoro"}):
+            self.assertNotIsInstance(configured_tts_backend(1.08), QwenVllmTtsClient)
+
+    def test_qwen_pcm_stream_is_reframed_and_prefilled_for_android(self):
+        async def run_test():
+            class StreamingTts:
+                speed = 1.0
+
+                async def stream_synthesize(self, _text, _speed):
+                    yield b"\0" * 7_000
+                    yield b"\0" * 12_200
+
+            service = LiveConversationService("agent:main:live-conversation", 0.72)
+            service.tts = StreamingTts()
+            socket = AsyncMock()
+            with patch("server.asyncio.sleep", AsyncMock()) as sleep:
+                latency = await service.send_spoken_response(
+                    socket, "A streamed Qwen response.", "direct", "response-qwen"
+                )
+            self.assertGreaterEqual(latency, 0)
+            self.assertEqual(sleep.await_count, 1)
+            payloads = [call.args[0] for call in socket.send_json.await_args_list]
+            deltas = [item for item in payloads if item.get("type") == "response.output_audio.delta"]
+            self.assertEqual(len(deltas), 4)
+            self.assertEqual(payloads[-1]["type"], "response.output_audio.done")
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_barge_in_closes_qwen_stream_without_a_spoken_acknowledgment(self):
+        async def run_test():
+            closed = False
+
+            class StreamingTts:
+                speed = 1.0
+
+                async def stream_synthesize(self, _text, _speed):
+                    nonlocal closed
+                    try:
+                        yield b"\0" * 48_000
+                        yield b"\0" * 48_000
+                    finally:
+                        closed = True
+
+            service = LiveConversationService("agent:main:live-conversation", 0.72)
+            service.tts = StreamingTts()
+            socket = AsyncMock()
+
+            async def interrupt_after_prefill(_):
+                service.interrupt_speech()
+
+            with patch("server.asyncio.sleep", AsyncMock(side_effect=interrupt_after_prefill)):
+                await service.send_spoken_response(
+                    socket, "A response that will be interrupted.", "direct", "response-qwen"
+                )
+            self.assertTrue(closed)
+            payloads = [call.args[0] for call in socket.send_json.await_args_list]
+            self.assertEqual(payloads[-1]["type"], "response.output_audio.done")
+            self.assertFalse(any(item.get("text") == "Stopped." for item in payloads))
 
         import asyncio
         asyncio.run(run_test())

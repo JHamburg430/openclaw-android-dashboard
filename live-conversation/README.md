@@ -90,16 +90,17 @@ in the Android Dashboard plus menu.
    confidence), avoiding long diagnostic generations and retries before routing.
    Ollama's NDJSON stream is decoded incrementally. Once the same decision has
    marked the thought complete and a direct route and stable spoken clause are
-   available, Kokoro starts synthesizing that clause
+   available, the configured speech backend starts synthesizing that clause
    while later model tokens are still arriving. New confirmed speech cancels
    the in-flight HTTP generation as well as pending synthesis and playback.
    Authorized tool work starts as soon as routing is final and runs concurrently
    with its acknowledgment instead of waiting for the entire utterance.
-9. A persistent local Kokoro TTS worker using the British male George voice
-   returns 24 kHz PCM to the Android
-   native playback bridge. Replies are synthesized in short, look-ahead-buffered
-   units so the first audio starts promptly while later speech is generated
-   during playback. The server sends a 300 ms PCM prefill before settling into
+9. Qwen3-TTS 0.6B runs locally behind vLLM-Omni's asynchronous chunked speech
+   endpoint and streams 24 kHz PCM to the Android native playback bridge. The
+   first ten codec frames provide enough audio to bridge subsequent model chunks
+   without the audible gap produced by a one-frame start. The bridge reframes
+   arbitrary HTTP chunks into 100 ms Android deltas and sends a 300 ms PCM prefill
+   before settling into
    realtime pacing, giving Android's AudioTrack enough scheduling margin to
    avoid periodic underruns without adding perceptible startup delay. Confirmed
    user speech stops playback after about 200 ms, so
@@ -107,8 +108,10 @@ in the Android Dashboard plus menu.
    controls such as “Jarvis stop,” “stop talking,” “be quiet,” and “that's
    enough” stop playback without entering history, invoking a model, or
    producing a reply. Each synthesis request carries a restrained contextual
-   cadence: brief questions/backchannels are slightly quicker, while warnings
-   and apologies slow down. Smart Turn can emit one short, nonverbal affirmative
+   cadence through the Qwen voice instruction. If Qwen is unavailable at service
+   startup, the persistent Kokoro George worker is retained as an automatic
+   fallback; `LIVE_CONVERSATION_TTS_BACKEND=kokoro` also provides an immediate
+   rollback. Smart Turn can emit one short, nonverbal affirmative
    hum only after ASR has established a stable intelligible prefix when a long
    utterance pauses but is semantically unfinished.
 10. When OpenClaw Dashboard holds Android's Assistant role, its lightweight
@@ -237,6 +240,9 @@ stops an active conversation and returns to wake listening.
 ```bash
 python3.13 -m venv ~/.openclaw/tools/pipecat-live-conversation/venv
 ~/.openclaw/tools/pipecat-live-conversation/venv/bin/pip install -r live-conversation/requirements.txt
+uv venv --python 3.12 ~/.openclaw/tools/qwen3-tts-vllm-omni/venv
+uv pip install --python ~/.openclaw/tools/qwen3-tts-vllm-omni/venv/bin/python \
+  -r live-conversation/requirements-qwen3-tts.txt
 curl -fL -o /tmp/kokoro-en-v0_19.tar.bz2 \
   https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-en-v0_19.tar.bz2
 tar -xjf /tmp/kokoro-en-v0_19.tar.bz2 \
@@ -249,10 +255,13 @@ live-conversation/build-tts-worker.sh
 mkdir -p ~/.config/systemd/user
 cp live-conversation/openclaw-live-conversation.service ~/.config/systemd/user/
 cp live-conversation/openclaw-live-ollama.service ~/.config/systemd/user/
+cp live-conversation/openclaw-qwen3-tts.service ~/.config/systemd/user/
 ollama create openclaw-live-conversation:4b -f live-conversation/Modelfile
 systemctl --user daemon-reload
 systemctl --user enable --now openclaw-live-ollama.service
+systemctl --user enable --now openclaw-qwen3-tts.service
 systemctl --user enable --now openclaw-live-conversation.service
+curl -fsS http://127.0.0.1:8792/health
 curl -fsS http://127.0.0.1:8790/health
 ```
 
@@ -268,6 +277,10 @@ PYTHONPATH=live-conversation \
   -m unittest discover -s live-conversation -p 'test_*.py' -v
 node scripts/test-live-conversation-app.mjs
 node scripts/test-live-conversation-turns.mjs
+LIVE_CONVERSATION_QWEN_TTS_TEST_URL=http://127.0.0.1:8792/v1/audio/speech \
+  PYTHONPATH=live-conversation \
+  ~/.openclaw/tools/pipecat-live-conversation/venv/bin/python \
+  -m unittest live-conversation/test_qwen_tts.py -v
 PYTHONPATH=live-conversation \
   ~/.openclaw/tools/pipecat-live-conversation/venv/bin/python \
   live-conversation/e2e_conversation_matrix.py --url http://127.0.0.1:8790/ws
@@ -286,8 +299,14 @@ fixture validation. If the local production voice assets are not installed, thes
 hardware integration cases report an explicit skip while the fast unit suite
 continues.
 
+`test_qwen_tts.py` is the opt-in GPU acceptance gate for the production response
+voice. It calls the real vLLM-Omni server, measures time to first PCM and realtime
+factor, and sends each generated waveform through the production Faster-Whisper
+model to verify intelligibility. It includes normal questions and the spoken stop
+command used for interruption.
+
 `e2e_conversation_matrix.py` is the required deployed-service release gate. It
-uses production Kokoro audio as microphone input, sends wall-clock-paced 20 ms
+uses locally synthesized audio as microphone input, sends wall-clock-paced 20 ms
 PCM frames through the real WebSocket, and requires actual Whisper transcripts,
 semantic decisions, local-model replies, and audible response PCM. It covers
 slow, natural, and fast speakers; broadband background noise; 250, 800, and
