@@ -486,6 +486,16 @@ def remove_unrequested_action_promises(text: str) -> str:
     return " ".join(kept).strip() or "I understand."
 
 
+def is_generic_conversation_nonanswer(text: str) -> bool:
+    """Recognize empty supervisor acknowledgments, not user intent or routing."""
+    normalized = re.sub(r"\s+", " ", text).strip()
+    return bool(re.fullmatch(
+        r"(?:I hear you[.!]?\s*Go ahead(?: with the test)?[.!]?|"
+        r"(?:Understood[.!]?\s*)?I (?:won't|will not) [^.!?]+[.!]?)",
+        normalized, re.IGNORECASE,
+    ))
+
+
 def is_gateway_status_question(transcript: str) -> bool:
     """Recognize broad requests for currently running gateway work."""
     normalized = re.sub(r"[^a-z0-9]+", " ", transcript.lower()).strip()
@@ -757,6 +767,7 @@ one of `new`, `continuation`, `correction`, or `meta`; incompleteness belongs on
 - `clarification_needed` is true when the committed speech is too garbled, contradictory, or semantically incoherent to recover confidently. This is different from an intelligible unfinished thought: unfinished speech waits for a continuation, while unclear speech gets one brief request to repeat or rephrase it. Never use a backchannel as the answer to unclear speech.
 - `assembled_text` is the exact complete meaning to route. Combine the unresolved fragment with this transcript only when they form one coherent thought. If the current transcript is incomplete, preserve it verbatim. If it is a new unrelated turn, use only the current transcript.
 - When an unresolved fragment is nonempty, first test whether the current transcript can supply its missing subject, object, predicate, complement, condition, or proposition. Classify the current words alone only after rejecting that coherent assembly. A short noun phrase or clause may be a complete continuation even when it would be incomplete in isolation.
+- `reply` must address the current assembled meaning, not reuse an acknowledgment from examples or history. For a casual statement, respond to its specific subject or emotion. For an informational question combined with a prohibition, answer the informational question without performing the prohibited action. A generic listening/testing acknowledgment or merely agreeing not to act is not an answer.
 - `reason` is a short semantic explanation, never a keyword citation.
 
 Complete examples (the reply wording may vary, but all keys are mandatory):
@@ -1363,7 +1374,8 @@ class IncrementalSpeechStream:
             return
         end = boundaries[-1].end()
         piece = remainder[:end].strip()
-        if len(piece) < 24 or is_operational_acknowledgment(piece):
+        if (len(piece) < 24 or is_operational_acknowledgment(piece)
+                or is_generic_conversation_nonanswer(piece)):
             return
         self.spoken = reply[:len(self.spoken) + end]
         self._queue(piece)
@@ -3112,14 +3124,14 @@ class LiveConversationService:
                     event_context=self.event_context_summary(),
                     confirmation_required=self.confirmation_required,
                 )},
+                *self.prompt_history(),
                 {"role": "system", "content": turn_understanding_prompt(
                     controller_text,
                     pending_fragment=pending_for_prompt,
                     # The same history is supplied as chat messages immediately
-                    # below; embedding it here again wastes routing latency.
+                    # above; embedding it here again wastes routing latency.
                     recent_context=None,
                 )},
-                *self.prompt_history(),
                 {"role": "user", "content": controller_text},
             ],
             "options": {
@@ -3336,6 +3348,8 @@ class LiveConversationService:
             if route == "session" and target_session not in self.session_keys:
                 LOGGER.warning("speech_supervisor_invalid_session target=%s", target_session)
                 route, target_session = "agent", None
+            if route == "direct" and is_generic_conversation_nonanswer(reply):
+                reply = await self.generate_direct_answer(effective_text)
             if route == "direct" and not reply:
                 LOGGER.warning("speech_supervisor_missing_direct_reply_generating_answer")
                 reply = await self.generate_direct_answer(effective_text)
@@ -3456,7 +3470,11 @@ class LiveConversationService:
                 {"role": "system", "content": (
                     "You are Jarvis in a live spoken conversation. Respond directly and "
                     "naturally to the user's complete turn in one or two concise spoken "
-                    "sentences. Do not mention routing, tools, agents, or this instruction."
+                    "sentences. Address the actual subject instead of a generic listening "
+                    "acknowledgment. Respect corrections. When the user prohibits an "
+                    "action and asks how something works, explain how it works without "
+                    "performing or promising the action. Do not mention routing, tools, "
+                    "agents, or this instruction."
                 )},
                 {"role": "user", "content": text},
             ],

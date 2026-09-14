@@ -247,6 +247,31 @@ class RoutingTests(unittest.TestCase):
             "Task an agent with fixing the live conversation."
         ))
 
+    def test_generic_nonanswers_are_repaired_before_speaking(self):
+        async def run_test():
+            for transcript, nonanswer, expected in (
+                ("I regret my lunch choice.", "I hear you. Go ahead with the test.",
+                 "What was wrong with your lunch?"),
+                ("Don't set an alarm. Explain how alarms work.",
+                 "Understood. I won't set an alarm.",
+                 "An alarm sounds when its scheduled time arrives."),
+            ):
+                service = LiveConversationService("agent:main:reply-regression", 1.15)
+                context, _ = mock_semantic_model(semantic_decision(reply=nonanswer, assembled_text=transcript))
+                service.generate_direct_answer = AsyncMock(return_value=expected)
+                with patch("server.aiohttp.ClientSession", return_value=context):
+                    result = await service.speech_reply(transcript)
+                self.assertEqual(result, ("direct", expected, None))
+                service.generate_direct_answer.assert_awaited_once_with(transcript)
+                socket = AsyncMock()
+                stream = IncrementalSpeechStream(service, socket, "reply", service.speech_generation)
+                await stream.feed(json.dumps({"route": "direct", "complete": True, "reply": nonanswer}))
+                self.assertIsNone(stream.worker)
+                socket.send_json.assert_not_called()
+
+        import asyncio
+        asyncio.run(run_test())
+
     def test_normal_conversation_corpus_never_accidentally_delegates(self):
         ordinary_turns = (
             "I guess Arby's was the wrong choice.",
@@ -1785,10 +1810,11 @@ class RoutingTests(unittest.TestCase):
                     ("direct", "Atlas is your robot.", None),
                 )
             messages = session.post.call_args.kwargs["json"]["messages"]
-            self.assertNotIn("Atlas", messages[1]["content"])
-            self.assertIn("Recent dialogue: []", messages[1]["content"])
-            self.assertEqual(messages[-3], {"role": "user", "content": "My robot is named Atlas."})
-            self.assertEqual(messages[-2], {"role": "assistant", "content": "I’ll remember that."})
+            self.assertNotIn("Atlas", messages[-2]["content"])
+            self.assertIn("Recent dialogue: []", messages[-2]["content"])
+            self.assertEqual(messages[-2]["role"], "system")
+            self.assertEqual(messages[-4], {"role": "user", "content": "My robot is named Atlas."})
+            self.assertEqual(messages[-3], {"role": "assistant", "content": "I’ll remember that."})
             self.assertEqual(messages[-1], {"role": "user", "content": "What is my robot’s name?"})
 
         import asyncio
