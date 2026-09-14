@@ -213,7 +213,7 @@ async def complete_turn(
     return await finish_turn(live, expected)
 
 
-async def run_matrix(url: str) -> dict:
+async def run_matrix(url: str, ordinary_only: bool = False) -> dict:
     slow, natural, fast = await asyncio.gather(
         synthesize("Please answer briefly. What color is a clear daytime sky?", 0.82),
         synthesize("Please answer briefly. What is two plus two?", 1.10),
@@ -303,6 +303,15 @@ async def run_matrix(url: str) -> dict:
                     raise AssertionError(
                         f"negated ordinary request fell back to a retry: {result.reply!r}"
                     )
+                answer = result.reply.casefold()
+                required_meaning = {
+                    "quiet_casual_statement": ("choice", "food", "meal", "arby", "happen", "wrong", "disappoint", "regret"),
+                    "disfluent_self_correction": ("thursday",),
+                    "everyday_question_with_noise": ("chlorophyll", "pigment"),
+                    "negated_action": ("time", "sound", "signal", "trigger", "clock", "timer"),
+                }.get(label, ())
+                if required_meaning and not any(word in answer for word in required_meaning):
+                    raise AssertionError(f"{label} did not answer the actual subject: {result.reply!r}")
                 report["ordinary_conversation"].append({
                     "case": label,
                     "transcript": result.transcript,
@@ -310,6 +319,9 @@ async def run_matrix(url: str) -> dict:
                     "route": result.route,
                     "response_pcm_bytes": len(result.response_pcm),
                 })
+
+            if ordinary_only:
+                return report
 
             for gap_ms, (pause_a, pause_b), expected in zip(
                 (250, 800, 1800), pause_cases,
@@ -445,8 +457,9 @@ async def run_matrix(url: str) -> dict:
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8790/ws")
+    parser.add_argument("--ordinary-only", action="store_true")
     args = parser.parse_args()
-    report = await run_matrix(args.url)
+    report = await run_matrix(args.url, ordinary_only=args.ordinary_only)
     encoded = json.dumps(report, indent=2)
     print(encoded)
 

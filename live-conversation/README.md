@@ -376,3 +376,10 @@ reply prevents remaining units from entering its queue. The optional Qwen
 acceptance suite interrupts a long real synthesis and requires the next reply's
 first audio within four seconds; the full WebSocket matrix checks the same
 user-visible interruption path.
+
+Ordinary cases also require subject-relevant replies: self-corrections retain
+the corrected detail, factual explanations address the requested mechanism,
+and a prohibited action plus an informational question still gets an answer.
+Use `e2e_conversation_matrix.py --ordinary-only` for the focused subset. These
+small deterministic answer checks are regression guards, not a general measure
+of conversational understanding or a substitute for human evaluation.
