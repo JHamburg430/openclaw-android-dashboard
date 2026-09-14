@@ -75,6 +75,20 @@ class QwenTtsAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 }
                 self.assertTrue(set(expected_words).issubset(normalized), transcript)
 
+    async def test_interrupted_long_reply_does_not_block_next_speech(self) -> None:
+        text = (
+            "Photosynthesis is how plants use sunlight to make food. "
+            "Their leaves absorb light and combine water with carbon dioxide. "
+            "This process releases oxygen and stores energy as sugar. "
+        ) * 4
+        stream = self.tts.stream_synthesize(text)
+        first = await anext(stream)
+        self.assertTrue(first)
+        await stream.aclose()
+        pcm, first_audio, _ = await self.synthesize_measured("Two plus two is four.")
+        self.assertTrue(pcm)
+        self.assertLess(first_audio, 4.0, "cancelled synthesis blocked the next turn")
+
     async def _transcribe(self, pcm: bytes) -> str:
         def run() -> str:
             assert self.stt._model

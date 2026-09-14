@@ -369,3 +369,10 @@ The client replay uses the September 11 quiet-phone fixture; missing that file
 fails the explicitly enabled gate. Normal CI runs synthetic client fixtures.
 Partially GPU-offloaded routers below 85% VRAM residency use the bounded small
 model fallback instead of treating any nonzero GPU allocation as sufficient.
+
+Qwen requests are limited to 50-character spoken units and submitted lazily.
+The backend may continue an in-flight unit after disconnect, but cancelling a
+reply prevents remaining units from entering its queue. The optional Qwen
+acceptance suite interrupts a long real synthesis and requires the next reply's
+first audio within four seconds; the full WebSocket matrix checks the same
+user-visible interruption path.

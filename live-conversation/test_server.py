@@ -2835,6 +2835,47 @@ class RoutingTests(unittest.TestCase):
         import asyncio
         asyncio.run(run_test())
 
+    def test_cancelled_qwen_stream_does_not_submit_remaining_reply(self):
+        async def run_test():
+            requests = []
+            closed = []
+
+            class Response:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    closed.append(True)
+
+                def raise_for_status(self):
+                    pass
+
+                @property
+                def content(self):
+                    return self
+
+                async def iter_chunked(self, size):
+                    yield b"pcm"
+
+            class Session:
+                def post(self, url, json):
+                    requests.append(json["input"])
+                    return Response()
+
+            client = QwenVllmTtsClient()
+            client.session = Session()
+            text = "A long explanation should stop when the user interrupts. " * 20
+            with patch.object(client, "start", new=AsyncMock()):
+                stream = client.stream_synthesize(text)
+                self.assertEqual(await anext(stream), b"pcm")
+                await stream.aclose()
+            self.assertEqual(len(requests), 1)
+            self.assertLessEqual(len(requests[0]), 50)
+            self.assertEqual(closed, [True])
+
+        import asyncio
+        asyncio.run(run_test())
+
     def test_qwen_backend_builds_raw_chunked_pcm_request(self):
         client = QwenVllmTtsClient()
         payload = client.request_payload("Hello from Jarvis.")

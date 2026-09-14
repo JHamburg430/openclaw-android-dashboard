@@ -1630,11 +1630,18 @@ class QwenVllmTtsClient:
         del speed
         await self.start()
         assert self.session
-        async with self.session.post(self.url, json=self.request_payload(text)) as response:
-            response.raise_for_status()
-            async for chunk in response.content.iter_chunked(64 * 1024):
-                if chunk:
-                    yield bytes(chunk)
+        # The backend can finish an in-flight request after HTTP cancellation.
+        # Bound that residual work so a long interrupted reply cannot block the
+        # next turn behind tens of seconds of obsolete synthesis. Do not submit
+        # later pieces until the consumer has drained the current one.
+        for piece in split_spoken_text(text, max_chars=50):
+            if not piece:
+                continue
+            async with self.session.post(self.url, json=self.request_payload(piece)) as response:
+                response.raise_for_status()
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    if chunk:
+                        yield bytes(chunk)
 
     async def synthesize(self, text: str, speed: float | None = None) -> bytes:
         pcm = bytearray()
