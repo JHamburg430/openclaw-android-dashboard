@@ -51,6 +51,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowInsets;
+import android.view.WindowManager;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -60,6 +61,7 @@ import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Switch;
 import android.widget.TextView;
 
 import org.json.JSONObject;
@@ -93,6 +95,7 @@ import okhttp3.Response;
 
 public final class MainActivity extends Activity {
     private static final String PREFS = "openclaw_dashboard";
+    private static final String PREF_KEEP_SCREEN_AWAKE = "keep_screen_awake";
     private static final int REQUEST_RECORD_AUDIO = 2001;
     private static final int REQUEST_POST_NOTIFICATIONS = 2002;
     private static final int REQUEST_CAMERA = 2003;
@@ -210,8 +213,23 @@ public final class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        applyKeepScreenAwake();
         clearNativeNotifications();
         updateJarvisWakeButton();
+    }
+
+    @Override
+    protected void onPause() {
+        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        super.onPause();
+    }
+
+    private void applyKeepScreenAwake() {
+        if (prefs.getBoolean(PREF_KEEP_SCREEN_AWAKE, true)) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        } else {
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
     }
 
     @Override protected void onNewIntent(Intent intent) {
@@ -294,6 +312,21 @@ public final class MainActivity extends Activity {
         chromeContainer.addView(controlsScroll, new LinearLayout.LayoutParams(-1, -2));
 
         LinearLayout controls = settingsPanel;
+        Switch keepScreenAwake = new Switch(this);
+        keepScreenAwake.setText("Keep screen awake");
+        keepScreenAwake.setTextColor(COLOR_TEXT_PRIMARY);
+        keepScreenAwake.setMinHeight(dp(48));
+        keepScreenAwake.setChecked(prefs.getBoolean(PREF_KEEP_SCREEN_AWAKE, true));
+        keepScreenAwake.setOnCheckedChangeListener((buttonView, checked) -> {
+            prefs.edit().putBoolean(PREF_KEEP_SCREEN_AWAKE, checked).apply();
+            applyKeepScreenAwake();
+        });
+        controls.addView(keepScreenAwake, new LinearLayout.LayoutParams(-1, -2));
+        TextView keepAwakeHint = text(
+                "Prevents automatic screen sleep while Dashboard is open. Leaving the app or locking the phone still turns the screen off normally. Uses more battery.",
+                12, COLOR_TEXT_MUTED, false);
+        keepAwakeHint.setPadding(0, 0, 0, dp(12));
+        controls.addView(keepAwakeHint);
         setupCodeInput = input("Paste setup code from openclaw qr --json", false, false);
         setupCodeInput.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
         controls.addView(label("Setup code"));

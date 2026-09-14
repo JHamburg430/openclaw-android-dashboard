@@ -92,6 +92,12 @@ Live Conversation shows the newest messages first and retains up to 120 messages
 
 Tool-backed requests use an explicit acknowledgment-first handoff. Jarvis finishes delivering a short spoken acknowledgment before the bridge dispatches any agent or session action. Immediate silent playback-stop commands remain the intentional exception.
 
+## Keep screen awake
+
+The native controls include a **Keep screen awake** switch (expand the controls with **+** if collapsed). It is enabled by default and remembers your choice across app restarts. It prevents automatic screen sleep while Dashboard is in the foreground, including its embedded Control UI and Live Conversation. Turning it off restores the normal screen timeout immediately. Leaving Dashboard or manually locking the phone releases keep-awake; returning to Dashboard reapplies your saved choice. It does not wake or unlock a locked phone or change Android's system-wide timeout. Keeping the display on uses more battery.
+
+This uses Android's standard activity window flag, with no additional permissions or background wake lock. See [Android's keep-screen-on documentation](https://developer.android.com/develop/background-work/background-tasks/awake/screen-on).
+
 ## Build
 
 This workspace has a local portable build toolchain under `/home/john/.android-build`.
