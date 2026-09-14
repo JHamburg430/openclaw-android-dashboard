@@ -111,9 +111,9 @@ in the Android Dashboard plus menu.
    cadence through the Qwen voice instruction. If Qwen is unavailable at service
    startup, the persistent Kokoro George worker is retained as an automatic
    fallback; `LIVE_CONVERSATION_TTS_BACKEND=kokoro` also provides an immediate
-   rollback. Smart Turn can emit one short, nonverbal affirmative
-   hum only after ASR has established a stable intelligible prefix when a long
-   utterance pauses but is semantically unfinished.
+   rollback. Incomplete turns stay silent while Smart Turn waits for the rest
+   of the utterance; spoken listening acknowledgments are disabled so they
+   cannot overlap normal phone speech.
 10. When OpenClaw Dashboard holds Android's Assistant role, its lightweight
    voice service streams rolling microphone windows to `/wake`. Detecting the
    standalone word “Jarvis” opens and auto-starts Live Conversation over the
@@ -344,6 +344,28 @@ PCM frames through the real WebSocket, and requires actual Whisper transcripts,
 semantic decisions, local-model replies, and audible response PCM. It covers
 slow, natural, and fast speakers; broadband background noise; 250, 800, and
 1,800 ms intra-sentence gaps; a sentence committed as two separate
-transcriptions; a nonverbal backchannel; and user barge-in during a real model
+transcriptions; silence during an unfinished long turn; and user barge-in during a real model
 response. The split-sentence case must remain silent after its first fragment
 and answer the semantically assembled question after its second fragment.
+
+### Ordinary-conversation regression coverage
+
+The audio matrix also exercises quiet casual remarks, frustration, disfluencies
+and self-corrections, everyday questions with background noise, and negated
+actions. These must produce a direct reply and audible PCM without an agent
+handoff. The idle microphone onset threshold is 0.006 RMS with 300 ms of
+confirmation; playback interruption retains its higher 0.025 threshold. This
+improves quiet-speech pickup but does not itself classify speech versus noise.
+
+Replay the private, consented phone corpus through Whisper and the embedded
+client onset detector (recordings are never committed):
+
+```sh
+LIVE_CONVERSATION_TEST_RECORDINGS=/path/to/recordings python -m unittest discover -s live-conversation -p test_recorded_audio.py
+LIVE_CONVERSATION_TEST_RECORDINGS=/path/to/recordings node scripts/test-live-conversation-turns.mjs
+```
+
+The client replay uses the September 11 quiet-phone fixture; missing that file
+fails the explicitly enabled gate. Normal CI runs synthetic client fixtures.
+Partially GPU-offloaded routers below 85% VRAM residency use the bounded small
+model fallback instead of treating any nonzero GPU allocation as sufficient.

@@ -64,10 +64,29 @@ SPEECH_MODEL_CONTEXT = 8_192
 SPEECH_NUM_PREDICT = 384
 SPEECH_RETRY_NUM_PREDICT = 640
 DEGRADED_SPEECH_TIMEOUT_SECONDS = 8
+DEGRADED_SPEECH_MODEL = "qwen3.5:0.8b"
+DEGRADED_SPEECH_CONTEXT = 4_096
+MIN_SPEECH_MODEL_VRAM_FRACTION = 0.85
 AGENT_SENTINEL = "[[OPENCLAW_AGENT]]"
 NEW_AGENT_SENTINEL = "[[OPENCLAW_NEW]]"
 SAY_SENTINEL = "[[SAY]]"
 IGNORE_SENTINEL = "[[IGNORE]]"
+
+
+def is_model_fully_accelerated(model: dict[str, Any]) -> bool:
+    size = int(model.get("size") or 0)
+    size_vram = int(model.get("size_vram") or 0)
+    return bool(size > 0 and size_vram / size >= MIN_SPEECH_MODEL_VRAM_FRACTION)
+
+
+def is_incomplete_spoken_fragment(text: str) -> bool:
+    normalized = re.sub(r"[\s.?!]+$", "", text).strip()
+    return bool(re.search(
+        r"(?:\b(?:and|or|but|because|with|to|for|about|that|which|whether|if)|"
+        r"\b(?:capital|colour|color|result)\s+of)\s*$",
+        normalized,
+        re.IGNORECASE,
+    ))
 SPEECH_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -144,6 +163,10 @@ PARTIAL_TRANSCRIPT_INTERVAL_SECONDS = 1.0
 ONLINE_ASR_WINDOW_SECONDS = 14.0
 ONLINE_ASR_OVERLAP_SECONDS = 2.0
 BACKCHANNEL_DISPLAY_TEXT = ""
+# Spoken listening acknowledgments are intentionally disabled. They can overlap
+# ordinary phone speech when acoustic endpointing is conservative, and users
+# cannot distinguish the synthetic hum from an unsolicited assistant reply.
+SPOKEN_BACKCHANNELS_ENABLED = False
 SMART_TURN_MODEL_PATH = os.environ.get(
     "SMART_TURN_MODEL_PATH",
     "/home/john/.openclaw/tools/pipecat-live-conversation/models/smart-turn-v3.2-cpu.onnx",
@@ -2500,9 +2523,34 @@ class LiveConversationService:
                     response.raise_for_status()
                     await response.read()
             LOGGER.info("speech_model_warm model=%s", SPEECH_MODEL)
-            await self.refresh_speech_model_acceleration(force=True)
+            accelerated = await self.refresh_speech_model_acceleration(force=True)
+            if accelerated is False:
+                await self.warm_degraded_speech_model()
         except Exception as error:
             LOGGER.warning("speech_model_warm_failed error=%s", error)
+
+    async def warm_degraded_speech_model(self) -> None:
+        payload = {
+            "model": DEGRADED_SPEECH_MODEL,
+            "keep_alive": SPEECH_MODEL_KEEP_ALIVE,
+            "stream": False,
+            "think": False,
+            "messages": [{"role": "user", "content": "Reply only: ready"}],
+            "options": {
+                "temperature": 0,
+                "num_predict": 3,
+                "num_ctx": DEGRADED_SPEECH_CONTEXT,
+            },
+        }
+        try:
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(SPEECH_MODEL_URL, json=payload) as response:
+                    response.raise_for_status()
+                    await response.read()
+            LOGGER.info("degraded_speech_model_warm model=%s", DEGRADED_SPEECH_MODEL)
+        except Exception as error:
+            LOGGER.warning("degraded_speech_model_warm_failed error=%s", error)
 
     async def refresh_speech_model_acceleration(self, force: bool = False) -> bool | None:
         """Report whether Ollama actually placed the speech router in VRAM.
@@ -2525,12 +2573,19 @@ class LiveConversationService:
                 item for item in payload.get("models", [])
                 if item.get("name") == SPEECH_MODEL or item.get("model") == SPEECH_MODEL
             ]
-            accelerated = bool(matching and int(matching[0].get("size_vram") or 0) > 0)
+            model = matching[0] if matching else {}
+            size = int(model.get("size") or 0)
+            size_vram = int(model.get("size_vram") or 0)
+            vram_fraction = size_vram / size if size > 0 else 0.0
+            # A few layers in VRAM is not enough for the full semantic prompt.
+            # Ollama still reports nonzero size_vram in that state, although
+            # observed turn latency exceeds the user-visible deadline.
+            accelerated = bool(matching and is_model_fully_accelerated(model))
             if accelerated != self.speech_model_accelerated:
                 LOGGER.warning(
-                    "speech_model_acceleration_changed accelerated=%s size_vram=%s",
-                    accelerated,
-                    matching[0].get("size_vram") if matching else "model-not-loaded",
+                    "speech_model_acceleration_changed accelerated=%s size_vram=%s "
+                    "size=%s vram_fraction=%.3f",
+                    accelerated, size_vram, size, vram_fraction,
                 )
             self.speech_model_accelerated = accelerated
             self.speech_model_acceleration_checked_at = now
@@ -2542,7 +2597,14 @@ class LiveConversationService:
     async def degraded_speech_reply(self, text: str) -> tuple[str, str, str | None]:
         """Keep voice routing useful when the dedicated model loses GPU use."""
         normalized = re.sub(r"\s+", " ", text).strip()
+        if self.pending_fragment:
+            normalized = f"{self.pending_fragment.rstrip(' .?!')} {normalized.lstrip()}"
+            self.pending_fragment = ""
+            self.pending_fragment_turn_id = None
         lowered = normalized.casefold()
+        if is_incomplete_spoken_fragment(normalized):
+            self.pending_fragment = normalized
+            return "wait", "", None
         if re.match(r"^(?:i am|i'm|just )?(?:testing|trying out|testing out)\b", lowered):
             return "direct", "I hear you. Go ahead with the test.", None
         if requires_tool_backed_action(normalized):
@@ -2552,21 +2614,22 @@ class LiveConversationService:
             return "agent", "I'll verify that against a current source.", None
 
         payload = {
-            "model": SPEECH_MODEL,
+            "model": DEGRADED_SPEECH_MODEL,
             "keep_alive": SPEECH_MODEL_KEEP_ALIVE,
             "stream": False,
             "think": False,
             "messages": [
                 {"role": "system", "content": (
-                    "Answer the user directly in one concise, natural spoken sentence. "
-                    "Never claim to perform an action or know changing current facts."
+                    "Answer only the user's actual question or statement in one concise, "
+                    "natural spoken sentence. Respect corrections and negation. Never claim "
+                    "to perform an action or know changing current facts."
                 )},
                 {"role": "user", "content": normalized},
             ],
             "options": {
                 "temperature": 0,
                 "num_predict": 96,
-                "num_ctx": SPEECH_MODEL_CONTEXT,
+                "num_ctx": DEGRADED_SPEECH_CONTEXT,
             },
         }
         try:
@@ -2705,10 +2768,7 @@ class LiveConversationService:
             )
         # Conservative fallback is explicit and observable rather than being
         # misrepresented as model-based semantic endpointing.
-        unfinished = bool(re.search(
-            r"(?:,|\b(?:and|or|but|because|with|to|for|about|that|which))\s*$",
-            transcript.strip(), re.I,
-        ))
+        unfinished = is_incomplete_spoken_fragment(transcript)
         return TurnDecision(not unfinished, 0.5 if not unfinished else 0.0, "text-fallback")
 
     async def semantic_endpoint_decision(
@@ -3793,7 +3853,7 @@ function renderDebugStatus(value){const current=value&&value.state?value:{state:
 function report(event,detail){send({type:'client_event',event:event,detail:String(detail||'')})}
 function finishTurn(){if(!recording)return;recording=false;awaitingResponse=true;candidateSpeechMs=0;endpointPending=false;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}
 function begin(){if(recording)return;const interruptedWait=awaitingResponse;recording=true;awaitingResponse=false;candidateSpeechMs=0;speechMs=0;silenceMs=0;endpointPending=false;nextEndpointAt=SEMANTIC_CHECK_MS;if(responseActive){responseActive=false;if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}try{OpenClawNativeAudio.interruptAgentResponsePlayback()}catch(e){}report('barge_in','confirmed_user_speech')}send({type:'input_audio_buffer.speech_started'});send({type:'start'});for(const audioBase64 of pre)send({type:'audio',audioBase64});pre=[];report('speech_started',interruptedWait?'while_awaiting_response':'ready');state.textContent='Listening…'}
-function processChunk(chunk){const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>PREBUFFER_FRAMES)pre.shift();const speechThreshold=responseActive?.025:.012;const speechRequiredMs=responseActive?BARGE_IN_CONFIRM_MS:START_CONFIRM_MS;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+AUDIO_FRAME_MS:0;if(candidateSpeechMs>=speechRequiredMs)begin();return true}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=AUDIO_FRAME_MS;silenceMs=0;endpointPending=false;nextEndpointAt=SEMANTIC_CHECK_MS}else silenceMs+=AUDIO_FRAME_MS;if(speechMs>=200&&silenceMs>=HARD_ENDPOINT_MS){finishTurn();return false}if(speechMs>=200&&silenceMs>=nextEndpointAt&&!endpointPending){endpointPending=true;nextEndpointAt=silenceMs+400;send({type:'endpoint_candidate'});state.textContent='Listening for more…'}return true}
+function processChunk(chunk){const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>PREBUFFER_FRAMES)pre.shift();const speechThreshold=responseActive?.025:.006;const speechRequiredMs=responseActive?BARGE_IN_CONFIRM_MS:START_CONFIRM_MS;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+AUDIO_FRAME_MS:0;if(candidateSpeechMs>=speechRequiredMs)begin();return true}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=AUDIO_FRAME_MS;silenceMs=0;endpointPending=false;nextEndpointAt=SEMANTIC_CHECK_MS}else silenceMs+=AUDIO_FRAME_MS;if(speechMs>=200&&silenceMs>=HARD_ENDPOINT_MS){finishTurn();return false}if(speechMs>=200&&silenceMs>=nextEndpointAt&&!endpointPending){endpointPending=true;nextEndpointAt=silenceMs+400;send({type:'endpoint_candidate'});state.textContent='Listening for more…'}return true}
 function tick(){for(let drained=0;drained<MAX_DRAIN_FRAMES;drained++){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;if(processChunk(chunk)===false)return}}
 function start(){if(ws&&(ws.readyState===0||ws.readyState===1))return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…';for(const message of pendingMessages.splice(0))send(message)};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-120):[];renderHistory()}if(m.type==='settings'){confirmation.textContent='Action confirmation: '+(m.action_confirmation==='confirm'?'On — asks before actions':'Off — replies before acting');audioCapture=m.audio_capture===true;recordingSetting.textContent='Test audio capture: '+(audioCapture?'On — saving microphone turns locally':'Off');recordingToggle.textContent=audioCapture?'Disable test audio capture':'Enable test audio capture';renderDebugStatus(m.debug_status)}if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.state==='listening'&&!recording){awaitingResponse=false;candidateSpeechMs=0}if((m.detail||'').startsWith('Ignored')||(m.detail||'').startsWith('Silent stop'))pendingTranscript=''}if(m.type==='action_status'&&m.state==='acknowledged')state.textContent='Working…';if(m.type==='partial_transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript='';addHistory('user',m.text)}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
 let realtimeListenerSocket=null;
@@ -4310,7 +4370,8 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
                     })
                     duration = len(snapshot) / (SAMPLE_RATE * 2)
                     if (
-                        not decision.complete and not backchannel_used
+                        SPOKEN_BACKCHANNELS_ENABLED
+                        and not decision.complete and not backchannel_used
                         and duration >= 4.0 and len(online_transcript.stable_words) >= 3
                     ):
                         backchannel_used = True

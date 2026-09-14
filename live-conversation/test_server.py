@@ -22,11 +22,15 @@ from server import (
     SPEECH_MODEL_URL,
     SPEECH_NUM_PREDICT,
     SPEECH_RETRY_NUM_PREDICT,
+    MIN_SPEECH_MODEL_VRAM_FRACTION,
+    SPOKEN_BACKCHANNELS_ENABLED,
     DEFAULT_NODE_COMMAND,
     DEFAULT_OPENCLAW_MODULE,
     DEFAULT_TTS_MODEL_DIR,
     DEFAULT_TTS_SPEAKER_ID,
     DEFAULT_QWEN_INITIAL_CHUNK_FRAMES,
+    DEGRADED_SPEECH_CONTEXT,
+    DEGRADED_SPEECH_MODEL,
     LiveConversationService,
     IncrementalSpeechStream,
     OnlineTranscript,
@@ -47,6 +51,8 @@ from server import (
     has_stale_identity_confusion,
     has_explicit_action_request,
     is_explicit_new_agent_request,
+    is_model_fully_accelerated,
+    is_incomplete_spoken_fragment,
     is_gateway_status_question,
     is_referential_agent_question,
     is_operational_acknowledgment,
@@ -163,6 +169,44 @@ class RoutingTests(unittest.TestCase):
         import asyncio
         asyncio.run(run_test())
 
+    def test_partial_model_offload_is_not_treated_as_full_acceleration(self):
+        self.assertFalse(is_model_fully_accelerated({
+            "size": 6_911_525_856,
+            "size_vram": 2_835_982_080,
+        }))
+        self.assertTrue(is_model_fully_accelerated({
+            "size": 6_911_525_856,
+            "size_vram": 6_911_525_856,
+        }))
+
+    def test_degraded_direct_answers_use_the_small_warm_model(self):
+        self.assertEqual(DEGRADED_SPEECH_MODEL, "qwen3.5:0.8b")
+        self.assertLess(DEGRADED_SPEECH_CONTEXT, SPEECH_MODEL_CONTEXT)
+
+    def test_degraded_router_preserves_incomplete_normal_speech(self):
+        self.assertTrue(is_incomplete_spoken_fragment("What is the capital of"))
+        self.assertTrue(is_incomplete_spoken_fragment("Could you tell me whether"))
+        self.assertFalse(is_incomplete_spoken_fragment(
+            "I guess Arby's was the wrong choice."
+        ))
+
+        async def run_test():
+            service = LiveConversationService("agent:main:degraded-fragment", 1.15)
+            service.speech_model_accelerated = False
+            first = await service.speech_reply("What is the capital of")
+            self.assertEqual(first, ("wait", "", None))
+            self.assertEqual(service.pending_fragment, "What is the capital of")
+            context, _ = mock_semantic_model("Ottawa is the capital of Canada.")
+            with patch("server.aiohttp.ClientSession", return_value=context):
+                second = await service.speech_reply("the nation called Canada?")
+            self.assertEqual(second, (
+                "direct", "Ottawa is the capital of Canada.", None
+            ))
+            self.assertEqual(service.pending_fragment, "")
+
+        import asyncio
+        asyncio.run(run_test())
+
     def test_degraded_router_preserves_explicit_action_authorization(self):
         async def run_test():
             service = LiveConversationService("agent:main:degraded-action", 1.15)
@@ -202,6 +246,19 @@ class RoutingTests(unittest.TestCase):
         self.assertTrue(requires_tool_backed_action(
             "Task an agent with fixing the live conversation."
         ))
+
+    def test_normal_conversation_corpus_never_accidentally_delegates(self):
+        ordinary_turns = (
+            "I guess Arby's was the wrong choice.",
+            "I'm frustrated because parts of what I say keep getting missed.",
+            "Um, I thought the meeting was Friday, but actually it's Thursday.",
+            "Why do leaves change color in autumn?",
+            "Don't set an alarm. I only want to know how alarms work.",
+            "No, I said Arby's, not Harvey's.",
+        )
+        for transcript in ordinary_turns:
+            with self.subTest(transcript=transcript):
+                self.assertFalse(requires_tool_backed_action(transcript))
 
     def test_adversarial_routing_corpus_preserves_least_powerful_route(self):
         conversational = (
@@ -506,6 +563,9 @@ class RoutingTests(unittest.TestCase):
 
         import asyncio
         asyncio.run(run_test())
+
+    def test_spoken_backchannels_are_disabled(self):
+        self.assertFalse(SPOKEN_BACKCHANNELS_ENABLED)
 
     def test_conversation_entity_graph_and_dynamic_cadence(self):
         entities = conversation_entities(
@@ -2622,6 +2682,7 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("await conversation_idle.wait()", source)
         self.assertIn("if turn_queue.empty() and not user_input_active", source)
         self.assertIn("len(online_transcript.stable_words) >= 3", source)
+        self.assertIn("SPOKEN_BACKCHANNELS_ENABLED", source)
         self.assertIn("pcm_override=affirmative_hum_pcm()", source)
         self.assertNotIn("turn_task.cancel()", source)
         self.assertNotIn("len(audio) < SAMPLE_RATE * 2 * 30", source)
@@ -2719,7 +2780,7 @@ class RoutingTests(unittest.TestCase):
 
     def test_playback_vad_rejects_echo_and_covers_native_tail(self):
         page = render_page()
-        self.assertIn("const speechThreshold=responseActive?.025:.012", page)
+        self.assertIn("const speechThreshold=responseActive?.025:.006", page)
         self.assertIn("START_CONFIRM_MS=300,BARGE_IN_CONFIRM_MS=300", page)
         self.assertIn(
             "const speechRequiredMs=responseActive?BARGE_IN_CONFIRM_MS:START_CONFIRM_MS",

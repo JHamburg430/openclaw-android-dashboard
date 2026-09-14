@@ -15,10 +15,16 @@ import re
 import unittest
 import wave
 
+import numpy as np
 from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transcriptions.language import Language
 
-from server import LiveConversationService, SAMPLE_RATE, is_gateway_status_question
+from server import (
+    LiveConversationService,
+    SAMPLE_RATE,
+    SPOKEN_BACKCHANNELS_ENABLED,
+    is_gateway_status_question,
+)
 
 
 def _words(text: str) -> set[str]:
@@ -44,10 +50,9 @@ class RecordedPhoneAudioTests(unittest.TestCase):
             user_agent = str((manifest.get("client_context") or {}).get("user_agent") or "")
             if source == "android_live_microphone" or "android" in user_agent.casefold():
                 phone_manifests.append(manifest_path)
-            if len(phone_manifests) >= 20:
-                break
-        cls.manifests = list(reversed(phone_manifests))
-        if not cls.manifests:
+        cls.all_manifests = list(reversed(phone_manifests))
+        cls.manifests = cls.all_manifests[-20:]
+        if not cls.all_manifests:
             raise unittest.SkipTest(
                 f"no Android microphone Live Conversation captures in {cls.root}"
             )
@@ -97,7 +102,7 @@ class RecordedPhoneAudioTests(unittest.TestCase):
         """Replay the debug capture that originally lost its requested subject."""
         capture_id = "20260910T190707.340433-4-6f85dc"
         manifest_path = next(
-            (path for path in self.manifests if path.stem == capture_id), None
+            (path for path in self.all_manifests if path.stem == capture_id), None
         )
         if manifest_path is None:
             self.skipTest(f"captured Android regression audio {capture_id} is unavailable")
@@ -122,7 +127,7 @@ class RecordedPhoneAudioTests(unittest.TestCase):
         """Replay the capture whose UI wording triggered the status shortcut."""
         capture_id = "20260910T193957.715784-2-95bafe"
         manifest_path = next(
-            (path for path in self.manifests if path.stem == capture_id), None
+            (path for path in self.all_manifests if path.stem == capture_id), None
         )
         if manifest_path is None:
             self.skipTest(f"captured Android regression audio {capture_id} is unavailable")
@@ -144,6 +149,87 @@ class RecordedPhoneAudioTests(unittest.TestCase):
             f"captured delegation lost required terms: {actual!r}",
         )
         self.assertFalse(is_gateway_status_question(actual), actual)
+
+    def test_unwanted_backchannel_complaint_disables_spoken_hums(self) -> None:
+        """Replay the phone report that the assistant was still saying mm-hmm."""
+        capture_id = "20260911T153034.848723-4-b9e7f5"
+        manifest_path = next(
+            (path for path in self.all_manifests if path.stem == capture_id), None
+        )
+        if manifest_path is None:
+            self.skipTest(f"captured Android regression audio {capture_id} is unavailable")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        wav_path = manifest_path.parent / manifest["user_audio"]
+
+        async def replay() -> str:
+            service = LiveConversationService("agent:main:backchannel-regression", 1.15)
+            service.stt = self.stt
+            with wave.open(str(wav_path), "rb") as recording:
+                pcm = recording.readframes(recording.getnframes())
+            return await service.transcribe(pcm, purpose="final")
+
+        actual = asyncio.run(replay())
+        self.assertTrue(
+            {"still", "saying", "mmhmm"}.issubset(_words(actual)),
+            f"captured complaint no longer reproduces clearly: {actual!r}",
+        )
+        self.assertFalse(SPOKEN_BACKCHANNELS_ENABLED)
+
+    def test_normal_phone_statement_survives_partial_and_final_asr(self) -> None:
+        """A casual statement must not vanish or change its central meaning."""
+        capture_id = "20260911T153118.746660-2-09d0d1"
+        manifest_path = next(
+            (path for path in self.all_manifests if path.stem == capture_id), None
+        )
+        if manifest_path is None:
+            self.skipTest(f"captured Android regression audio {capture_id} is unavailable")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        wav_path = manifest_path.parent / manifest["user_audio"]
+
+        async def replay() -> dict[str, str]:
+            service = LiveConversationService("agent:main:ordinary-speech-regression", 1.15)
+            service.stt = self.stt
+            with wave.open(str(wav_path), "rb") as recording:
+                pcm = recording.readframes(recording.getnframes())
+            return {
+                purpose: await service.transcribe(pcm, purpose=purpose)
+                for purpose in ("partial", "final")
+            }
+
+        actual = asyncio.run(replay())
+        for purpose, transcript in actual.items():
+            with self.subTest(purpose=purpose):
+                self.assertTrue(
+                    {"arby's", "wrong", "choice"}.issubset(_words(transcript)),
+                    f"{purpose} ASR misunderstood the casual phone statement: {transcript!r}",
+                )
+
+    def test_quiet_normal_phone_speech_crosses_the_client_start_gate(self) -> None:
+        """Prove the S25 onset detector still hears a substantially quieter turn."""
+        capture_id = "20260911T152955.906576-2-1ef3d4"
+        manifest_path = next(
+            (path for path in self.all_manifests if path.stem == capture_id), None
+        )
+        if manifest_path is None:
+            self.skipTest(f"captured Android regression audio {capture_id} is unavailable")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        wav_path = manifest_path.parent / manifest["user_audio"]
+        with wave.open(str(wav_path), "rb") as recording:
+            pcm = recording.readframes(recording.getnframes())
+
+        samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) * 0.30
+        frame_samples = SAMPLE_RATE // 50
+        consecutive_ms = 0
+        longest_ms = 0
+        for offset in range(0, len(samples), frame_samples):
+            frame = samples[offset:offset + frame_samples]
+            level = float(np.sqrt(np.mean(np.square(frame / 32768.0))))
+            consecutive_ms = consecutive_ms + 20 if level >= 0.006 else 0
+            longest_ms = max(longest_ms, consecutive_ms)
+        self.assertGreaterEqual(
+            longest_ms, 300,
+            "quiet replay never crossed the production 300 ms speech-start gate",
+        )
 
 
 if __name__ == "__main__":

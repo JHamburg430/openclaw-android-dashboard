@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import vm from "node:vm";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 const source = readFileSync(
   new URL("../live-conversation/server.py", import.meta.url),
@@ -105,6 +106,10 @@ function harness() {
         vm.runInContext("tick()", context);
       }
     },
+    feed(chunk) {
+      chunks.push(chunk);
+      vm.runInContext("tick()", context);
+    },
     count(type) { return sent.filter((message) => message.type === type).length; },
     value(expression) { return vm.runInContext(expression, context); },
     get interrupts() { return interrupts; },
@@ -114,8 +119,21 @@ function harness() {
 
 {
   const app = harness();
-  app.run(0.010, 150);
-  assert.equal(app.count("start"), 0, "sustained background noise does not start a turn");
+  app.run(0.004, 150);
+  assert.equal(app.count("start"), 0, "sustained below-threshold background noise does not start a turn");
+}
+
+{
+  const app = harness();
+  app.run(0.008, 14);
+  assert.equal(app.count("start"), 0, "quiet speech still needs confirmation");
+  app.run(0.008, 1);
+  assert.equal(app.count("start"), 1, "quiet ordinary speech starts after 300 ms");
+  app.run(0.008, 50);
+  assert.equal(app.count("start"), 1, "sustained quiet speech remains one turn");
+  app.run(0.001, 38);
+  app.socket.server({type: "endpoint_decision", complete: true});
+  assert.equal(app.count("commit"), 1, "quiet speech completes normally");
 }
 
 {
@@ -203,12 +221,12 @@ function harness() {
   // A near-field sentence can begin quietly before a later vowel crosses the
   // conservative start gate. Preserve 2.5 seconds before the 300 ms confirmation
   // window so those first words reach ASR instead of starting mid-sentence.
-  app.run(0.007, 125);
+  app.run(0.004, 125);
   app.run(0.030, 15);
   const captured = app.sent.filter((message) => message.type === "audio");
   assert.equal(app.count("start"), 1, "confirmed foreground speech starts a turn");
   assert.equal(captured.length, 140, "the full 2.5 second quiet onset and confirmation window are retained");
-  assert.equal(captured[0].audioBase64, pcm(0.007), "capture begins at the quiet sentence onset");
+  assert.equal(captured[0].audioBase64, pcm(0.004), "capture begins at the quiet sentence onset");
 }
 
 {
@@ -313,6 +331,34 @@ function harness() {
     ["user:First question.", "user:Second question."],
     "each final transcript is recorded even when no assistant reply separates the turns",
   );
+}
+
+// Optional private-corpus gate runs captured phone PCM through the actual
+// embedded client, not a second implementation of its onset detector.
+if (process.env.LIVE_CONVERSATION_TEST_RECORDINGS) {
+  const wav = readFileSync(join(process.env.LIVE_CONVERSATION_TEST_RECORDINGS,
+    "20260911/20260911T152955.906576-2-1ef3d4-user.wav"));
+  assert.equal(wav.toString("ascii", 0, 4), "RIFF");
+  assert.equal(wav.toString("ascii", 8, 12), "WAVE");
+  let audio;
+  for (let offset = 12; offset + 8 <= wav.length;) {
+    const size = wav.readUInt32LE(offset + 4);
+    if (wav.toString("ascii", offset, offset + 4) === "data") {
+      audio = Buffer.from(wav.subarray(offset + 8, offset + 8 + size));
+      break;
+    }
+    offset += 8 + size + (size % 2);
+  }
+  assert.ok(audio?.length, "private phone fixture has PCM audio");
+  for (let offset = 0; offset + 2 <= audio.length; offset += 2) {
+    audio.writeInt16LE(Math.round(audio.readInt16LE(offset) * 0.30), offset);
+  }
+  const app = harness();
+  for (let offset = 0; offset + 640 <= audio.length; offset += 640) {
+    app.feed(audio.subarray(offset, offset + 640).toString("base64"));
+  }
+  assert.equal(app.count("start"), 1, "quiet captured phone speech starts one real client turn");
+  assert.ok(app.count("audio") > 15, "captured speech is delivered to the server");
 }
 
 console.log("Live Conversation multi-turn/noise/interruption matrix passed");

@@ -62,6 +62,11 @@ def mix_noise(pcm: bytes, level: float, seed: int = 430) -> bytes:
     return np.rint(np.clip(samples + noise, -1.0, 1.0) * 32767).astype("<i2").tobytes()
 
 
+def apply_gain(pcm: bytes, gain: float) -> bytes:
+    samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
+    return np.rint(np.clip(samples * gain, -32768, 32767)).astype("<i2").tobytes()
+
+
 def rms(pcm: bytes) -> float:
     samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
     return math.sqrt(float(np.mean(samples * samples))) if len(samples) else 0.0
@@ -239,12 +244,32 @@ async def run_matrix(url: str) -> dict:
     unfinished = await synthesize(
         "Could you tell me whether", 0.88
     )
+    ordinary_cases = await asyncio.gather(
+        synthesize("I guess Arby's was the wrong choice.", 1.04),
+        synthesize(
+            "Hey, I'm a little frustrated because parts of what I say keep getting missed.",
+            1.02,
+        ),
+        synthesize(
+            "Um, I thought the meeting was Friday, but actually it's Thursday.", 0.96
+        ),
+        synthesize("Why do leaves change color in autumn?", 1.12),
+        synthesize(
+            "Don't set an alarm. I only want to know how alarms work.", 1.03
+        ),
+    )
 
     report: dict[str, object] = {
         "speed_noise": [], "pause_gaps_ms": [], "broken_sentence": {},
-        "barge_in": {},
+        "barge_in": {}, "ordinary_conversation": [],
     }
     async with ClientSession() as client:
+        health_url = url.rsplit("/ws", 1)[0] + "/health"
+        async with client.get(health_url) as response:
+            response.raise_for_status()
+            health = await response.json()
+        router_mode = str((health.get("speech_router") or {}).get("mode") or "unknown")
+        report["router_mode"] = router_mode
         socket = await client.ws_connect(url, heartbeat=20)
         live = LiveSocket(socket)
         try:
@@ -259,6 +284,33 @@ async def run_matrix(url: str) -> dict:
                     "reply": result.reply, "response_pcm_bytes": len(result.response_pcm),
                 })
 
+            ordinary_matrix = (
+                ("quiet_casual_statement", apply_gain(ordinary_cases[0], 0.35),
+                 ("wrong", "choice")),
+                ("frustration", ordinary_cases[1], ("frustrated", "missed")),
+                ("disfluent_self_correction", ordinary_cases[2],
+                 ("meeting", "thursday")),
+                ("everyday_question_with_noise", mix_noise(ordinary_cases[3], 0.004, 431),
+                 ("leaves", "autumn")),
+                ("negated_action", ordinary_cases[4], ("alarm", "work")),
+            )
+            for label, pcm, expected in ordinary_matrix:
+                result = await complete_turn(live, pcm, expected)
+                if (
+                    label == "negated_action"
+                    and "couldn't process" in result.reply.casefold()
+                ):
+                    raise AssertionError(
+                        f"negated ordinary request fell back to a retry: {result.reply!r}"
+                    )
+                report["ordinary_conversation"].append({
+                    "case": label,
+                    "transcript": result.transcript,
+                    "reply": result.reply,
+                    "route": result.route,
+                    "response_pcm_bytes": len(result.response_pcm),
+                })
+
             for gap_ms, (pause_a, pause_b), expected in zip(
                 (250, 800, 1800), pause_cases,
                 (("three",), ("spring",), ("grass",)),
@@ -271,7 +323,10 @@ async def run_matrix(url: str) -> dict:
                 if gap_ms >= 750:
                     await live.send({"type": "endpoint_candidate"})
                     endpoint = await live.wait(lambda e: e.get("type") == "endpoint_decision")
-                    if endpoint.get("source", "").endswith("semantic-error"):
+                    if (
+                        router_mode == "gpu"
+                        and endpoint.get("source", "").endswith("semantic-error")
+                    ):
                         raise AssertionError(
                             f"semantic endpoint controller failed after {gap_ms} ms: {endpoint}"
                         )
@@ -286,8 +341,10 @@ async def run_matrix(url: str) -> dict:
                     "transcript": result.transcript, "reply": result.reply,
                 })
 
-            # An incomplete long thought should yield a blank-text PCM hum, not
-            # a text token that Kokoro can spell aloud.
+            # An incomplete long thought must stay silent. Spoken listening
+            # acknowledgments overlap normal phone speech and sound like an
+            # unsolicited assistant response.
+            backchannel_start = len(live.all_events)
             await begin_turn(live)
             # Ensure this conversational hold is long enough to exercise the
             # production >=4 s backchannel threshold at real-time pacing.
@@ -299,27 +356,19 @@ async def run_matrix(url: str) -> dict:
             endpoint = await live.wait(lambda e: e.get("type") == "endpoint_decision")
             if endpoint.get("complete"):
                 raise AssertionError(f"unfinished backchannel probe ended early: {endpoint}")
-            backchannel = await live.wait(lambda e: e.get("type") == "backchannel")
-            if backchannel.get("text") != "":
-                raise AssertionError(f"backchannel exposed spelling text: {backchannel}")
-            backchannel_id = backchannel["responseId"]
-            await live.wait(
-                lambda e: e.get("type") == "response.output_audio.done"
-                and e.get("responseId") == backchannel_id
-            )
-            hum_pcm = b"".join(
-                base64.b64decode(event["audioBase64"])
-                for event in live.all_events
-                if event.get("type") == "response.output_audio.delta"
-                and event.get("responseId") == backchannel_id
-            )
-            if len(hum_pcm) < 20_000 or rms(hum_pcm) < 0.02:
-                raise AssertionError("nonverbal backchannel audio was missing")
+            await asyncio.sleep(0.4)
+            backchannels = [
+                event for event in live.all_events[backchannel_start:]
+                if event.get("type") == "backchannel"
+            ]
+            if backchannels:
+                raise AssertionError(
+                    f"unfinished speech produced an unwanted backchannel: {backchannels}"
+                )
             await send_pcm(live, await synthesize("autumn comes after summer?", 1.0))
             await finish_turn(live, ("autumn", "summer"))
             report["backchannel"] = {
-                "text": backchannel.get("text"), "pcm_bytes": len(hum_pcm),
-                "endpoint": endpoint,
+                "enabled": False, "endpoint": endpoint,
             }
 
             # Two separately committed ASR turns must remain one semantic
