@@ -7,6 +7,8 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
+import android.content.BroadcastReceiver;
+import android.content.IntentFilter;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -33,6 +35,7 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
     public static final String ACTION_START = "ai.openclaw.dashboard.node.START";
     public static final String ACTION_STOP = "ai.openclaw.dashboard.node.STOP";
     public static final String ACTION_RECONNECT = "ai.openclaw.dashboard.node.RECONNECT";
+    public static final String ACTION_ALLOW_SLEEP = "ai.openclaw.dashboard.node.ALLOW_SLEEP";
     static final String PREFS = "openclaw_dashboard";
 
     private static final String CHANNEL_ID = "openclaw_phone_node";
@@ -71,10 +74,31 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
     private long connectStartedAtMs;
     private long nextReconnectAtMs;
     private String activeGatewayUrl = "";
+    private PhoneKeepAwake keepAwake;
+    private boolean foregroundStarted;
+    private final SharedPreferences.OnSharedPreferenceChangeListener keepAwakePreferenceListener = (preferences, key) -> {
+        if (PhoneKeepAwake.PREF_ENABLED.equals(key)) handler.post(this::refreshKeepAwake);
+    };
+    private final BroadcastReceiver screenStateReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) { refreshKeepAwake(); }
+    };
+
+    private void refreshKeepAwake() {
+        keepAwake.update(foregroundStarted && !manualStop
+                && prefs.getBoolean(PhoneKeepAwake.PREF_ENABLED, true));
+        if (foregroundStarted) updateNotification(prefs.getString("trace.node.state", "starting"));
+        dispatchState();
+    }
 
     @Override public void onCreate() {
         super.onCreate();
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        keepAwake = new PhoneKeepAwake(this);
+        prefs.registerOnSharedPreferenceChangeListener(keepAwakePreferenceListener);
+        IntentFilter screenEvents = new IntentFilter(Intent.ACTION_SCREEN_OFF);
+        screenEvents.addAction(Intent.ACTION_SCREEN_ON);
+        screenEvents.addAction(Intent.ACTION_USER_PRESENT);
+        registerReceiver(screenStateReceiver, screenEvents, Context.RECEIVER_NOT_EXPORTED);
         audit = new ConnectionAuditLog(this);
         broker = new AndroidCapabilityBroker(this);
         IdentityStore identityStore = new IdentityStore(this);
@@ -87,13 +111,21 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
         createNotificationChannel();
         registerNetworkCallback();
         handler.post(watchdogRunnable);
-        updateState("starting", "", false);
+        updateState(prefs.getBoolean("nodeEnabled", false) ? "starting" : "stopped", "", false);
         audit.record("node", "service_created", new JSONObject());
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent == null ? ACTION_START : intent.getAction();
+        if (ACTION_ALLOW_SLEEP.equals(action)) {
+            prefs.edit().putBoolean(PhoneKeepAwake.PREF_ENABLED, false).apply();
+            refreshKeepAwake();
+            if (!foregroundStarted) stopSelf();
+            return foregroundStarted ? START_STICKY : START_NOT_STICKY;
+        }
         if (ACTION_STOP.equals(action)) {
+            foregroundStarted = false;
+            keepAwake.release();
             prefs.edit().putBoolean("nodeEnabled", false).apply();
             manualStop = true;
             handler.removeCallbacks(reconnectRunnable);
@@ -109,6 +141,8 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
         prefs.edit().putBoolean("nodeEnabled", true).apply();
         manualStop = false;
         startForeground(NOTIFICATION_ID, buildNotification("Connecting"));
+        foregroundStarted = true;
+        refreshKeepAwake();
         String configuredGateway = prefs.getString("url", "");
         boolean configurationChanged = !activeGatewayUrl.isEmpty()
                 && !activeGatewayUrl.equals(configuredGateway == null ? "" : configuredGateway.trim());
@@ -123,6 +157,10 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
     @Override public IBinder onBind(Intent intent) { return binder; }
 
     @Override public void onDestroy() {
+        foregroundStarted = false;
+        prefs.unregisterOnSharedPreferenceChangeListener(keepAwakePreferenceListener);
+        unregisterReceiver(screenStateReceiver);
+        keepAwake.release();
         manualStop = true;
         handler.removeCallbacks(reconnectRunnable);
         handler.removeCallbacks(watchdogRunnable);
@@ -151,12 +189,16 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
         if (stateListener == expected) stateListener = null;
     }
 
-    JSONObject snapshot() { return audit.connectionSnapshot(); }
+    JSONObject snapshot() {
+        JSONObject state = audit.connectionSnapshot();
+        try { state.put("keepAwake", keepAwake.status()); } catch (Exception ignored) { }
+        return state;
+    }
     JSONArray recentAudit(int limit) { return audit.recent(limit); }
     void clearAudit() { audit.clear(); }
 
     private synchronized void connectNow() {
-        if (manualStop) return;
+        if (manualStop || !prefs.getBoolean("nodeEnabled", false)) return;
         if (!hasUsableNetwork()) {
             updateState("network_wait", "Network unavailable", false);
             return;
@@ -533,14 +575,25 @@ public final class PhoneNodeService extends Service implements OpenClawClient.Li
         Intent reconnect = new Intent(this, PhoneNodeService.class).setAction(ACTION_RECONNECT);
         PendingIntent reconnectIntent = PendingIntent.getService(this, 1, reconnect,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        PendingIntent allowSleep = PendingIntent.getService(this, 2,
+                new Intent(this, PhoneNodeService.class).setAction(ACTION_ALLOW_SLEEP),
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        PendingIntent stopNode = PendingIntent.getService(this, 3,
+                new Intent(this, PhoneNodeService.class).setAction(ACTION_STOP),
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         return new Notification.Builder(this, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.stat_notify_sync)
                 .setContentTitle("OpenClaw phone node")
-                .setContentText(state == null ? "Starting" : state.replace('_', ' '))
+                .setContentText((state == null ? "Starting" : state.replace('_', ' '))
+                        + " · Keep awake: " + keepAwake.status())
+                .setStyle(new Notification.BigTextStyle().bigText(
+                        "Keep awake: " + keepAwake.status() + ". Allow sleep turns off keep-awake without disconnecting the node."))
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
                 .setContentIntent(contentIntent)
                 .addAction(new Notification.Action.Builder(null, "Reconnect", reconnectIntent).build())
+                .addAction(new Notification.Action.Builder(null, "Allow sleep", allowSleep).build())
+                .addAction(new Notification.Action.Builder(null, "Stop node", stopNode).build())
                 .build();
     }
 

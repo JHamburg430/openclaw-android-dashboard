@@ -51,7 +51,6 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowInsets;
-import android.view.WindowManager;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -95,7 +94,7 @@ import okhttp3.Response;
 
 public final class MainActivity extends Activity {
     private static final String PREFS = "openclaw_dashboard";
-    private static final String PREF_KEEP_SCREEN_AWAKE = "keep_screen_awake";
+    private static final String PREF_KEEP_SCREEN_AWAKE = PhoneKeepAwake.PREF_ENABLED;
     private static final int REQUEST_RECORD_AUDIO = 2001;
     private static final int REQUEST_POST_NOTIFICATIONS = 2002;
     private static final int REQUEST_CAMERA = 2003;
@@ -160,6 +159,7 @@ public final class MainActivity extends Activity {
     private Button chromeToggleButton;
     private Button overlayToggleButton;
     private Button jarvisWakeButton;
+    private Switch keepScreenAwake;
     private TextView collapsedOutputText;
     private TextView jarvisWakeStatusText;
     private WebView webView;
@@ -213,23 +213,9 @@ public final class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        applyKeepScreenAwake();
+        keepScreenAwake.setChecked(prefs.getBoolean(PREF_KEEP_SCREEN_AWAKE, true));
         clearNativeNotifications();
         updateJarvisWakeButton();
-    }
-
-    @Override
-    protected void onPause() {
-        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        super.onPause();
-    }
-
-    private void applyKeepScreenAwake() {
-        if (prefs.getBoolean(PREF_KEEP_SCREEN_AWAKE, true)) {
-            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        } else {
-            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        }
     }
 
     @Override protected void onNewIntent(Intent intent) {
@@ -312,18 +298,17 @@ public final class MainActivity extends Activity {
         chromeContainer.addView(controlsScroll, new LinearLayout.LayoutParams(-1, -2));
 
         LinearLayout controls = settingsPanel;
-        Switch keepScreenAwake = new Switch(this);
-        keepScreenAwake.setText("Keep screen awake");
+        keepScreenAwake = new Switch(this);
+        keepScreenAwake.setText("Keep phone awake across apps");
         keepScreenAwake.setTextColor(COLOR_TEXT_PRIMARY);
         keepScreenAwake.setMinHeight(dp(48));
         keepScreenAwake.setChecked(prefs.getBoolean(PREF_KEEP_SCREEN_AWAKE, true));
         keepScreenAwake.setOnCheckedChangeListener((buttonView, checked) -> {
             prefs.edit().putBoolean(PREF_KEEP_SCREEN_AWAKE, checked).apply();
-            applyKeepScreenAwake();
         });
         controls.addView(keepScreenAwake, new LinearLayout.LayoutParams(-1, -2));
         TextView keepAwakeHint = text(
-                "Prevents automatic screen sleep while Dashboard is open. Leaving the app or locking the phone still turns the screen off normally. Uses more battery.",
+                "While the phone node is running, keeps the screen and connection awake even in other apps. The screen may dim. Use Allow sleep in the node notification or turn this off when finished. Power still locks the phone. Uses more battery.",
                 12, COLOR_TEXT_MUTED, false);
         keepAwakeHint.setPadding(0, 0, 0, dp(12));
         controls.addView(keepAwakeHint);
@@ -871,6 +856,7 @@ public final class MainActivity extends Activity {
     }
 
     private void startPhoneNodeServiceIfConfigured() {
+        if (!prefs.getBoolean("nodeEnabled", true)) return;
         String rawUrl = prefs.getString("url", "");
         if (rawUrl == null || rawUrl.trim().isEmpty()) return;
         Intent service = new Intent(this, PhoneNodeService.class).setAction(PhoneNodeService.ACTION_START);
@@ -1320,7 +1306,7 @@ public final class MainActivity extends Activity {
             recordDiagnostic("open_dashboard", dashboardUrl);
             Log.d(TAG, "opening " + dashboardUrl);
             setConnectedUiVisible(false);
-            connectDashboardNode();
+            if (prefs.getBoolean("nodeEnabled", true)) connectDashboardNode();
             webView.stopLoading();
             webView.loadUrl(dashboardUrl);
             statusText.setText("Opening Control UI");
@@ -2020,6 +2006,8 @@ public final class MainActivity extends Activity {
             String webUrl = state.optString("webViewUrl", "");
             if (!webUrl.isEmpty()) text.append("\n  ").append(webUrl);
             text.append("\nPhone node: ").append(state.optString("nodeState", "unknown"));
+            text.append("\nKeep awake: ").append(state.optString("keepAwake", "start the phone node to enable"));
+            if (keepScreenAwake != null) keepScreenAwake.setChecked(prefs.getBoolean(PREF_KEEP_SCREEN_AWAKE, true));
             String nodeId = state.optString("nodeId", "");
             if (!nodeId.isEmpty()) text.append("\n  node ").append(shortId(nodeId));
             String connectionId = state.optString("nodeConnectionId", "");

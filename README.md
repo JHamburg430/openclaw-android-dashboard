@@ -94,9 +94,13 @@ Tool-backed requests use an explicit acknowledgment-first handoff. Jarvis finish
 
 ## Keep screen awake
 
-The native controls include a **Keep screen awake** switch (expand the controls with **+** if collapsed). It is enabled by default and remembers your choice across app restarts. It prevents automatic screen sleep while Dashboard is in the foreground, including its embedded Control UI and Live Conversation. Turning it off restores the normal screen timeout immediately. Leaving Dashboard or manually locking the phone releases keep-awake; returning to Dashboard reapplies your saved choice. It does not wake or unlock a locked phone or change Android's system-wide timeout. Keeping the display on uses more battery.
+The native controls include **Keep phone awake across apps** (open **+ → Controls / Diagnostics** if collapsed). Enabled by default, it remembers your choice across app restarts. While the phone node is running, its foreground service keeps the CPU and screen awake even on Home or in other apps, including during connection retries. The screen can dim to save power. Closing Dashboard's activity does not release these service-owned locks. Start the phone node with **Node** if it is stopped.
 
-This uses Android's standard activity window flag, with no additional permissions or background wake lock. See [Android's keep-screen-on documentation](https://developer.android.com/develop/background-work/background-tasks/awake/screen-on).
+Turn the switch off or use **Allow sleep** in the phone-node notification to restore normal sleep without disconnecting the node. **Stop node** releases both locks and stops the connection. Your power button still turns the screen off; the CPU lock remains for the node, and screen keep-awake resumes when you wake the phone. It never wakes or unlocks the phone automatically. Android force-stop, process termination, manufacturer battery restrictions, and network outages can still interrupt connectivity; this is not a guarantee of an always-connected node. Keeping the phone awake uses more battery.
+
+Implementation: Android `WAKE_LOCK` permission, a service-owned partial CPU lock and a capability-checked `SCREEN_DIM_WAKE_LOCK`. The legacy screen-lock level is necessary here because activity window flags do not keep other apps awake. Unsupported screen-lock capability is shown in Connection Center and the notification. See [Android PowerManager documentation](https://developer.android.com/reference/android/os/PowerManager).
+
+The opt-in [emulator integration check](scripts/check-background-keep-awake.py) covers Home/other-app timeouts, manual lock, notification actions, toggle persistence, process restart, activity exit, and node stop/restart. It only runs against the disposable `dashboard-keep-awake-test` AVD, with a debug build and dummy gateway; setup is documented in the script. It does not substitute for physical-phone acceptance.
 
 ## Build
 
