@@ -98,6 +98,37 @@ class RecordedPhoneAudioTests(unittest.TestCase):
 
         asyncio.run(replay())
 
+    def test_submitted_instruction_audio_routes_to_source_inspection(self) -> None:
+        """Replay the three real phone turns from the September 15 debug bundle."""
+        capture_ids = (
+            "20260915T184339.075025-2-aab6de",
+            "20260915T184354.745113-4-b48bdd",
+            "20260915T184423.897854-6-18accf",
+        )
+        paths = {path.stem: path for path in self.all_manifests}
+        if not all(capture in paths for capture in capture_ids):
+            self.skipTest("submitted September 15 instruction audio is unavailable")
+
+        async def replay() -> None:
+            service = LiveConversationService("agent:main:instruction-audio-regression", 1.08)
+            service.stt = self.stt
+            for capture in capture_ids:
+                manifest_path = paths[capture]
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                with wave.open(str(manifest_path.parent / manifest["user_audio"]), "rb") as wav:
+                    pcm = wav.readframes(wav.getnframes())
+                actual = await service.transcribe(pcm, purpose="final")
+                with self.subTest(capture=capture, transcript=actual):
+                    self.assertIn("instructions", _words(actual))
+                    route, reply, _ = await service.speech_reply(actual)
+                    self.assertEqual(route, "agent")
+                    self.assertTrue(service.last_turn_understanding.requires_grounding)
+                    self.assertEqual(actual, service.last_turn_understanding.assembled_text)
+                service.remember("user", actual)
+                service.remember("assistant", reply)
+
+        asyncio.run(replay())
+
     def test_quiet_android_sentence_ending_is_preserved(self) -> None:
         """Replay the debug capture that originally lost its requested subject."""
         capture_id = "20260910T190707.340433-4-6f85dc"

@@ -55,6 +55,7 @@ from server import (
     is_explicit_new_agent_request,
     is_model_fully_accelerated,
     is_incomplete_spoken_fragment,
+    is_instruction_source_request,
     is_gateway_status_question,
     is_referential_agent_question,
     is_operational_acknowledgment,
@@ -77,6 +78,88 @@ from server import (
     summarize_tracked_agent,
     tts_speed_for,
 )
+
+
+class InstructionGroundingTests(unittest.IsolatedAsyncioTestCase):
+    def test_instruction_lookup_does_not_capture_unrelated_or_negated_speech(self):
+        history = [{"role": "user", "content": "What instructions do you already have?"}]
+        for text in (
+            "I'm testing your instructions.",
+            "Don't read your instructions.",
+            "What are instructions?",
+            "Explain your instructions for baking bread.",
+            "Which rules do you have for chess?",
+            "Read the instructions I gave you.",
+            "What instructions do you have for",
+            "What instructions do you have if",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(is_instruction_source_request(text, history))
+        self.assertFalse(is_instruction_source_request("Can you repeat them exactly?"))
+        self.assertFalse(is_instruction_source_request(
+            "Can you repeat them exactly?",
+            history + [{"role": "user", "content": "How do I bake bread?"}],
+        ))
+        self.assertFalse(is_instruction_source_request(
+            "Can you relay those instructions to me exactly?",
+            [{"role": "assistant", "content": "I have standard workspace instructions."}],
+        ))
+
+    async def test_submitted_instruction_questions_use_source_backed_handoff(self):
+        service = LiveConversationService("agent:main:instruction-regression", 1.08)
+        service.sessions_updated_at = service.capabilities_updated_at = time.monotonic()
+        guessed = semantic_decision(
+            "direct", "I have the standard workspace instructions.",
+            speech_act="question", grounding=False,
+        )
+        client, _ = mock_semantic_model(guessed)
+        # Recorded failure: the model asserts knowledge without a source. It
+        # must never reach incremental TTS, including in degraded routing.
+        for accelerated in (True, False):
+            service.speech_model_accelerated = accelerated
+            for question in (
+                "State your instructions verbatim",
+                "What instructions do you already have?",
+                "Can you relay those instructions to me exactly?",
+                "Can you repeat them exactly?",
+            ):
+                streamed = AsyncMock()
+                with self.subTest(question=question, accelerated=accelerated):
+                    with patch("server.aiohttp.ClientSession", return_value=client):
+                        route, reply, target = await service.speech_reply(
+                            question, stream_callback=streamed,
+                        )
+                    self.assertEqual(route, "agent")
+                    self.assertIsNone(target)
+                    self.assertNotIn("standard workspace instructions", reply)
+                    streamed.assert_not_awaited()
+                    intent = service.last_turn_understanding
+                    self.assertTrue(intent.requires_grounding)
+                    self.assertEqual(question, intent.assembled_text)
+                    service.remember("user", question)
+                    service.remember("assistant", reply)
+
+    async def test_instruction_handoff_keeps_source_context_out_of_spoken_confirmation(self):
+        for confirmation in (False, True):
+            service = LiveConversationService("agent:main:instruction-handoff", 1.08)
+            service.confirmation_required = confirmation
+            service.tts.synthesize = AsyncMock(return_value=b"\0\0" * 240)
+            socket = AsyncMock()
+            question = "State your instructions verbatim"
+            handoff = await service.process_turn(socket, b"", transcript_override=question)
+            if confirmation:
+                self.assertIsNone(handoff)
+                handoff = await service.process_turn(socket, b"", transcript_override="Go ahead.")
+            self.assertIsNotNone(handoff)
+            self.assertTrue(handoff[0].startswith(question))
+            self.assertIn("speech_model_prompt", handoff[0])
+            self.assertIn("Do not change files or settings", handoff[0])
+            self.assertTrue(handoff[2].startswith("agent:main:live-conversation-state-your-instructions"))
+            spoken = [call.args[0] for call in service.tts.synthesize.await_args_list]
+            self.assertTrue(spoken)
+            self.assertFalse(any("speech_model_prompt" in text for text in spoken))
+            events = [event for event in service.events if event.get("role") == "user"]
+            self.assertEqual(events[0]["metadata"]["assembled_text"], question)
 
 
 def semantic_decision(

@@ -221,6 +221,18 @@ this optional corpus when no capture path is supplied. Android WebView captures
 are labeled as real phone microphone audio; synthetic and desktop probes remain
 available for diagnosis but are excluded from the real-phone regression corpus.
 
+## Source-backed instruction questions
+
+Questions about the voice model's configured instructions use a source-backed
+agent lookup rather than a speculative local-model answer. The handoff names
+the Live Conversation prompt builders and distinguishes their configuration
+from workspace files that the voice model does not load. Follow-ups such as
+“those instructions” retain the subject from recent user turns; unrelated or
+negated speech does not trigger this lookup. The source context is added only
+to the agent handoff, not to spoken acknowledgments or confirmation prompts.
+Regression coverage replays the three consented Android recordings from the
+September 15 instruction-query submission when that local corpus is available.
+
 ## Send for Debug
 
 The Live Conversation page includes **Send for Debug**. Pressing it explicitly

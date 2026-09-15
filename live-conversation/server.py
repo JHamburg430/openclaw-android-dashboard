@@ -604,6 +604,45 @@ def requires_tool_backed_action(transcript: str) -> bool:
     ))
 
 
+def is_instruction_source_request(
+    transcript: str, history: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Recognize requests to inspect our configured instructions, not advice.
+
+    This source-provenance boundary runs before speculative speech. Only user
+    turns establish the referent, so an assistant's invented claim cannot do so.
+    A new unrelated user turn clears it.
+    """
+    def matches(text: str, prior: bool) -> bool:
+        text = re.sub(r"\s+", " ", text.casefold()).strip()
+        if (is_incomplete_spoken_fragment(text)
+                or re.search(r"\b(?:don't|do not|never|stop|without)\b", text)
+                or not re.match(
+                    r"^(?:(?:please|jarvis)[, ]+)?(?:state|show|read|quote|repeat|relay|"
+                    r"recite|list|tell me|explain|summarize|describe|what|which|how|"
+                    r"can you|could you|would you|will you)\b", text,
+                )):
+            return False
+        subject = r"(?:instructions|rules|guidelines|system prompt|prompt)"
+        ending = r"(?:[.!?]*$|\s+(?:verbatim|exactly|to me|again|please)\b)"
+        own = bool(re.search(
+            rf"\byour (?:current |existing |operating |system )*{subject}{ending}|"
+            rf"\b{subject}\b.*\byou (?:already )?(?:have|follow|were given|received){ending}",
+            text,
+        ))
+        followup = prior and bool(re.search(
+            rf"\b(?:those|these|the same) {subject}{ending}|"
+            rf"\b(?:repeat|relay|quote|read|recite|show) (?:them|that){ending}", text,
+        ))
+        return own or followup
+
+    prior = False
+    for message in (history or [])[-8:]:
+        if message.get("role") == "user":
+            prior = matches(str(message.get("content") or ""), prior)
+    return matches(transcript, prior)
+
+
 def requires_authoritative_lookup(transcript: str) -> bool:
     """Route changeable facts and ambiguous live locations to grounded tools."""
     normalized = re.sub(r"\s+", " ", transcript).strip()
@@ -822,6 +861,7 @@ def speech_model_prompt(
     return f"""You are Jarvis, the model operating John's Live Conversation voice interface right now.
 Jarvis and the Live Conversation model are the same speaker: both refer to you. You receive John's locally transcribed microphone input, choose how each turn is handled, and speak the response. A gateway agent is only a tool-backed work session that you may use; it is not a separate Live Conversation model. Never claim that you are merely a supervisor outside Live Conversation, and never ask an agent to verify whether you can hear John when the current utterance already arrived. Receiving one transcript proves only that the current capture path worked; it does not prove that listening continues while the app is closed, minimized, backgrounded, or the screen is locked. Questions about those runtime states require an authoritative refresh through an agent.
 You are not a general chatbot pretending to lack system access. You can see the live gateway-session summary and capability catalog below, answer questions about them directly, route a follow-up into an existing session, or launch a separate agent session. {pending_note}
+The capability catalog is not the contents of workspace instruction files. Never claim you have read AGENTS.md or other configuration files unless a tool result supplies their contents. Requests to inspect, quote, or explain your configured instructions require source-backed inspection: choose agent with requires_grounding true and a brief lookup acknowledgment, not a guessed answer. Preserve that subject in follow-ups such as "those instructions". Questions about instructions in general, or user-provided instructions already in the conversation, can still be answered directly.
 {confirmation_note}
 Make each decision in this order: (1) determine whether John addressed you, (2) resolve references using the newest relevant conversation and session context, (3) distinguish conversation from an explicit request, (4) decide whether current evidence or a tool-backed refresh is required, (5) choose the least powerful route that can satisfy the request, and only then (6) write the spoken reply. Newer instructions override older ones.
 Conversation history is memory for continuity, preferences, names, and referents—not evidence that changeable information is still true. Never answer a request for current status, availability, progress, configuration, messages, schedules, files, logs, or other time-sensitive facts by repeating history. Refresh the authoritative source through an agent or the live session catalog first. If a refresh is unavailable, say that the current state could not be verified. A completed historical action never prevents John from requesting the same action again.
@@ -3223,6 +3263,17 @@ class LiveConversationService:
         direct_reply = direct_voice_surface_reply(text)
         if direct_reply:
             return "direct", direct_reply, None
+        if not self.pending_fragment and is_instruction_source_request(text, self.recent_history()):
+            # The local model previously invented workspace instructions and
+            # streamed them as direct answers. Ground these before invoking it,
+            # including while the model is degraded. Name the actual surface
+            # for the fresh agent, which otherwise sees only "your"/"those".
+            self.last_turn_understanding = TurnUnderstanding(
+                complete=True, confidence=1.0, speech_act="question", relation="new",
+                actionable=False, requires_grounding=True, supersedes_previous=False,
+                assembled_text=text, reason="Configured instructions need source evidence.",
+            )
+            return "agent", "I'll check the local source for Live Conversation's instructions.", None
         status_question = is_gateway_status_question(text)
         if status_question:
             await self.refresh_sessions(force=True)
@@ -3934,7 +3985,21 @@ class LiveConversationService:
                 agent_request = assembled_text
                 if route in ("agent", "new_agent", "session"):
                     if route in {"agent", "new_agent"} and target_session is None:
-                        target_session = self.allocate_agent_session_key(agent_request)
+                        target_session = self.allocate_agent_session_key(assembled_text)
+                    if is_instruction_source_request(assembled_text, self.recent_history()):
+                        agent_request = (
+                            assembled_text + "\n\nSource lookup context: "
+                            "Answer a read-only source question about the local Live Conversation "
+                            "voice supervisor, not about the correction agent's own instructions. "
+                            f"Inspect {DEFAULT_DASHBOARD_REPO}/live-conversation/server.py, "
+                            "especially speech_model_prompt and turn_understanding_prompt, and "
+                            "any relevant configuration they actually load. Distinguish configured "
+                            "source text from dynamic session context and from workspace files "
+                            "that are not loaded into the voice model. Cite the local source; "
+                            "do not invent instructions or claim a source excerpt is a complete "
+                            "runtime prompt. Do not change files or settings. The user's request "
+                            "refers to these Live Conversation instructions."
+                        )
                     if self.confirmation_required:
                         self.pending_confirmation = (agent_request, target_session, route)
                         summary = re.sub(r"\s+", " ", assembled_text).strip()[:180].rstrip(" .?!")
