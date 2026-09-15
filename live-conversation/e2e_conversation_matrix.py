@@ -378,9 +378,14 @@ async def run_matrix(url: str, ordinary_only: bool = False) -> dict:
                     f"unfinished speech produced an unwanted backchannel: {backchannels}"
                 )
             await send_pcm(live, await synthesize("autumn comes after summer?", 1.0))
-            await finish_turn(live, ("autumn", "summer"))
+            seasonal = await finish_turn(live, ("autumn", "summer"))
+            if not contains_words(seasonal.reply, ("autumn", "summer")):
+                raise AssertionError(
+                    f"whether/weather homophone changed the question: {seasonal.reply!r}"
+                )
             report["backchannel"] = {
                 "enabled": False, "endpoint": endpoint,
+                "reply": seasonal.reply,
             }
 
             # Two separately committed ASR turns must remain one semantic

@@ -369,6 +369,21 @@ The client replay uses the September 11 quiet-phone fixture; missing that file
 fails the explicitly enabled gate. Normal CI runs synthetic client fixtures.
 Partially GPU-offloaded routers below 85% VRAM residency use the bounded small
 model fallback instead of treating any nonzero GPU allocation as sufficient.
+The dedicated voice model uses Ollama's `keep_alive: -1` so idle conversations
+do not expire after 30 minutes. The background session poll attempts to warm a
+lost runner again, at most once per minute; microphone processing does not wait
+on recovery. `/health` reports `ok: false, status: degraded` when the router is
+not accelerated, so the production gate rejects fallback-only deployments.
+The HTTP endpoint remains available for diagnosis and the watchdog's liveness
+check; model recovery is handled in-process rather than repeatedly restarting
+the audio service. The checked-in dedicated Ollama unit pins the model to the
+RTX 3090 by UUID because the general-purpose 3080 Ti server can fill that GPU.
+Verify actual `/api/ps` VRAM residency after deployment, not just CUDA settings.
+Ollama documents indefinite residency in its [keep-alive FAQ](https://docs.ollama.com/faq).
+Between conversations, run `LIVE_CONVERSATION_TEST_RECOVERY=1 python -m unittest
+test_voice_residency.py` from this directory to unload only the dedicated model
+and require recovery on GPU within 30 seconds without restarting the audio
+service. Do not run this fault-injection gate during someone else's voice turn.
 
 Qwen requests are limited to 50-character spoken units and submitted lazily.
 The backend may continue an in-flight unit after disconnect, but cancelling a

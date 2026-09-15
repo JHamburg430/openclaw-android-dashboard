@@ -1505,7 +1505,7 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(SPEECH_MODEL, "openclaw-live-conversation:4b")
         self.assertEqual(SPEECH_MODEL_CONTEXT, 8192)
         self.assertEqual(SPEECH_MODEL_URL, "http://127.0.0.1:11439/api/chat")
-        self.assertEqual(SPEECH_MODEL_KEEP_ALIVE, "30m")
+        self.assertEqual(SPEECH_MODEL_KEEP_ALIVE, -1)
         self.assertEqual(SPEECH_NUM_PREDICT, 384)
         self.assertEqual(SPEECH_RETRY_NUM_PREDICT, 640)
 
@@ -1603,6 +1603,26 @@ class RoutingTests(unittest.TestCase):
         source = inspect.getsource(LiveConversationService.warm_speech_model)
         self.assertIn('"num_ctx": SPEECH_MODEL_CONTEXT', source)
         self.assertNotIn('"num_ctx": 512', source)
+
+    def test_lost_speech_runner_recovers_and_failed_retries_are_bounded(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.refresh_speech_model_acceleration = AsyncMock(return_value=False)
+            service.warm_speech_model = AsyncMock()
+            with patch("server.time.monotonic", return_value=100):
+                await service.maintain_speech_model()
+                await service.maintain_speech_model()
+            service.warm_speech_model.assert_awaited_once()
+            with patch("server.time.monotonic", return_value=161):
+                await service.maintain_speech_model()
+            self.assertEqual(service.warm_speech_model.await_count, 2)
+            service.refresh_speech_model_acceleration.return_value = True
+            with patch("server.time.monotonic", return_value=222):
+                await service.maintain_speech_model()
+            self.assertEqual(service.warm_speech_model.await_count, 2)
+            self.assertEqual(SPEECH_MODEL_KEEP_ALIVE, -1)
+        import asyncio
+        asyncio.run(run_test())
 
     def test_speech_supervisor_retries_instead_of_showing_a_token_limited_reply(self):
         async def run_test():
@@ -3086,6 +3106,10 @@ class ProductionHardeningTests(unittest.TestCase):
             try:
                 health_payload = await (await client.get("/health")).json()
                 self.assertTrue(health_payload["ok"])
+                service.speech_model_accelerated = False
+                degraded = await (await client.get("/health")).json()
+                self.assertFalse(degraded["ok"])
+                self.assertEqual(degraded["status"], "degraded")
                 serialized = json.dumps(health_payload)
                 self.assertNotIn("secret-session", serialized)
                 self.assertNotIn("/private/model/path", serialized)

@@ -59,7 +59,7 @@ SPEECH_MODEL_URL = "http://127.0.0.1:11439/api/chat"
 # Use a dedicated Ollama model identity so unrelated qwen3.5 requests with a
 # different context size cannot replace Live Conversation's warm runner.
 SPEECH_MODEL = "openclaw-live-conversation:4b"
-SPEECH_MODEL_KEEP_ALIVE = "30m"
+SPEECH_MODEL_KEEP_ALIVE = -1  # Dedicated interactive model must survive idle periods.
 SPEECH_MODEL_CONTEXT = 8_192
 SPEECH_NUM_PREDICT = 384
 SPEECH_RETRY_NUM_PREDICT = 640
@@ -864,6 +864,7 @@ Recent structured conversation events (newest last):
 Resolve “this agent,” “that agent,” “it,” and similar follow-ups to the newest relevant Live Conversation session above. Preserve the subject and intent established by recent user turns. Do not replace a specific referent with a generic list of all sessions.
 Use this catalog to answer capability questions quickly. If the user explicitly asks to use, configure, expand, or change a capability, choose `agent`. Do not claim an unavailable capability exists. Newly added agents and skills appear after the catalog refreshes.
 Interpret likely recognition mistakes using the conversation and session context. In this voice app, “five agent” or “five conversation model” means “live agent” or “live conversation model” unless John explicitly discusses the number five or five distinct agents; correct that known ASR error without asking and use the corrected word “live” in the acknowledgment. Do not silently replace any other uncertain proper noun; ask a short clarification instead.
+Resolve common homophones and misplaced ASR punctuation using the whole utterance before deciding its subject. For example, “tell me weather? autumn comes after summer” asks WHETHER the seasonal statement is true, not for a weather forecast. Answer the coherent complete question; do not invent an unrelated request from a homophone.
 When John asks to make the live agent or Live Conversation model more capable, that is a complete actionable request: choose `agent` so the agent can review the conversation and current implementation. Do not ask which capabilities he means unless he explicitly presents alternatives requiring a choice.
 Never fabricate private, project, or agent progress. Keep `reply` short and natural for speech. Complete every reply as a grammatical sentence; never end mid-sentence.
 Examples:
@@ -1771,6 +1772,7 @@ class LiveConversationService:
         self.last_turn_understanding: TurnUnderstanding | None = None
         self.speech_model_accelerated: bool | None = None
         self.speech_model_acceleration_checked_at = 0.0
+        self.speech_model_recovery_at = float("-inf")
         self.superseded_turn_ids: set[str] = set()
         self.recent_agent_sessions: deque[dict[str, Any]] = deque(maxlen=12)
         self.history_path = Path(history_path) if history_path else None
@@ -2706,10 +2708,24 @@ class LiveConversationService:
             try:
                 await asyncio.gather(
                     self.refresh_sessions(),
-                    self.refresh_speech_model_acceleration(force=True),
+                    self.maintain_speech_model(),
                 )
             except Exception as error:
                 LOGGER.warning("session_poll_failed error=%s", error)
+
+    async def maintain_speech_model(self) -> None:
+        """Recover a lost runner outside the latency-sensitive microphone path.
+
+        Merely polling /api/ps leaves an expired model permanently in fallback:
+        neither semantic endpointing nor the supervisor will request it again.
+        Bound retries when the model server is unavailable or VRAM is full.
+        """
+        accelerated = await self.refresh_speech_model_acceleration(force=True)
+        now = time.monotonic()
+        if accelerated is False and now - self.speech_model_recovery_at >= 60:
+            self.speech_model_recovery_at = now
+            LOGGER.warning("speech_model_recovery_attempt")
+            await self.warm_speech_model()
 
     async def stop(self) -> None:
         if self.capability_refresh_task and not self.capability_refresh_task.done():
@@ -3942,8 +3958,11 @@ async def health(request: web.Request) -> web.Response:
         else "unknown"
     )
     return web.json_response({
-        "ok": service.stt is not None,
-        "status": "healthy" if service.stt is not None else "starting",
+        "ok": service.stt is not None and service.speech_model_accelerated is True,
+        "status": (
+            "starting" if service.stt is None else
+            "healthy" if service.speech_model_accelerated is True else "degraded"
+        ),
         "uptime_seconds": round(time.time() - service.started_at),
         "speech_router": {
             "accelerated": service.speech_model_accelerated,
