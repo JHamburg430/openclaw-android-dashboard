@@ -48,7 +48,7 @@ DEFAULT_TTS_SPEAKER_ID = 9  # bm_george, a British male voice
 DEFAULT_TTS_BACKEND = "kokoro"
 DEFAULT_QWEN_TTS_URL = "http://127.0.0.1:8792/v1/audio/speech"
 DEFAULT_QWEN_TTS_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
-DEFAULT_QWEN_TTS_VOICE = "aiden"
+DEFAULT_QWEN_TTS_VOICE = "ryan"
 DEFAULT_QWEN_TTS_INSTRUCTIONS = (
     "Speak in a natural, relaxed conversational voice at a moderately brisk "
     "pace and normal indoor volume. Use ordinary sentence rhythm and neutral "

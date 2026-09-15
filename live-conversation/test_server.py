@@ -3027,7 +3027,7 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("natural, relaxed conversational voice", payload["instructions"])
         self.assertIn("normal indoor volume", payload["instructions"])
         self.assertIn("neutral emphasis", payload["instructions"])
-        self.assertEqual(payload["voice"], "aiden")
+        self.assertEqual(payload["voice"], "ryan")
 
     def test_qwen_keeps_normal_reply_in_one_prosody_request(self):
         async def run_test():
