@@ -411,3 +411,46 @@ and a prohibited action plus an informational question still gets an answer.
 Use `e2e_conversation_matrix.py --ordinary-only` for the focused subset. These
 small deterministic answer checks are regression guards, not a general measure
 of conversational understanding or a substitute for human evaluation.
+
+## Settings page (Dashboard 1.0.83)
+
+Open **Live Conversation → Settings** (or `/settings` on the private voice
+service). The searchable page exposes 89 validated service options across
+conversation instructions/model budgets, ASR, Smart Turn and microphone VAD,
+Kokoro/Qwen speech output, history, recording/debug retention, wake recognition,
+and runtime limits. Five additional on-phone settings control echo cancellation,
+noise suppression, automatic microphone gain, speaker gain, and Bluetooth
+preference in Dashboard 1.0.83 or newer.
+
+Settings use the existing owner-only settings JSON; old confirmation, recording,
+debug-status, and tracked-session data are preserved. Deployment CLI/environment
+values remain the initial defaults. **Save changes** validates and persists the
+whole patch atomically; stale revisions require reloading. **Reload saved**
+discards drafts, while **Restore defaults** only fills service defaults into the
+form until saved. Phone settings are stored separately on the device.
+
+Confirmation and recording changes apply immediately. Microphone timing applies
+on the next conversation. Fields marked for service restart remain pending until
+**Apply pending service settings** restarts only the voice service. Existing
+conversations disconnect; the Gateway is not restarted. Invalid model names or
+unavailable model assets may prevent initialization; keep the previous settings
+file for operational rollback. The settings API never accepts executable names,
+unit names, or credentials.
+
+Model endpoint URLs, executable/model/storage paths, bind addresses, GPU/service
+resource allocation, TLS ingress, credentials, Android Assistant permissions,
+and fixed PCM protocol formats remain deployment/OS managed and are identified
+as such on the page. They are not represented as editable controls that cannot
+actually take effect.
+
+Focused checks:
+
+```sh
+PYTHONPATH=live-conversation python -m unittest discover -s live-conversation -p 'test_settings*.py'
+node scripts/test-live-settings-ui.mjs
+```
+
+The Chromium suite supports `PLAYWRIGHT_MODULE`, `CHROME_BIN`, and
+`LIVE_SETTINGS_PYTHON` for non-workstation environments. It exercises the actual
+settings UI against the real schema/validator, with a simulated phone bridge;
+this is not physical-device audio acceptance.

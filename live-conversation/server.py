@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 import json
 import inspect
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -31,6 +32,8 @@ import numpy as np
 from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transcriptions.language import Language
 from semantic_turn import SemanticTurnDetector, TurnDecision
+from settings_config import SETTINGS_SCHEMA, GLOBAL_KEYS, defaults as settings_defaults, validate_settings
+import settings_api
 
 
 SAMPLE_RATE = 16_000
@@ -64,6 +67,15 @@ SPEECH_MODEL_URL = "http://127.0.0.1:11439/api/chat"
 # different context size cannot replace Live Conversation's warm runner.
 SPEECH_MODEL = "openclaw-live-conversation:4b"
 SPEECH_MODEL_KEEP_ALIVE = -1  # Dedicated interactive model must survive idle periods.
+CONVERSATION_INSTRUCTIONS = ''
+SPEECH_TEMPERATURE = 0.0
+SPEECH_TIMEOUT_SECONDS = 30.0
+SEMANTIC_TURN_THRESHOLD = 0.5
+SEMANTIC_CONFIDENCE_THRESHOLD = 0.7
+SEMANTIC_TIMEOUT_SECONDS = 4.0
+SEMANTIC_NUM_PREDICT = 32
+FRAGMENT_TIMEOUT_SECONDS = 8.0
+FRAGMENT_NUM_PREDICT = 160
 SPEECH_MODEL_CONTEXT = 8_192
 SPEECH_NUM_PREDICT = 384
 SPEECH_RETRY_NUM_PREDICT = 640
@@ -1642,8 +1654,8 @@ class PersistentTtsWorker:
             "--tokens", str(Path(self.model_dir) / "tokens.txt"),
             "--data-dir", str(Path(self.model_dir) / "espeak-ng-data"),
             "--voices", str(Path(self.model_dir) / "voices.bin"),
-            "--sid", str(DEFAULT_TTS_SPEAKER_ID),
-            "--threads", "8",
+            "--sid", str(getattr(self, 'speaker_id', DEFAULT_TTS_SPEAKER_ID)),
+            "--threads", str(getattr(self, "threads", 8)),
             "--speed", str(self.speed),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -1811,7 +1823,20 @@ class QwenVllmTtsClient:
         self.session = None
 
 
-def configured_tts_backend(speed: float) -> PersistentTtsWorker | QwenVllmTtsClient:
+def configured_tts_backend(speed: float, config: dict | None = None) -> PersistentTtsWorker | QwenVllmTtsClient:
+    if config is not None:
+        if config['tts_backend'] == 'qwen':
+            return QwenVllmTtsClient(
+                url=os.environ.get('QWEN_TTS_URL', DEFAULT_QWEN_TTS_URL),
+                model=config['qwen_tts_model'], voice=config['qwen_tts_voice'],
+                instructions=config['qwen_tts_instructions'],
+                initial_chunk_frames=config['qwen_tts_initial_chunk_frames'],
+                startup_wait_seconds=config['qwen_tts_startup_wait_seconds'],
+            )
+        worker = PersistentTtsWorker(DEFAULT_TTS_WORKER, DEFAULT_TTS_RUNTIME, DEFAULT_TTS_MODEL_DIR, speed)
+        worker.speaker_id = config['tts_speaker_id']
+        worker.threads = config['tts_threads']
+        return worker
     backend = os.environ.get("LIVE_CONVERSATION_TTS_BACKEND", DEFAULT_TTS_BACKEND).strip().lower()
     if backend == "qwen":
         return QwenVllmTtsClient(
@@ -1855,6 +1880,22 @@ class LiveConversationService:
         self.stt_description = "not loaded"
         self.semantic_turn: SemanticTurnDetector | None = None
         self.semantic_turn_description = "fallback"
+        self.configuration_defaults = settings_defaults()
+        self.configuration_defaults.update({
+            'tts_speed': tts_speed,
+            'tts_backend': os.environ.get('LIVE_CONVERSATION_TTS_BACKEND', DEFAULT_TTS_BACKEND),
+            'qwen_tts_model': os.environ.get('QWEN_TTS_MODEL', DEFAULT_QWEN_TTS_MODEL),
+            'qwen_tts_voice': os.environ.get('QWEN_TTS_VOICE', DEFAULT_QWEN_TTS_VOICE),
+            'qwen_tts_instructions': os.environ.get('QWEN_TTS_INSTRUCTIONS', DEFAULT_QWEN_TTS_INSTRUCTIONS),
+            'qwen_tts_initial_chunk_frames': int(os.environ.get('QWEN_TTS_INITIAL_CHUNK_FRAMES', DEFAULT_QWEN_INITIAL_CHUNK_FRAMES)),
+            'qwen_tts_startup_wait_seconds': float(os.environ.get('QWEN_TTS_STARTUP_WAIT_SECONDS', '0')),
+            'recording_retention_days': recording_retention_days,
+            'debug_retention_days': debug_retention_days,
+            'recording_max_bytes': recording_max_bytes,
+            'debug_max_bytes': debug_max_bytes,
+        })
+        self.configuration = dict(self.configuration_defaults)
+        self.settings_revision = 0
         self.tts = configured_tts_backend(tts_speed)
         self.tts_backend_description = type(self.tts).__name__
         self.speech_lock = asyncio.Lock()
@@ -1910,6 +1951,13 @@ class LiveConversationService:
                 except OSError as error:
                     LOGGER.warning("private_data_permissions_failed path=%s error=%s", private_file, error)
         self._load_settings()
+        self.active_configuration = dict(self.configuration)
+        self.tts = configured_tts_backend(self.configuration['tts_speed'], self.configuration)
+        self.tts_backend_description = type(self.tts).__name__
+        for key in ('recording_retention_days', 'debug_retention_days', 'recording_max_bytes', 'debug_max_bytes'):
+            setattr(self, key, self.configuration[key])
+        self.history = deque(maxlen=self.active_configuration['max_history_messages'])
+        self.events = deque(maxlen=self.active_configuration['max_conversation_events'])
         self._load_history()
         self.prune_private_data()
 
@@ -1919,6 +1967,9 @@ class LiveConversationService:
         interrupted_debug = False
         try:
             payload = json.loads(self.settings_path.read_text(encoding="utf-8"))
+            if 'configuration' in payload:
+                self.configuration = validate_settings(payload['configuration'], self.configuration_defaults)
+            self.settings_revision = int(payload.get('settings_revision', 0))
             self.confirmation_required = payload.get("action_confirmation") == "confirm"
             self.audio_capture_enabled = payload.get("audio_capture") is True
             debug_status = payload.get("debug_status")
@@ -1949,7 +2000,7 @@ class LiveConversationService:
         except (OSError, ValueError, TypeError) as error:
             LOGGER.warning("conversation_settings_load_failed error=%s", error)
 
-    def _save_settings(self) -> None:
+    def _save_settings(self, strict: bool = False) -> None:
         if not self.settings_path:
             return
         try:
@@ -1959,6 +2010,8 @@ class LiveConversationService:
                     "action_confirmation": (
                         "confirm" if self.confirmation_required else "automatic"
                     ),
+                    "configuration": self.configuration,
+                    "settings_revision": self.settings_revision,
                     "recent_agent_sessions": list(self.recent_agent_sessions),
                     "audio_capture": self.audio_capture_enabled,
                     "debug_status": self.debug_status,
@@ -1966,20 +2019,26 @@ class LiveConversationService:
             )
         except OSError as error:
             LOGGER.warning("conversation_settings_save_failed error=%s", error)
+            if strict:
+                raise
 
     def set_confirmation_required(self, required: bool) -> None:
         self.confirmation_required = required
+        self.settings_revision += 1
         if not required:
             self.pending_confirmation = None
         self._save_settings()
 
     def set_audio_capture_enabled(self, enabled: bool) -> None:
         self.audio_capture_enabled = enabled
+        self.settings_revision += 1
         self._save_settings()
 
     def settings_payload(self) -> dict[str, Any]:
         return {
             "type": "settings",
+            "browser": {key: value for key, value in self.configuration.items() if key.startswith('browser_')},
+            "history_limit": self.active_configuration['max_history_messages'],
             "action_confirmation": (
                 "confirm" if self.confirmation_required else "automatic"
             ),
@@ -2308,11 +2367,11 @@ class LiveConversationService:
                 self.session_key = saved_session_key
             events = payload.get("events", []) if isinstance(payload, dict) else []
             if isinstance(events, list):
-                for event in events[-MAX_CONVERSATION_EVENTS:]:
+                for event in events[-self.active_configuration['max_conversation_events']:]:
                     if isinstance(event, dict) and isinstance(event.get("type"), str):
                         self.events.append(dict(event))
             messages = payload.get("messages", []) if isinstance(payload, dict) else []
-            for message in messages[-MAX_HISTORY_MESSAGES:]:
+            for message in messages[-self.active_configuration['max_history_messages']:]:
                 role = message.get("role")
                 content = message.get("content")
                 if role in ("user", "assistant") and isinstance(content, str) and content.strip():
@@ -2661,24 +2720,24 @@ class LiveConversationService:
             self.stt = await asyncio.to_thread(
                 WhisperSTTService,
                 settings=WhisperSTTService.Settings(
-                    model="small.en", language=Language.EN, no_speech_prob=0.6
+                    model=self.active_configuration["asr_model"], language=Language.EN, no_speech_prob=self.active_configuration["asr_no_speech_prob"]
                 ),
-                device="cuda",
-                compute_type="float16",
+                device=self.active_configuration["asr_device"],
+                compute_type=self.active_configuration["asr_compute_type"],
             )
-            self.stt_description = "faster-whisper small.en cuda-float16"
+            self.stt_description = "faster-whisper {asr_model} {asr_device}-{asr_compute_type}".format(**self.active_configuration)
             await self.transcribe(bytes(SAMPLE_RATE), purpose="warmup")
         except Exception as error:
             LOGGER.warning("cuda_stt_unavailable_falling_back_to_cpu error=%s", error)
             self.stt = await asyncio.to_thread(
                 WhisperSTTService,
                 settings=WhisperSTTService.Settings(
-                    model="small.en", language=Language.EN, no_speech_prob=0.6
+                    model=self.active_configuration["asr_model"], language=Language.EN, no_speech_prob=self.active_configuration["asr_no_speech_prob"]
                 ),
                 device="cpu",
                 compute_type="int8",
             )
-            self.stt_description = "faster-whisper small.en cpu-int8 fallback"
+            self.stt_description = "faster-whisper {asr_model} cpu-int8 fallback".format(**self.active_configuration)
         try:
             await self.tts.start()
         except Exception as error:
@@ -2898,35 +2957,31 @@ class LiveConversationService:
             # conservative, but let the authoritative full-turn pass retain a
             # quiet final phrase instead of converting a complete request into
             # an unresolved fragment.
-            vad_threshold = 0.35 if purpose == "final" else (
-                0.5 if purpose == "wake" else 0.6
-            )
+            config = self.active_configuration
+            vad_threshold = config['asr_vad_' + ('final' if purpose == 'final' else 'wake' if purpose == 'wake' else 'partial') + '_threshold']
             segments, _ = self.stt._model.transcribe(
                 audio_float,
-                language="en",
-                beam_size=5,
-                best_of=5,
-                temperature=0.0,
+                language=config['asr_language'],
+                beam_size=config['asr_beam_size'],
+                best_of=config['asr_best_of'],
+                temperature=config['asr_temperature'],
                 condition_on_previous_text=False,
                 without_timestamps=True,
-                no_speech_threshold=0.6,
-                hotwords=(
-                    "John, Jarvis, OpenClaw, Live Conversation, live agent, "
-                    "subagent, gateway, sessions"
-                ),
+                no_speech_threshold=config['asr_no_speech_prob'],
+                hotwords=config['asr_hotwords'],
                 initial_prompt=initial_prompt or None,
-                vad_filter=True,
+                vad_filter=config['asr_vad_filter'],
                 vad_parameters={
                     "threshold": vad_threshold,
-                    "min_speech_duration_ms": 250,
-                    "min_silence_duration_ms": 300,
-                    "speech_pad_ms": 300 if purpose == "final" else 200,
+                    "min_speech_duration_ms": config["asr_min_speech_duration_ms"],
+                    "min_silence_duration_ms": config["asr_min_silence_duration_ms"],
+                    "speech_pad_ms": config["asr_speech_pad_final_ms" if purpose == "final" else "asr_speech_pad_partial_ms"],
                 },
             )
             text = "".join(
                 f"{segment.text} "
                 for segment in segments
-                if segment.no_speech_prob < 0.6
+                if segment.no_speech_prob < config["asr_no_speech_prob"]
             ).strip()
             LOGGER.info(
                 "speech_transcription_complete purpose=%s audio_seconds=%.2f chars=%d",
@@ -2964,7 +3019,7 @@ class LiveConversationService:
 
     async def endpoint_decision(self, audio: bytes, transcript: str = "") -> TurnDecision:
         if self.semantic_turn is not None:
-            acoustic = await asyncio.to_thread(self.semantic_turn.predict, audio)
+            acoustic = await asyncio.to_thread(self.semantic_turn.predict, audio, SEMANTIC_TURN_THRESHOLD)
             if not acoustic.complete or not transcript.strip():
                 return acoustic
             semantic = await self.semantic_endpoint_decision(transcript)
@@ -2975,7 +3030,7 @@ class LiveConversationService:
                 return TurnDecision(False, 0.0, f"{acoustic.source}+semantic-error")
             complete, confidence = semantic
             return TurnDecision(
-                complete and confidence >= 0.7,
+                complete and confidence >= SEMANTIC_CONFIDENCE_THRESHOLD,
                 min(acoustic.probability, confidence),
                 f"{acoustic.source}+semantic",
             )
@@ -3018,11 +3073,11 @@ class LiveConversationService:
             # Asking Ollama for 1024 here evicted the warm 8192-token runner,
             # forcing a multi-second model reload during natural pauses.
             "options": {
-                "temperature": 0, "num_predict": 32,
+                "temperature": 0, "num_predict": SEMANTIC_NUM_PREDICT,
                 "num_ctx": SPEECH_MODEL_CONTEXT,
             },
         }
-        timeout = aiohttp.ClientTimeout(total=4)
+        timeout = aiohttp.ClientTimeout(total=SEMANTIC_TIMEOUT_SECONDS)
         last_error: Exception | None = None
         for attempt in range(2):
             request_payload = payload
@@ -3339,7 +3394,7 @@ class LiveConversationService:
                     voice_sessions=self.voice_session_summary(),
                     event_context=self.event_context_summary(),
                     confirmation_required=self.confirmation_required,
-                )},
+                ) + ("\nAdditional conversation directions:\n" + CONVERSATION_INSTRUCTIONS if CONVERSATION_INSTRUCTIONS else "")},
                 *self.prompt_history(),
                 {"role": "system", "content": turn_understanding_prompt(
                     controller_text,
@@ -3351,12 +3406,12 @@ class LiveConversationService:
                 {"role": "user", "content": controller_text},
             ],
             "options": {
-                "temperature": 0,
+                "temperature": SPEECH_TEMPERATURE,
                 "num_predict": SPEECH_NUM_PREDICT,
                 "num_ctx": SPEECH_MODEL_CONTEXT,
             },
         }
-        timeout = aiohttp.ClientTimeout(total=30)
+        timeout = aiohttp.ClientTimeout(total=SPEECH_TIMEOUT_SECONDS)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 result: dict[str, Any] = {}
@@ -3621,11 +3676,11 @@ class LiveConversationService:
                 }, ensure_ascii=False)},
             ],
             "options": {
-                "temperature": 0, "num_predict": 160,
+                "temperature": 0, "num_predict": FRAGMENT_NUM_PREDICT,
                 "num_ctx": SPEECH_MODEL_CONTEXT,
             },
         }
-        timeout = aiohttp.ClientTimeout(total=8)
+        timeout = aiohttp.ClientTimeout(total=FRAGMENT_TIMEOUT_SECONDS)
         last_error: Exception | None = None
         for attempt in range(2):
             request_payload = payload
@@ -4103,11 +4158,12 @@ def render_page() -> str:
 <html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>Live Conversation</title><style>
 html,body{margin:0;min-height:100%;background:#060a10;color:#f4f8fc;font-family:system-ui,sans-serif}main{padding:18px 14px 28px;max-width:760px;margin:auto}h1{font-size:23px;margin:0 0 5px}.sub{color:#9aa9b8;margin:0 0 7px}.setting{color:#7fcbb4;font-size:12px;margin-bottom:16px}.state{font-size:18px;color:#54e0b4;margin:12px 0}.meter{height:14px;background:#101820;border:1px solid #304050;border-radius:8px;overflow:hidden}.meter div{height:100%;width:0;background:#00ab7e;transition:width 60ms}.buttons{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:14px 0}button{min-height:48px;border:1px solid #00ab7e;border-radius:8px;background:#1e2630;color:#fff;font-size:15px}button:disabled{opacity:.55}.debug-card{border:1px solid #31475a}.debug-line{display:flex;align-items:center;gap:8px;margin:5px 0 10px}.debug-icon{width:12px;height:12px;border-radius:50%;background:#708090;box-shadow:0 0 8px currentColor}.debug-icon.collecting,.debug-icon.working{background:#e0a84f;color:#e0a84f}.debug-icon.fixed{background:#54e0b4;color:#54e0b4}.debug-icon.release_available{background:#59a9ff;color:#59a9ff}.debug-icon.gateway_updated{background:#bf8cff;color:#bf8cff}.debug-icon.failed{background:#ff6b72;color:#ff6b72}.card{background:#0a0e14;border-radius:8px;padding:12px;margin-top:10px;min-height:48px}.label{color:#8797a8;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.metrics{font-size:12px;color:#aebdca;margin-top:12px}.route{display:inline-block;border:1px solid #36556a;border-radius:10px;padding:2px 7px;font-size:11px;margin-left:6px}.history{margin-top:18px}.history-list{display:flex;flex-direction:column;gap:8px;margin-top:8px}.history-empty{color:#718294;font-size:13px}.message{max-width:88%;padding:9px 11px;border-radius:12px;line-height:1.35;white-space:pre-wrap;overflow-wrap:anywhere}.message.user{align-self:flex-end;background:#0e5948}.message.assistant{align-self:flex-start;background:#182431}.message-role{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:#9db0bf;margin-bottom:3px}
-</style></head><body><main><h1>Live Conversation</h1><p class="sub">Accurate local speech recognition. Simple requests answer here; complex work routes to the right OpenClaw session.</p><div id="confirmation" class="setting">Action confirmation: loading…</div><div id="recording" class="setting">Test audio capture: loading…</div><p class="sub">Audio capture is off by default. When enabled, microphone turns and test metadata are saved locally on the OpenClaw host for regression testing.</p><div class="card debug-card"><div class="label">Conversation diagnostics</div><div class="debug-line"><span id="debugIcon" class="debug-icon idle" aria-hidden="true"></span><span id="debugStatus" role="status">No debug submission pending.</span></div><button id="sendDebug">Send for Debug</button></div><div id="state" class="state">Ready</div><div class="meter"><div id="bar"></div></div><div class="buttons"><button id="start">Start conversation</button><button id="stop">Stop</button><button id="newSession">New session</button></div><div class="card"><div class="label">You</div><div id="user">—</div></div><div class="card"><div class="label">Assistant <span id="route" class="route">waiting</span></div><div id="assistant">—</div></div><div id="metrics" class="metrics"></div><section class="history"><div class="label">Recent messages · newest first · last 120</div><div id="history" class="history-list"><div class="history-empty">No conversation history yet.</div></div></section></main><script>
-const state=document.getElementById('state'),bar=document.getElementById('bar'),user=document.getElementById('user'),assistant=document.getElementById('assistant'),route=document.getElementById('route'),metrics=document.getElementById('metrics'),confirmation=document.getElementById('confirmation'),recordingSetting=document.getElementById('recording'),debugIcon=document.getElementById('debugIcon'),debugStatus=document.getElementById('debugStatus'),sendDebug=document.getElementById('sendDebug'),historyList=document.getElementById('history');const AUDIO_FRAME_MS=20,START_CONFIRM_MS=300,BARGE_IN_CONFIRM_MS=300,ONSET_PREROLL_MS=2500,PREBUFFER_FRAMES=Math.ceil((START_CONFIRM_MS+ONSET_PREROLL_MS)/AUDIO_FRAME_MS),MAX_DRAIN_FRAMES=24,SEMANTIC_CHECK_MS=750,HARD_ENDPOINT_MS=3500;let ws,timer,recording=false,awaitingResponse=false,responseActive=false,responseTailTimer=null,speechMs=0,silenceMs=0,candidateSpeechMs=0,pre=[],historyMessages=[],pendingTranscript='',endpointPending=false,nextEndpointAt=SEMANTIC_CHECK_MS,confirmationMode='automatic',audioCapture=false,pendingMessages=[];const confirmationToggle=document.createElement('button');confirmationToggle.textContent='Toggle confirmation';confirmation.insertAdjacentElement('afterend',confirmationToggle);const recordingToggle=document.createElement('button');recordingToggle.textContent='Enable test audio capture';recordingSetting.insertAdjacentElement('afterend',recordingToggle);
+</style></head><body><main><h1>Live Conversation</h1><p><a href="/settings" style="color:#64dab7">Settings</a></p><p class="sub">Accurate local speech recognition. Simple requests answer here; complex work routes to the right OpenClaw session.</p><div id="confirmation" class="setting">Action confirmation: loading…</div><div id="recording" class="setting">Test audio capture: loading…</div><p class="sub">Audio capture is off by default. When enabled, microphone turns and test metadata are saved locally on the OpenClaw host for regression testing.</p><div class="card debug-card"><div class="label">Conversation diagnostics</div><div class="debug-line"><span id="debugIcon" class="debug-icon idle" aria-hidden="true"></span><span id="debugStatus" role="status">No debug submission pending.</span></div><button id="sendDebug">Send for Debug</button></div><div id="state" class="state">Ready</div><div class="meter"><div id="bar"></div></div><div class="buttons"><button id="start">Start conversation</button><button id="stop">Stop</button><button id="newSession">New session</button></div><div class="card"><div class="label">You</div><div id="user">—</div></div><div class="card"><div class="label">Assistant <span id="route" class="route">waiting</span></div><div id="assistant">—</div></div><div id="metrics" class="metrics"></div><section class="history"><div class="label">Recent messages · newest first</div><div id="history" class="history-list"><div class="history-empty">No conversation history yet.</div></div></section></main><script>
+const state=document.getElementById('state'),bar=document.getElementById('bar'),user=document.getElementById('user'),assistant=document.getElementById('assistant'),route=document.getElementById('route'),metrics=document.getElementById('metrics'),confirmation=document.getElementById('confirmation'),recordingSetting=document.getElementById('recording'),debugIcon=document.getElementById('debugIcon'),debugStatus=document.getElementById('debugStatus'),sendDebug=document.getElementById('sendDebug'),historyList=document.getElementById('history');const AUDIO_FRAME_MS=20;let START_CONFIRM_MS=300,BARGE_IN_CONFIRM_MS=300,ONSET_PREROLL_MS=2500,PREBUFFER_FRAMES=Math.ceil((START_CONFIRM_MS+ONSET_PREROLL_MS)/AUDIO_FRAME_MS),MAX_DRAIN_FRAMES=24,SEMANTIC_CHECK_MS=750,HARD_ENDPOINT_MS=3500;let browserSettings={},SPEECH_THRESHOLD=.006,BARGE_THRESHOLD=.025,MIN_SPEECH_MS=200,ENDPOINT_RETRY_MS=400,RESPONSE_TAIL_MS=1500,HISTORY_LIMIT=120;let ws,timer,recording=false,awaitingResponse=false,responseActive=false,responseTailTimer=null,speechMs=0,silenceMs=0,candidateSpeechMs=0,pre=[],historyMessages=[],pendingTranscript='',endpointPending=false,nextEndpointAt=SEMANTIC_CHECK_MS,confirmationMode='automatic',audioCapture=false,pendingMessages=[];const confirmationToggle=document.createElement('button');confirmationToggle.textContent='Toggle confirmation';confirmation.insertAdjacentElement('afterend',confirmationToggle);const recordingToggle=document.createElement('button');recordingToggle.textContent='Enable test audio capture';recordingSetting.insertAdjacentElement('afterend',recordingToggle);
 const deleteRecordings=document.createElement('button');deleteRecordings.textContent='Delete all recordings';deleteRecordings.ariaLabel='Delete all locally retained microphone recordings';recordingToggle.insertAdjacentElement('afterend',deleteRecordings);
-function renderHistory(){historyList.replaceChildren();if(!historyMessages.length){const empty=document.createElement('div');empty.className='history-empty';empty.textContent='No conversation history yet.';historyList.appendChild(empty);return}for(const message of historyMessages.slice(-120).reverse()){const bubble=document.createElement('div');bubble.className='message '+message.role;const who=document.createElement('div');who.className='message-role';who.textContent=message.role==='user'?'You':'Assistant';const content=document.createElement('div');content.textContent=message.content;bubble.append(who,content);historyList.appendChild(bubble)}}
-function addHistory(role,content){if(!content)return;historyMessages.push({role,content});historyMessages=historyMessages.slice(-120);renderHistory()}
+function applyBrowserSettings(m){browserSettings=m.browser||browserSettings;HISTORY_LIMIT=m.history_limit||HISTORY_LIMIT;if(recording||responseActive)return;const b=browserSettings;START_CONFIRM_MS=b.browser_start_confirm_ms??300;BARGE_IN_CONFIRM_MS=b.browser_barge_in_confirm_ms??300;ONSET_PREROLL_MS=b.browser_onset_preroll_ms??2500;PREBUFFER_FRAMES=Math.ceil((START_CONFIRM_MS+ONSET_PREROLL_MS)/AUDIO_FRAME_MS);MAX_DRAIN_FRAMES=b.browser_max_drain_frames??24;SEMANTIC_CHECK_MS=b.browser_semantic_check_ms??750;HARD_ENDPOINT_MS=b.browser_hard_endpoint_ms??3500;SPEECH_THRESHOLD=b.browser_speech_threshold??.006;BARGE_THRESHOLD=b.browser_barge_in_threshold??.025;MIN_SPEECH_MS=b.browser_min_speech_ms??200;ENDPOINT_RETRY_MS=b.browser_endpoint_retry_ms??400;RESPONSE_TAIL_MS=b.browser_response_tail_ms??1500;}
+function renderHistory(){historyList.replaceChildren();if(!historyMessages.length){const empty=document.createElement('div');empty.className='history-empty';empty.textContent='No conversation history yet.';historyList.appendChild(empty);return}for(const message of historyMessages.slice(-HISTORY_LIMIT).reverse()){const bubble=document.createElement('div');bubble.className='message '+message.role;const who=document.createElement('div');who.className='message-role';who.textContent=message.role==='user'?'You':'Assistant';const content=document.createElement('div');content.textContent=message.content;bubble.append(who,content);historyList.appendChild(bubble)}}
+function addHistory(role,content){if(!content)return;historyMessages.push({role,content});historyMessages=historyMessages.slice(-HISTORY_LIMIT);renderHistory()}
 function rms(b64){const s=atob(b64||'');let sum=0,n=0;for(let i=0;i+1<s.length;i+=2){let v=(s.charCodeAt(i)&255)|((s.charCodeAt(i+1)&255)<<8);if(v&32768)v-=65536;const f=v/32768;sum+=f*f;n++}return n?Math.sqrt(sum/n):0}
 function send(x){if(ws&&ws.readyState===1){ws.send(JSON.stringify(x));return true}return false}
 function sendWhenConnected(x){if(send(x))return;pendingMessages.push(x);start()}
@@ -4115,9 +4171,9 @@ function renderDebugStatus(value){const current=value&&value.state?value:{state:
 function report(event,detail){send({type:'client_event',event:event,detail:String(detail||'')})}
 function finishTurn(){if(!recording)return;recording=false;awaitingResponse=true;candidateSpeechMs=0;endpointPending=false;try{OpenClawNativeAudio.prepareAgentResponsePlayback()}catch(e){}send({type:'commit'});state.textContent='Transcribing…'}
 function begin(){if(recording)return;const interruptedWait=awaitingResponse;recording=true;awaitingResponse=false;candidateSpeechMs=0;speechMs=0;silenceMs=0;endpointPending=false;nextEndpointAt=SEMANTIC_CHECK_MS;if(responseActive){responseActive=false;if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}try{OpenClawNativeAudio.interruptAgentResponsePlayback()}catch(e){}report('barge_in','confirmed_user_speech')}send({type:'input_audio_buffer.speech_started'});send({type:'start'});for(const audioBase64 of pre)send({type:'audio',audioBase64});pre=[];report('speech_started',interruptedWait?'while_awaiting_response':'ready');state.textContent='Listening…'}
-function processChunk(chunk){const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>PREBUFFER_FRAMES)pre.shift();const speechThreshold=responseActive?.025:.006;const speechRequiredMs=responseActive?BARGE_IN_CONFIRM_MS:START_CONFIRM_MS;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+AUDIO_FRAME_MS:0;if(candidateSpeechMs>=speechRequiredMs)begin();return true}send({type:'audio',audioBase64:chunk});if(level>=.006){speechMs+=AUDIO_FRAME_MS;silenceMs=0;endpointPending=false;nextEndpointAt=SEMANTIC_CHECK_MS}else silenceMs+=AUDIO_FRAME_MS;if(speechMs>=200&&silenceMs>=HARD_ENDPOINT_MS){finishTurn();return false}if(speechMs>=200&&silenceMs>=nextEndpointAt&&!endpointPending){endpointPending=true;nextEndpointAt=silenceMs+400;send({type:'endpoint_candidate'});state.textContent='Listening for more…'}return true}
+function processChunk(chunk){const level=rms(chunk);bar.style.width=Math.min(100,Math.round(level*850))+'%';if(!recording){pre.push(chunk);while(pre.length>PREBUFFER_FRAMES)pre.shift();const speechThreshold=responseActive?BARGE_THRESHOLD:SPEECH_THRESHOLD;const speechRequiredMs=responseActive?BARGE_IN_CONFIRM_MS:START_CONFIRM_MS;candidateSpeechMs=level>=speechThreshold?candidateSpeechMs+AUDIO_FRAME_MS:0;if(candidateSpeechMs>=speechRequiredMs)begin();return true}send({type:'audio',audioBase64:chunk});if(level>=SPEECH_THRESHOLD){speechMs+=AUDIO_FRAME_MS;silenceMs=0;endpointPending=false;nextEndpointAt=SEMANTIC_CHECK_MS}else silenceMs+=AUDIO_FRAME_MS;if(speechMs>=MIN_SPEECH_MS&&silenceMs>=HARD_ENDPOINT_MS){finishTurn();return false}if(speechMs>=MIN_SPEECH_MS&&silenceMs>=nextEndpointAt&&!endpointPending){endpointPending=true;nextEndpointAt=silenceMs+ENDPOINT_RETRY_MS;send({type:'endpoint_candidate'});state.textContent='Listening for more…'}return true}
 function tick(){for(let drained=0;drained<MAX_DRAIN_FRAMES;drained++){let chunk='';try{chunk=OpenClawNativeAudio.readChunkBase64()||''}catch(e){state.textContent='Microphone error';return}if(!chunk)return;if(processChunk(chunk)===false)return}}
-function start(){if(ws&&(ws.readyState===0||ws.readyState===1))return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…';for(const message of pendingMessages.splice(0))send(message)};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-120):[];renderHistory()}if(m.type==='settings'){confirmation.textContent='Action confirmation: '+(m.action_confirmation==='confirm'?'On — asks before actions':'Off — replies before acting');audioCapture=m.audio_capture===true;recordingSetting.textContent='Test audio capture: '+(audioCapture?'On — saving microphone turns locally':'Off');recordingToggle.textContent=audioCapture?'Disable test audio capture':'Enable test audio capture';renderDebugStatus(m.debug_status)}if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.state==='listening'&&!recording){awaitingResponse=false;candidateSpeechMs=0}if((m.detail||'').startsWith('Ignored')||(m.detail||'').startsWith('Silent stop'))pendingTranscript=''}if(m.type==='action_status'&&m.state==='acknowledged')state.textContent='Working…';if(m.type==='partial_transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript='';addHistory('user',m.text)}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
+function start(){if(ws&&(ws.readyState===0||ws.readyState===1))return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');let audioChunks=0,audioChars=0;ws.onopen=()=>{OpenClawNativeAudio.startCapture(16000,20);timer=setInterval(tick,20);state.textContent='Listening…';for(const message of pendingMessages.splice(0))send(message)};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='history'){historyMessages=Array.isArray(m.messages)?m.messages.slice(-HISTORY_LIMIT):[];renderHistory()}if(m.type==='settings'){applyBrowserSettings(m);confirmation.textContent='Action confirmation: '+(m.action_confirmation==='confirm'?'On — asks before actions':'Off — replies before acting');audioCapture=m.audio_capture===true;recordingSetting.textContent='Test audio capture: '+(audioCapture?'On — saving microphone turns locally':'Off');recordingToggle.textContent=audioCapture?'Disable test audio capture':'Enable test audio capture';renderDebugStatus(m.debug_status)}if(m.type==='state'){state.textContent=m.state[0].toUpperCase()+m.state.slice(1)+'…';if(m.state==='listening'&&!recording){awaitingResponse=false;candidateSpeechMs=0}if((m.detail||'').startsWith('Ignored')||(m.detail||'').startsWith('Silent stop'))pendingTranscript=''}if(m.type==='action_status'&&m.state==='acknowledged')state.textContent='Working…';if(m.type==='partial_transcript'){user.textContent=m.text;pendingTranscript=m.text}if(m.type==='transcript'){user.textContent=m.text;pendingTranscript='';addHistory('user',m.text)}if(m.type==='reply'){assistant.textContent=m.text;route.textContent=m.route;addHistory('assistant',m.text);report('reply',{route:m.route})}if(m.type==='output_audio_buffer.started'){if(responseTailTimer){clearTimeout(responseTailTimer);responseTailTimer=null}awaitingResponse=false;responseActive=true;audioChunks=0;audioChars=0;try{OpenClawNativeAudio.prepareAgentResponsePlayback();report('playback_prepared',m.responseId)}catch(err){report('playback_prepare_error',err)}}if(m.type==='response.output_audio.delta'){audioChunks++;audioChars+=(m.audioBase64||'').length;try{OpenClawNativeAudio.playAgentResponsePcm16Base64(m.audioBase64,m.sampleRate);if(audioChunks===1)report('first_pcm_enqueued','rate='+m.sampleRate+' chars='+(m.audioBase64||'').length)}catch(err){report('pcm_enqueue_error',err)}}if(m.type==='response.output_audio.done'){if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},RESPONSE_TAIL_MS);report('pcm_delivery_done','chunks='+audioChunks+' chars='+audioChars)}if(m.type==='metrics')metrics.textContent=`ASR ${m.asr_ms} ms · Agent ${m.response_ms} ms · TTS ${m.tts_ms} ms · Ready ${m.total_ms} ms`;if(m.type==='error'){awaitingResponse=false;responseActive=false;pendingTranscript='';state.textContent='Error';assistant.textContent=m.message;report('server_error',m.message)}};ws.onerror=()=>state.textContent='Connection error';ws.onclose=()=>state.textContent='Stopped'}
 let realtimeListenerSocket=null;
 function installRealtimeListeners(){if(!ws||realtimeListenerSocket===ws)return;realtimeListenerSocket=ws;ws.addEventListener('message',event=>{const m=JSON.parse(event.data);if(m.type==='settings'){confirmationMode=m.action_confirmation;confirmationToggle.textContent=confirmationMode==='confirm'?'Turn confirmation off':'Turn confirmation on'}if(m.type==='endpoint_decision'){endpointPending=false;report('semantic_endpoint',m.source+':'+m.probability);if(recording&&m.complete)finishTurn()}if(m.type==='backchannel'){assistant.textContent=m.text;route.textContent='listening'}});setTimeout(()=>{try{report('voice_processing',OpenClawNativeAudio.getVoiceProcessingStatus())}catch(e){report('voice_processing','unavailable')}},250)}
 const originalStart=start;start=function(){originalStart();installRealtimeListeners()};confirmationToggle.onclick=()=>sendWhenConnected({type:'set_confirmation',required:confirmationMode!=='confirm'});recordingToggle.onclick=()=>sendWhenConnected({type:'set_audio_capture',enabled:!audioCapture});sendDebug.onclick=()=>sendWhenConnected({type:'send_for_debug'});renderDebugStatus({state:'idle'});
@@ -4189,7 +4245,7 @@ async def metrics(request: web.Request) -> web.Response:
 async def security_headers(request: web.Request, handler: Callable[..., Awaitable[web.StreamResponse]]) -> web.StreamResponse:
     response = await handler(request)
     response.headers.update({
-        "Content-Security-Policy": "default-src 'self'; connect-src 'self'; style-src 'unsafe-inline'",
+        "Content-Security-Policy": "default-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; script-src 'self' 'sha256-" + base64.b64encode(hashlib.sha256(render_page().split('<script>', 1)[1].split('</script>', 1)[0].encode()).digest()).decode() + "'",
         "Referrer-Policy": "no-referrer",
         "X-Content-Type-Options": "nosniff",
         "X-Frame-Options": "DENY",
@@ -4250,8 +4306,8 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
     await socket.prepare(request)
     sockets.add(socket)
     _increment_metric(service, "websocket_connections_total")
-    await socket.send_json({"type": "history", "messages": service.recent_history()})
     await socket.send_json(service.settings_payload())
+    await socket.send_json({"type": "history", "messages": service.recent_history()})
     while service.pending_spoken_replies:
         reply = service.pending_spoken_replies.popleft()
         await service.send_spoken_response(
@@ -4747,11 +4803,17 @@ async def build_app(args: argparse.Namespace) -> web.Application:
         getattr(args, "recording_max_bytes", DEFAULT_RECORDING_MAX_BYTES),
         getattr(args, "debug_max_bytes", DEFAULT_DEBUG_MAX_BYTES),
     )
+    for key in GLOBAL_KEYS:
+        globals()[key.upper()] = service.active_configuration[key]
+    globals()['WAKE_WORD_ALIASES'] = frozenset(word.strip().lower() for word in service.active_configuration['wake_aliases'].split(',')) | {WAKE_WORD.lower()}
+    service.history = deque(service.history, maxlen=MAX_HISTORY_MESSAGES)
+    service.events = deque(service.events, maxlen=MAX_CONVERSATION_EVENTS)
     await service.start()
     app = web.Application(client_max_size=MAX_HTTP_BODY_BYTES, middlewares=[security_headers])
     app["service"] = service
     app["live_sockets"] = set()
     app["wake_sockets"] = set()
+    settings_api.install(app, _origin_matches_request)
     app.router.add_get("/", index)
     app.router.add_get("/health", health)
     app.router.add_get("/metrics", metrics)

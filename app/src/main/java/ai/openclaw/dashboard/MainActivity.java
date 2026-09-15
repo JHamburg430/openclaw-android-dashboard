@@ -2393,6 +2393,68 @@ public final class MainActivity extends Activity {
             return true;
         }
 
+        private static final String LIVE_AUDIO_PREF_PREFIX = "live_audio.";
+
+        @JavascriptInterface
+        public String getLiveConversationAudioSettings() {
+            try {
+                return new JSONObject()
+                        .put("aec", prefs.getBoolean(LIVE_AUDIO_PREF_PREFIX + "aec", true))
+                        .put("noise_suppression", prefs.getBoolean(LIVE_AUDIO_PREF_PREFIX + "noise_suppression", true))
+                        .put("automatic_gain", prefs.getBoolean(LIVE_AUDIO_PREF_PREFIX + "automatic_gain", true))
+                        .put("output_gain", (double) prefs.getFloat(LIVE_AUDIO_PREF_PREFIX + "output_gain", (float) OUTPUT_GAIN))
+                        .put("prefer_bluetooth", prefs.getBoolean(LIVE_AUDIO_PREF_PREFIX + "prefer_bluetooth", true))
+                        .put("applies", "next_capture_or_playback")
+                        .put("read_only", new JSONObject()
+                                .put("input_sample_rate_hz", NATIVE_SAMPLE_RATE)
+                                .put("output_sample_rate_hz", OUTPUT_SAMPLE_RATE)
+                                .put("input_source", "VOICE_COMMUNICATION")
+                                .put("aec_available", AcousticEchoCanceler.isAvailable())
+                                .put("noise_suppression_available", NoiseSuppressor.isAvailable())
+                                .put("automatic_gain_available", AutomaticGainControl.isAvailable())
+                                .put("audio_route", "Android-managed; Bluetooth preference when available"))
+                        .toString();
+            } catch (Exception error) {
+                return "{\"error\":\"Audio settings are unavailable\"}";
+            }
+        }
+
+        @JavascriptInterface
+        public String configureLiveConversationAudioSettings(String json) {
+            try {
+                if (json == null || json.length() > 4096) throw new IllegalArgumentException();
+                JSONObject update = new JSONObject(json);
+                SharedPreferences.Editor edit = prefs.edit();
+                java.util.Iterator<String> keys = update.keys();
+                while (keys.hasNext()) {
+                    String key = keys.next();
+                    Object value = update.get(key);
+                    switch (key) {
+                        case "aec":
+                        case "noise_suppression":
+                        case "automatic_gain":
+                        case "prefer_bluetooth":
+                            if (!(value instanceof Boolean)) throw new IllegalArgumentException();
+                            edit.putBoolean(LIVE_AUDIO_PREF_PREFIX + key, (Boolean) value);
+                            break;
+                        case "output_gain":
+                            if (!(value instanceof Number)) throw new IllegalArgumentException();
+                            double gain = ((Number) value).doubleValue();
+                            if (!Double.isFinite(gain) || gain < 0 || gain > 2) throw new IllegalArgumentException();
+                            edit.putFloat(LIVE_AUDIO_PREF_PREFIX + key, (float) gain);
+                            break;
+                        default:
+                            throw new IllegalArgumentException();
+                    }
+                }
+                // Commit only after the complete update has passed validation.
+                if (!edit.commit()) return "{\"error\":\"Audio settings could not be saved\"}";
+                return getLiveConversationAudioSettings();
+            } catch (Exception error) {
+                return "{\"error\":\"Invalid audio settings: use booleans and output gain from 0 to 2\"}";
+            }
+        }
+
         @JavascriptInterface
         @android.annotation.SuppressLint("MissingPermission")
         public void startCapture(int sampleRateHz, int frameMs) {
@@ -2553,12 +2615,13 @@ public final class MainActivity extends Activity {
             if (pcm.length == 0) return;
             lastPcmOutputRequestedAtMs = System.currentTimeMillis();
             stopFallbackTtsPlayback("pcm_output_requested");
-            int clippedSamples = applyPcm16Gain(pcm, OUTPUT_GAIN);
+            double outputGain = prefs.getFloat(LIVE_AUDIO_PREF_PREFIX + "output_gain", (float) OUTPUT_GAIN);
+            int clippedSamples = applyPcm16Gain(pcm, outputGain);
             recordDiagnostic("native_audio_output.enqueue",
                     "reason=" + routeReason
                             + " sampleRate=" + outputSampleRate
                             + " bytes=" + pcm.length
-                            + " gain=" + OUTPUT_GAIN
+                            + " gain=" + outputGain
                             + " clipped=" + clippedSamples);
             synchronized (outputLock) {
                 outputQueue.addLast(pcm);
@@ -2845,7 +2908,7 @@ public final class MainActivity extends Activity {
         }
 
         private int applyPcm16Gain(byte[] pcm, double gain) {
-            if (gain <= 0.0 || gain == 1.0) return 0;
+            if (gain < 0.0 || gain == 1.0) return 0;
             int clipped = 0;
             for (int i = 0; i + 1 < pcm.length; i += 2) {
                 int sample = (pcm[i] & 0xff) | (pcm[i + 1] << 8);
@@ -2936,6 +2999,11 @@ public final class MainActivity extends Activity {
         }
 
         private AudioDeviceInfo preferBluetoothAudioRoute(boolean needsInput, String reason) {
+            if (!prefs.getBoolean(LIVE_AUDIO_PREF_PREFIX + "prefer_bluetooth", true)) {
+                AudioManager manager = getAudioManager();
+                if (manager != null) prepareSpeakerPlaybackRoute(manager, reason);
+                return null;
+            }
             if (!hasBluetoothConnectPermission()) {
                 requestBluetoothConnectPermission();
                 recordDiagnostic("native_audio_route.bluetooth", "permission_missing reason=" + reason);
@@ -3056,6 +3124,7 @@ public final class MainActivity extends Activity {
         }
 
         private AcousticEchoCanceler enableAcousticEchoCanceler(int audioSessionId) {
+            if (!prefs.getBoolean(LIVE_AUDIO_PREF_PREFIX + "aec", true)) return null;
             if (!AcousticEchoCanceler.isAvailable()) {
                 recordDiagnostic("native_audio_bridge.effect", "aec=unavailable");
                 return null;
@@ -3071,6 +3140,7 @@ public final class MainActivity extends Activity {
         }
 
         private NoiseSuppressor enableNoiseSuppressor(int audioSessionId) {
+            if (!prefs.getBoolean(LIVE_AUDIO_PREF_PREFIX + "noise_suppression", true)) return null;
             if (!NoiseSuppressor.isAvailable()) {
                 recordDiagnostic("native_audio_bridge.effect", "ns=unavailable");
                 return null;
@@ -3086,6 +3156,7 @@ public final class MainActivity extends Activity {
         }
 
         private AutomaticGainControl enableAutomaticGainControl(int audioSessionId) {
+            if (!prefs.getBoolean(LIVE_AUDIO_PREF_PREFIX + "automatic_gain", true)) return null;
             if (!AutomaticGainControl.isAvailable()) {
                 recordDiagnostic("native_audio_bridge.effect", "agc=unavailable");
                 return null;

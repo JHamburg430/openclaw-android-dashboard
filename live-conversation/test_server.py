@@ -1544,11 +1544,11 @@ class RoutingTests(unittest.TestCase):
 
     def test_page_displays_and_updates_the_rolling_history(self):
         page = render_page()
-        self.assertIn("Recent messages · newest first · last 120", page)
+        self.assertIn("Recent messages · newest first", page)
         self.assertIn('<button id="newSession">New session</button>', page)
         self.assertIn("pendingMessages.push({type:'new_session'})", page)
         self.assertIn("m.type==='history'", page)
-        self.assertIn("historyMessages.slice(-120).reverse()", page)
+        self.assertIn("historyMessages.slice(-HISTORY_LIMIT).reverse()", page)
         self.assertIn("addHistory('user',m.text)", page)
         self.assertIn("addHistory('assistant',m.text)", page)
         self.assertIn("get('autostart')==='1'", page)
@@ -2313,11 +2313,11 @@ class RoutingTests(unittest.TestCase):
     def test_start_uses_the_more_accurate_cached_whisper_model(self):
         import inspect
         source = inspect.getsource(LiveConversationService.start)
-        self.assertIn('model="small.en"', source)
-        self.assertIn('device="cuda"', source)
-        self.assertIn('compute_type="float16"', source)
+        from settings_config import defaults
+        config = defaults()
+        self.assertEqual((config['asr_model'], config['asr_device'], config['asr_compute_type']), ('small.en', 'cuda', 'float16'))
+        self.assertIn('model=self.active_configuration["asr_model"]', source)
         self.assertIn("falling_back_to_cpu", source)
-        self.assertNotIn('model="tiny.en"', source)
 
     def test_lazy_whisper_segments_are_consumed_off_the_event_loop(self):
         async def run_test():
@@ -2350,16 +2350,14 @@ class RoutingTests(unittest.TestCase):
     def test_transcription_uses_silero_noise_filtering(self):
         import inspect
         source = inspect.getsource(LiveConversationService.transcribe)
-        self.assertIn("vad_filter=True", source)
-        self.assertIn('vad_threshold = 0.35 if purpose == "final"', source)
-        self.assertIn('0.5 if purpose == "wake" else 0.6', source)
+        from settings_config import defaults
+        config = defaults()
+        self.assertTrue(config['asr_vad_filter'])
+        self.assertEqual([config['asr_vad_'+purpose+'_threshold'] for purpose in ('final','wake','partial')], [.35,.5,.6])
+        self.assertIn("vad_filter=config['asr_vad_filter']", source)
         self.assertIn('"threshold": vad_threshold', source)
-        self.assertIn('"speech_pad_ms": 300 if purpose == "final" else 200', source)
-        self.assertIn('"min_speech_duration_ms": 250', source)
-        self.assertIn("beam_size=5", source)
-        self.assertIn("best_of=5", source)
-        self.assertIn("hotwords=", source)
-        self.assertIn("OpenClaw, Live Conversation, live agent", source)
+        self.assertEqual(config['asr_beam_size'], 5)
+        self.assertIn("hotwords=config['asr_hotwords']", source)
 
     def test_agent_turn_intercepts_sentinel_without_speaking_it(self):
         async def run_test():
@@ -2998,7 +2996,7 @@ class RoutingTests(unittest.TestCase):
 
     def test_playback_vad_rejects_echo_and_covers_native_tail(self):
         page = render_page()
-        self.assertIn("const speechThreshold=responseActive?.025:.006", page)
+        self.assertIn("const speechThreshold=responseActive?BARGE_THRESHOLD:SPEECH_THRESHOLD", page)
         self.assertIn("START_CONFIRM_MS=300,BARGE_IN_CONFIRM_MS=300", page)
         self.assertIn(
             "const speechRequiredMs=responseActive?BARGE_IN_CONFIRM_MS:START_CONFIRM_MS",
@@ -3008,7 +3006,7 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("HARD_ENDPOINT_MS=3500", page)
         self.assertIn("send({type:'endpoint_candidate'})", page)
         self.assertIn("m.type==='endpoint_decision'", page)
-        self.assertIn("responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},1500)", page)
+        self.assertIn("responseTailTimer=setTimeout(()=>{responseActive=false;responseTailTimer=null},RESPONSE_TAIL_MS)", page)
         self.assertIn("report('barge_in','confirmed_user_speech')", page)
         self.assertIn("}send({type:'input_audio_buffer.speech_started'});send({type:'start'})", page)
 

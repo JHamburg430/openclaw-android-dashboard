@@ -54,9 +54,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu -r live-conversation/requirements-ci.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install settings browser test dependency
+        run: npm install --prefix /tmp/live-settings-browser --no-save playwright-core@1.62.1
       - name: Python and browser regression suites
         env:
           PYTHONPATH: live-conversation
+          PLAYWRIGHT_MODULE: /tmp/live-settings-browser/node_modules/playwright-core
+          LIVE_SETTINGS_PYTHON: python
+          CHROME_BIN: /usr/bin/google-chrome
         run: |
           python -m compileall -q live-conversation
           python -m unittest discover -s live-conversation -p 'test_*.py'
