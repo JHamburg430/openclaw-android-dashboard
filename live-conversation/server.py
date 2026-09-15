@@ -491,7 +491,8 @@ def is_generic_conversation_nonanswer(text: str) -> bool:
     normalized = re.sub(r"\s+", " ", text).strip()
     return bool(re.fullmatch(
         r"(?:I hear you[.!]?\s*Go ahead(?: with the test)?[.!]?|"
-        r"(?:Understood[.!]?\s*)?I (?:won't|will not) [^.!?]+[.!]?)",
+        r"(?:Understood[.!]?\s*)?I (?:won't|will not) [^.!?]+[.!]?"
+        r"(?:\s*I can (?:explain|describe|tell) [^.!?]+[.!]?)?)",
         normalized, re.IGNORECASE,
     ))
 

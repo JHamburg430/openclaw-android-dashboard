@@ -253,6 +253,9 @@ class RoutingTests(unittest.TestCase):
                 ("I regret my lunch choice.", "I hear you. Go ahead with the test.",
                  "What was wrong with your lunch?"),
                 ("Don't set an alarm. Explain how alarms work.",
+                 "I won't set an alarm. I can explain how alarms work.",
+                 "An alarm sounds when its scheduled time arrives."),
+                ("Don't set an alarm. Explain how alarms work.",
                  "Understood. I won't set an alarm.",
                  "An alarm sounds when its scheduled time arrives."),
             ):
