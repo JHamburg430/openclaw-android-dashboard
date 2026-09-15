@@ -14,8 +14,16 @@ assert.ok(source.includes("new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS
 assert.ok(source.includes("abandonAudioFocusRequest(speechAudioFocusRequest)"));
 assert.equal(method.includes("buildLiveConversationHtml()"), false);
 assert.ok(source.includes("public void prepareAgentResponsePlayback()"));
-assert.ok(source.includes('prepareSpeakerPlaybackRoute(audioManager, "response_prepare")'));
 assert.ok(source.includes('startPcmOutputThreadLocked(OUTPUT_SAMPLE_RATE, "response_prepare")'));
+assert.ok(source.includes("private static final double OUTPUT_GAIN = 1.0"));
+assert.ok(source.includes("createAssistantAudioTrack(sampleRateHz, bufferSize)"));
+assert.ok(source.includes("AudioAttributes.USAGE_MEDIA"));
+assert.ok(source.includes("findPreferredPlaybackDevice(audioManager)"));
+const prepareStart = source.indexOf("public void prepareAgentResponsePlayback()");
+const prepareEnd = source.indexOf("public void interruptAgentResponsePlayback()", prepareStart);
+const prepareMethod = source.slice(prepareStart, prepareEnd);
+assert.equal(prepareMethod.includes("prepareSpeakerPlaybackRoute"), false);
+assert.equal(prepareMethod.includes("preferBluetoothAudioRoute"), false);
 assert.equal(source.includes('"openclaw-native-output-prepare"'), false);
 assert.ok(source.includes("public void interruptAgentResponsePlayback()"));
 assert.ok(source.includes('recordDiagnostic("native_audio_output.cleared", "speech_started")'));

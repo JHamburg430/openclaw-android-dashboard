@@ -29,6 +29,8 @@ from server import (
     DEFAULT_TTS_MODEL_DIR,
     DEFAULT_TTS_SPEAKER_ID,
     DEFAULT_QWEN_INITIAL_CHUNK_FRAMES,
+    DEFAULT_QWEN_FIRST_UTTERANCE_CHARS,
+    DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS,
     DEGRADED_SPEECH_CONTEXT,
     DEGRADED_SPEECH_MODEL,
     LiveConversationService,
@@ -69,6 +71,7 @@ from server import (
     requires_authoritative_lookup,
     render_page,
     split_spoken_text,
+    split_qwen_utterances,
     speech_model_prompt,
     summarize_gateway_status,
     summarize_tracked_agent,
@@ -1385,6 +1388,59 @@ class RoutingTests(unittest.TestCase):
         self.assertRegex(first, r"^agent:main:live-conversation-inspect-speech-[a-f0-9]{12}$")
         self.assertNotRegex(first, r"\d{10,}")
 
+    def test_new_conversation_session_archives_context_and_rotates_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history_path = Path(directory) / "history.json"
+            service = LiveConversationService(
+                "agent:main:live-conversation", 1.15,
+                history_path=str(history_path),
+            )
+            service.remember("user", "old context")
+            service.pending_fragment = "unfinished thought"
+            old_key = service.session_key
+
+            new_key = service.begin_new_conversation_session()
+
+            self.assertNotEqual(new_key, old_key)
+            self.assertRegex(
+                new_key,
+                r"^agent:main:live-conversation-conversation-[a-f0-9]{12}$",
+            )
+            self.assertEqual(service.recent_history(), [])
+            self.assertEqual(service.pending_fragment, "")
+            archives = list((Path(directory) / "history-archive").glob("*.json"))
+            self.assertEqual(len(archives), 1)
+            archived = json.loads(archives[0].read_text(encoding="utf-8"))
+            self.assertEqual(archived["session_key"], old_key)
+            self.assertEqual(archived["messages"][-1]["content"], "old context")
+            restarted = LiveConversationService(
+                "agent:main:live-conversation", 1.15,
+                history_path=str(history_path),
+            )
+            self.assertEqual(restarted.session_key, new_key)
+
+    def test_project_session_is_created_in_dashboard_project(self):
+        service = LiveConversationService("agent:main:live-conversation", 1.15)
+        service.openclaw_json = AsyncMock(return_value={"ok": True})
+
+        async def run_test():
+            await service.create_project_session(
+                "agent:main:live-conversation-inspect-abcdef123456",
+                "Inspect the voice UI",
+            )
+
+        import asyncio
+        asyncio.run(run_test())
+
+        create_call = service.openclaw_json.await_args_list[0].args
+        self.assertEqual(create_call[:3], ("gateway", "call", "sessions.create"))
+        params = json.loads(create_call[-1])
+        self.assertEqual(params["projectId"], "openclaw-android-dashboard")
+        self.assertEqual(
+            params["key"],
+            "agent:main:live-conversation-inspect-abcdef123456",
+        )
+
     def test_legacy_voice_session_is_recovered_from_history_and_gateway(self):
         service = LiveConversationService("agent:main:live-conversation", 1.15)
         service.remember("user", "Spawn a subagent to fix message cutoff.")
@@ -1406,6 +1462,8 @@ class RoutingTests(unittest.TestCase):
     def test_page_displays_and_updates_the_rolling_history(self):
         page = render_page()
         self.assertIn("Recent messages · newest first · last 120", page)
+        self.assertIn('<button id="newSession">New session</button>', page)
+        self.assertIn("pendingMessages.push({type:'new_session'})", page)
         self.assertIn("m.type==='history'", page)
         self.assertIn("historyMessages.slice(-120).reverse()", page)
         self.assertIn("addHistory('user',m.text)", page)
@@ -2568,6 +2626,7 @@ class RoutingTests(unittest.TestCase):
                     self.speech_generation = 0
                     self.called = asyncio.Event()
                     self.registered = []
+                    self.project_sessions = []
 
                 def recent_history(self):
                     return [{"role": "user", "content": "The previous turn failed."}]
@@ -2594,6 +2653,9 @@ class RoutingTests(unittest.TestCase):
 
                 def register_agent_session(self, session_key, request, origin_turn_id):
                     self.registered.append((session_key, request, origin_turn_id))
+
+                async def create_project_session(self, session_key, task):
+                    self.project_sessions.append((session_key, task))
 
                 async def agent_reply(self, prompt, session_key):
                     self.prompt = prompt
@@ -2633,6 +2695,7 @@ class RoutingTests(unittest.TestCase):
 
             await asyncio.wait_for(service.called.wait(), timeout=1)
             self.assertEqual(len(service.registered), 1)
+            self.assertEqual(len(service.project_sessions), 1)
             self.assertIn("dedicated Live Conversation correction agent", service.prompt)
             self.assertIn("/tmp/debug-test.json", service.prompt)
             states = [item.get("debug_status", {}).get("state") for item in messages]
@@ -2827,6 +2890,29 @@ class RoutingTests(unittest.TestCase):
         self.assertTrue(all(len(part) <= 90 for part in parts))
         self.assertEqual(" ".join(parts), text)
 
+    def test_qwen_dynamic_window_keeps_normal_explanation_continuous(self):
+        text = (
+            "This is a normal explanation with two complete sentences. "
+            "The second sentence should share the first sentence's prosody."
+        )
+        self.assertEqual(split_qwen_utterances(text), [text])
+
+    def test_qwen_dynamic_window_uses_larger_followup_units(self):
+        sentence = "A complete sentence carries natural rhythm and emphasis. "
+        text = sentence * 14
+        parts = split_qwen_utterances(text.strip())
+        self.assertGreater(len(parts), 1)
+        self.assertLessEqual(len(parts[0]), DEFAULT_QWEN_FIRST_UTTERANCE_CHARS)
+        self.assertTrue(all(
+            len(part) <= DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS
+            for part in parts[1:]
+        ))
+        self.assertEqual(" ".join(parts), text.strip())
+
+    def test_qwen_dynamic_window_does_not_split_short_quoted_question(self):
+        text = 'She asked, "Why does this phrase sound unusual?" Then she waited.'
+        self.assertEqual(split_qwen_utterances(text), [text])
+
     def test_playback_vad_rejects_echo_and_covers_native_tail(self):
         page = render_page()
         self.assertIn("const speechThreshold=responseActive?.025:.006", page)
@@ -2921,7 +3007,9 @@ class RoutingTests(unittest.TestCase):
                 self.assertEqual(await anext(stream), b"p" * 4800)
                 await stream.aclose()
             self.assertEqual(len(requests), 1)
-            self.assertLessEqual(len(requests[0]), 50)
+            self.assertLessEqual(
+                len(requests[0]), DEFAULT_QWEN_FIRST_UTTERANCE_CHARS
+            )
             self.assertEqual(closed, [True])
 
         import asyncio
@@ -2936,7 +3024,50 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(
             payload["initial_codec_chunk_frames"], DEFAULT_QWEN_INITIAL_CHUNK_FRAMES
         )
+        self.assertIn("natural, relaxed conversational voice", payload["instructions"])
+        self.assertIn("normal indoor volume", payload["instructions"])
+        self.assertIn("neutral emphasis", payload["instructions"])
         self.assertEqual(payload["voice"], "aiden")
+
+    def test_qwen_keeps_normal_reply_in_one_prosody_request(self):
+        async def run_test():
+            requests = []
+
+            class Response:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *_args):
+                    return None
+
+                def raise_for_status(self):
+                    pass
+
+                @property
+                def content(self):
+                    return self
+
+                async def iter_chunked(self, _size):
+                    yield b"pcm"
+
+            class Session:
+                def post(self, _url, json):
+                    requests.append(json["input"])
+                    return Response()
+
+            client = QwenVllmTtsClient()
+            client.session = Session()
+            text = (
+                "This ordinary two-sentence reply should retain continuous prosody. "
+                "Its pauses and emphasis should come from the complete context."
+            )
+            with patch.object(client, "start", new=AsyncMock()):
+                chunks = [chunk async for chunk in client.stream_synthesize(text)]
+            self.assertEqual(chunks, [b"pcm"])
+            self.assertEqual(requests, [text])
+
+        import asyncio
+        asyncio.run(run_test())
 
     def test_tts_backend_switch_is_explicit_and_reversible(self):
         with patch.dict("server.os.environ", {"LIVE_CONVERSATION_TTS_BACKEND": "qwen"}):

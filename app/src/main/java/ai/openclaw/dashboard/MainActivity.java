@@ -2358,7 +2358,9 @@ public final class MainActivity extends Activity {
         // an old 1.28-second cap no longer discards the beginning of a sentence.
         private static final int MAX_QUEUED_CHUNKS = 256;
         private static final int MAX_OUTPUT_QUEUED_CHUNKS = 96;
-        private static final double OUTPUT_GAIN = 5.0;
+        // Qwen PCM is already normalized. Amplifying it here hard-clipped peaks
+        // and made otherwise normal speech sound strained and shouted.
+        private static final double OUTPUT_GAIN = 1.0;
         private static final double TEST_TONE_AMPLITUDE = 30000.0;
         private static final int OUTPUT_TAIL_WAIT_MS = 1500;
         private static final int OUTPUT_DRAIN_WAIT_MS = 1200;
@@ -2487,16 +2489,13 @@ public final class MainActivity extends Activity {
                 recordDiagnostic("native_audio_output.focus_denied", "response_prepare");
                 return;
             }
-            AudioDeviceInfo bluetoothOutput = preferBluetoothAudioRoute(false, "response_prepare");
             AudioManager audioManager = getAudioManager();
-            if (audioManager != null && bluetoothOutput == null) {
-                prepareSpeakerPlaybackRoute(audioManager, "response_prepare");
-            }
+            AudioDeviceInfo playbackOutput = findPreferredPlaybackDevice(audioManager);
             synchronized (outputLock) {
                 startPcmOutputThreadLocked(OUTPUT_SAMPLE_RATE, "response_prepare");
             }
             recordDiagnostic("native_audio_output.prepared",
-                    bluetoothOutput == null ? "speaker" : describeAudioDevice(bluetoothOutput));
+                    playbackOutput == null ? "system_default" : describeAudioDevice(playbackOutput));
         }
 
         @JavascriptInterface
@@ -2654,12 +2653,9 @@ public final class MainActivity extends Activity {
         private void playPcmOutputLoop(int sampleRateHz, String routeReason) {
             AudioTrack track = null;
             try {
-                AudioDeviceInfo bluetoothOutput = preferBluetoothAudioRoute(false, routeReason);
                 AudioManager audioManager = getAudioManager();
+                AudioDeviceInfo playbackOutput = findPreferredPlaybackDevice(audioManager);
                 if (audioManager != null) {
-                    if (bluetoothOutput == null) {
-                        prepareSpeakerPlaybackRoute(audioManager, routeReason);
-                    }
                     logPlaybackStreamVolume(audioManager);
                 }
                 int minBuffer = AudioTrack.getMinBufferSize(
@@ -2672,15 +2668,15 @@ public final class MainActivity extends Activity {
                 // buffer and explicitly start after the first 100 ms PCM delta.
                 int targetBuffer = sampleRateHz * OUTPUT_BYTES_PER_SAMPLE * OUTPUT_BUFFER_MS / 1000;
                 int bufferSize = Math.max(minBuffer, targetBuffer);
-                track = createCommunicationAudioTrack(sampleRateHz, bufferSize);
+                track = createAssistantAudioTrack(sampleRateHz, bufferSize);
                 if (track.getState() != AudioTrack.STATE_INITIALIZED) {
                     throw new IllegalStateException("AudioTrack failed to initialize: state=" + track.getState());
                 }
                 int requestedStartFrames = Math.max(1, sampleRateHz * OUTPUT_START_THRESHOLD_MS / 1000);
                 int startThresholdFrames = Math.min(requestedStartFrames, track.getBufferCapacityInFrames());
                 int appliedStartFrames = track.setStartThresholdInFrames(startThresholdFrames);
-                if (bluetoothOutput != null && track.setPreferredDevice(bluetoothOutput)) {
-                    recordDiagnostic("native_audio_output.route", describeAudioDevice(bluetoothOutput));
+                if (playbackOutput != null && track.setPreferredDevice(playbackOutput)) {
+                    recordDiagnostic("native_audio_output.route", describeAudioDevice(playbackOutput));
                 }
                 recordDiagnostic("native_audio_output.stream_start",
                         "reason=" + routeReason
@@ -2749,7 +2745,7 @@ public final class MainActivity extends Activity {
             if (audioManager == null) return false;
             if (speechAudioFocusHeld) return true;
             AudioAttributes attributes = new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build();
             speechAudioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
@@ -2790,9 +2786,9 @@ public final class MainActivity extends Activity {
                             + " mode=" + audioManager.getMode());
         }
 
-        private AudioTrack createCommunicationAudioTrack(int sampleRateHz, int bufferSize) {
+        private AudioTrack createAssistantAudioTrack(int sampleRateHz, int bufferSize) {
             AudioAttributes attributes = new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build();
             AudioFormat format = new AudioFormat.Builder()
@@ -2806,6 +2802,32 @@ public final class MainActivity extends Activity {
                     .setBufferSizeInBytes(bufferSize)
                     .setTransferMode(AudioTrack.MODE_STREAM)
                     .build();
+        }
+
+        private AudioDeviceInfo findPreferredPlaybackDevice(AudioManager audioManager) {
+            if (audioManager == null) return null;
+            AudioDeviceInfo speaker = null;
+            AudioDeviceInfo fallback = null;
+            for (AudioDeviceInfo device : audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                if (!device.isSink()) continue;
+                int type = device.getType();
+                // Prefer full-bandwidth Bluetooth playback over the narrow-band
+                // SCO/telephony route. Wired and USB outputs come next.
+                if (type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+                        || type == AudioDeviceInfo.TYPE_BLE_SPEAKER
+                        || type == AudioDeviceInfo.TYPE_BLE_BROADCAST) {
+                    return device;
+                }
+                if (type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES
+                        || type == AudioDeviceInfo.TYPE_WIRED_HEADSET
+                        || type == AudioDeviceInfo.TYPE_USB_HEADSET
+                        || type == AudioDeviceInfo.TYPE_USB_DEVICE) {
+                    fallback = device;
+                } else if (type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) {
+                    speaker = device;
+                }
+            }
+            return fallback != null ? fallback : speaker;
         }
 
         private void drainPcmOutput(AudioTrack track, int sampleRateHz, int chunks) {

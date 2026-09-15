@@ -40,6 +40,7 @@ DEFAULT_PORT = 8790
 DEFAULT_SESSION_KEY = "agent:main:live-conversation"
 DEFAULT_NODE_COMMAND = "/home/john/nodejs/bin/node"
 DEFAULT_OPENCLAW_MODULE = "/home/john/nodejs/lib/node_modules/openclaw/openclaw.mjs"
+DEFAULT_OPENCLAW_PROJECT_ID = "openclaw-android-dashboard"
 DEFAULT_TTS_WORKER = str(Path(__file__).with_name("openclaw-kokoro-tts-worker"))
 DEFAULT_TTS_RUNTIME = "/home/john/.openclaw/tools/sherpa-onnx-tts/runtime"
 DEFAULT_TTS_MODEL_DIR = "/home/john/.openclaw/tools/sherpa-onnx-tts/models/kokoro-en-v0_19"
@@ -49,10 +50,13 @@ DEFAULT_QWEN_TTS_URL = "http://127.0.0.1:8792/v1/audio/speech"
 DEFAULT_QWEN_TTS_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 DEFAULT_QWEN_TTS_VOICE = "aiden"
 DEFAULT_QWEN_TTS_INSTRUCTIONS = (
-    "Speak naturally as a calm, concise personal assistant. Use conversational "
-    "pacing, clear phrasing, and subtle warmth without sounding theatrical."
+    "Speak in a natural, relaxed conversational voice at a moderately brisk "
+    "pace and normal indoor volume. Use ordinary sentence rhythm and neutral "
+    "emphasis."
 )
 DEFAULT_QWEN_INITIAL_CHUNK_FRAMES = 10
+DEFAULT_QWEN_FIRST_UTTERANCE_CHARS = 320
+DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS = 480
 SPEECH_MODEL_URL = "http://127.0.0.1:11439/api/chat"
 # Large enough for materially better natural-language supervision while staying
 # within the sub-second warm-response budget on the local Ollama GPUs.
@@ -1306,6 +1310,67 @@ def split_spoken_text(text: str, max_chars: int = 90) -> list[str]:
     return parts or [normalized]
 
 
+def split_qwen_utterances(text: str) -> list[str]:
+    """Preserve prosody while bounding startup and long-response buffering."""
+    normalized = normalize_spoken_text(text)
+    if not normalized:
+        return [""]
+    if len(normalized) <= DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS:
+        return [normalized]
+
+    sentences = [
+        match.group(0).strip()
+        for match in re.finditer(
+            r'.+?(?:[.!?]["”’]?(?=\s|$)|$)', normalized
+        )
+        if match.group(0).strip()
+    ]
+    units: list[str] = []
+    current = ""
+
+    def limit() -> int:
+        return (
+            DEFAULT_QWEN_FIRST_UTTERANCE_CHARS
+            if not units else DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS
+        )
+
+    def split_long(fragment: str, cap: int) -> list[str]:
+        pieces: list[str] = []
+        remainder = fragment
+        while len(remainder) > cap:
+            candidates = []
+            for marker in ("; ", ": ", ", ", " "):
+                position = remainder.rfind(marker, 0, cap + 1)
+                if position > 0:
+                    end = position + (1 if marker != " " else 0)
+                    prefix = remainder[:end]
+                    if prefix.count('"') % 2 == 0 and prefix.count("“") == prefix.count("”"):
+                        candidates.append(end)
+            split_at = max(candidates, default=cap)
+            pieces.append(remainder[:split_at].strip())
+            remainder = remainder[split_at:].strip()
+        if remainder:
+            pieces.append(remainder)
+        return pieces
+
+    for sentence in sentences or [normalized]:
+        cap = limit()
+        candidate = f"{current} {sentence}".strip()
+        if len(candidate) <= cap:
+            current = candidate
+            continue
+        if current:
+            units.append(current)
+            current = ""
+            cap = limit()
+        pieces = split_long(sentence, cap)
+        units.extend(pieces[:-1])
+        current = pieces[-1]
+    if current:
+        units.append(current)
+    return units or [normalized]
+
+
 def partial_structured_reply(text: str) -> tuple[str | None, str]:
     """Extract the route and currently decoded reply from partial JSON."""
     route_match = re.search(r'"route"\s*:\s*"([^"\\]*)"', text)
@@ -1659,7 +1724,11 @@ class QwenVllmTtsClient:
 
         async def produce() -> None:
             try:
-                for piece in split_spoken_text(text, max_chars=50):
+                # Qwen streams PCM, so tiny text requests do not improve
+                # first-audio latency. They do restart prosody at every join,
+                # producing artificial pauses and emphasis. Keep normal replies
+                # continuous and split only unusually long utterances.
+                for piece in split_qwen_utterances(text):
                     if not piece:
                         continue
                     async with self.session.post(
@@ -2191,6 +2260,12 @@ class LiveConversationService:
             return
         try:
             payload = json.loads(self.history_path.read_text(encoding="utf-8"))
+            saved_session_key = payload.get("session_key") if isinstance(payload, dict) else None
+            if (
+                isinstance(saved_session_key, str)
+                and saved_session_key.startswith("agent:main:live-conversation-")
+            ):
+                self.session_key = saved_session_key
             events = payload.get("events", []) if isinstance(payload, dict) else []
             if isinstance(events, list):
                 for event in events[-MAX_CONVERSATION_EVENTS:]:
@@ -2222,6 +2297,7 @@ class LiveConversationService:
                 self.history_path,
                 json.dumps({
                     "schema_version": 2,
+                    "session_key": self.session_key,
                     "messages": list(self.history),
                     "events": list(self.events),
                 }, ensure_ascii=False, indent=2),
@@ -2304,12 +2380,40 @@ class LiveConversationService:
         }
         slug = "-".join(word for word in words if word not in stop_words)[:48].strip("-")
         # A monotonic nanosecond suffix was a 15-to-19 digit number which could
-        # leak into status speech and be dictated in full. A 48-bit opaque token
-        # remains collision-resistant without looking like a giant cardinal.
-        suffix = secrets.token_hex(6)
-        if suffix.isdigit():
-            suffix = "a" + suffix[1:]
+        # leak into status speech and be dictated in full. Prefixing the opaque
+        # token with a letter prevents any random hex draw from looking like a
+        # giant cardinal while retaining ample collision resistance.
+        suffix = "a" + secrets.token_hex(6)[:11]
         return f"agent:main:live-conversation-{slug or 'task'}-{suffix}"
+
+    def begin_new_conversation_session(self) -> str:
+        """Archive the active context, then rotate to a clean direct session."""
+        self.interrupt_speech()
+        if self.history_path and (self.history or self.events):
+            archive_dir = self.history_path.parent / f"{self.history_path.stem}-archive"
+            archive_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            archive_path = archive_dir / (
+                datetime.now(ZoneInfo("America/Detroit")).strftime("%Y%m%dT%H%M%S")
+                + f"-{secrets.token_hex(3)}.json"
+            )
+            _secure_atomic_write(archive_path, json.dumps({
+                "schema_version": 2,
+                "session_key": self.session_key,
+                "archived_at": int(time.time()),
+                "messages": list(self.history),
+                "events": list(self.events),
+            }, ensure_ascii=False, indent=2))
+        self.session_key = self.allocate_agent_session_key("conversation")
+        self.history.clear()
+        self.events.clear()
+        self.pending_spoken_replies.clear()
+        self.pending_confirmation = None
+        self.pending_fragment = ""
+        self.pending_fragment_turn_id = None
+        self.last_turn_understanding = None
+        self.superseded_turn_ids.clear()
+        self._save_history()
+        return self.session_key
 
     def register_agent_session(
         self, session_key: str, request: str, origin_turn_id: str | None = None
@@ -3059,6 +3163,7 @@ class LiveConversationService:
 
     async def agent_reply(self, text: str, session_key: str | None = None) -> str:
         target_key = session_key or self.session_key
+
         for attempt, delay in enumerate((1, 2, 4, 8), start=1):
             try:
                 payload = await self.openclaw_json(
@@ -3097,6 +3202,17 @@ class LiveConversationService:
             if final_text:
                 return final_text
         return "The delegated agent is still working in its session."
+
+    async def create_project_session(self, session_key: str, task: str) -> None:
+        await self.openclaw_json(
+            "gateway", "call", "sessions.create", "--json", "--params",
+            json.dumps({
+                "key": session_key,
+                "agentId": "main",
+                "projectId": DEFAULT_OPENCLAW_PROJECT_ID,
+                "task": re.sub(r"\s+", " ", task).strip()[:500],
+            }),
+        )
 
     async def speech_reply(
         self, text: str, agent_pending: bool = False,
@@ -3922,7 +4038,7 @@ def render_page() -> str:
 <html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>Live Conversation</title><style>
 html,body{margin:0;min-height:100%;background:#060a10;color:#f4f8fc;font-family:system-ui,sans-serif}main{padding:18px 14px 28px;max-width:760px;margin:auto}h1{font-size:23px;margin:0 0 5px}.sub{color:#9aa9b8;margin:0 0 7px}.setting{color:#7fcbb4;font-size:12px;margin-bottom:16px}.state{font-size:18px;color:#54e0b4;margin:12px 0}.meter{height:14px;background:#101820;border:1px solid #304050;border-radius:8px;overflow:hidden}.meter div{height:100%;width:0;background:#00ab7e;transition:width 60ms}.buttons{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:14px 0}button{min-height:48px;border:1px solid #00ab7e;border-radius:8px;background:#1e2630;color:#fff;font-size:15px}button:disabled{opacity:.55}.debug-card{border:1px solid #31475a}.debug-line{display:flex;align-items:center;gap:8px;margin:5px 0 10px}.debug-icon{width:12px;height:12px;border-radius:50%;background:#708090;box-shadow:0 0 8px currentColor}.debug-icon.collecting,.debug-icon.working{background:#e0a84f;color:#e0a84f}.debug-icon.fixed{background:#54e0b4;color:#54e0b4}.debug-icon.release_available{background:#59a9ff;color:#59a9ff}.debug-icon.gateway_updated{background:#bf8cff;color:#bf8cff}.debug-icon.failed{background:#ff6b72;color:#ff6b72}.card{background:#0a0e14;border-radius:8px;padding:12px;margin-top:10px;min-height:48px}.label{color:#8797a8;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.metrics{font-size:12px;color:#aebdca;margin-top:12px}.route{display:inline-block;border:1px solid #36556a;border-radius:10px;padding:2px 7px;font-size:11px;margin-left:6px}.history{margin-top:18px}.history-list{display:flex;flex-direction:column;gap:8px;margin-top:8px}.history-empty{color:#718294;font-size:13px}.message{max-width:88%;padding:9px 11px;border-radius:12px;line-height:1.35;white-space:pre-wrap;overflow-wrap:anywhere}.message.user{align-self:flex-end;background:#0e5948}.message.assistant{align-self:flex-start;background:#182431}.message-role{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:#9db0bf;margin-bottom:3px}
-</style></head><body><main><h1>Live Conversation</h1><p class="sub">Accurate local speech recognition. Simple requests answer here; complex work routes to the right OpenClaw session.</p><div id="confirmation" class="setting">Action confirmation: loading…</div><div id="recording" class="setting">Test audio capture: loading…</div><p class="sub">Audio capture is off by default. When enabled, microphone turns and test metadata are saved locally on the OpenClaw host for regression testing.</p><div class="card debug-card"><div class="label">Conversation diagnostics</div><div class="debug-line"><span id="debugIcon" class="debug-icon idle" aria-hidden="true"></span><span id="debugStatus" role="status">No debug submission pending.</span></div><button id="sendDebug">Send for Debug</button></div><div id="state" class="state">Ready</div><div class="meter"><div id="bar"></div></div><div class="buttons"><button id="start">Start conversation</button><button id="stop">Stop</button></div><div class="card"><div class="label">You</div><div id="user">—</div></div><div class="card"><div class="label">Assistant <span id="route" class="route">waiting</span></div><div id="assistant">—</div></div><div id="metrics" class="metrics"></div><section class="history"><div class="label">Recent messages · newest first · last 120</div><div id="history" class="history-list"><div class="history-empty">No conversation history yet.</div></div></section></main><script>
+</style></head><body><main><h1>Live Conversation</h1><p class="sub">Accurate local speech recognition. Simple requests answer here; complex work routes to the right OpenClaw session.</p><div id="confirmation" class="setting">Action confirmation: loading…</div><div id="recording" class="setting">Test audio capture: loading…</div><p class="sub">Audio capture is off by default. When enabled, microphone turns and test metadata are saved locally on the OpenClaw host for regression testing.</p><div class="card debug-card"><div class="label">Conversation diagnostics</div><div class="debug-line"><span id="debugIcon" class="debug-icon idle" aria-hidden="true"></span><span id="debugStatus" role="status">No debug submission pending.</span></div><button id="sendDebug">Send for Debug</button></div><div id="state" class="state">Ready</div><div class="meter"><div id="bar"></div></div><div class="buttons"><button id="start">Start conversation</button><button id="stop">Stop</button><button id="newSession">New session</button></div><div class="card"><div class="label">You</div><div id="user">—</div></div><div class="card"><div class="label">Assistant <span id="route" class="route">waiting</span></div><div id="assistant">—</div></div><div id="metrics" class="metrics"></div><section class="history"><div class="label">Recent messages · newest first · last 120</div><div id="history" class="history-list"><div class="history-empty">No conversation history yet.</div></div></section></main><script>
 const state=document.getElementById('state'),bar=document.getElementById('bar'),user=document.getElementById('user'),assistant=document.getElementById('assistant'),route=document.getElementById('route'),metrics=document.getElementById('metrics'),confirmation=document.getElementById('confirmation'),recordingSetting=document.getElementById('recording'),debugIcon=document.getElementById('debugIcon'),debugStatus=document.getElementById('debugStatus'),sendDebug=document.getElementById('sendDebug'),historyList=document.getElementById('history');const AUDIO_FRAME_MS=20,START_CONFIRM_MS=300,BARGE_IN_CONFIRM_MS=300,ONSET_PREROLL_MS=2500,PREBUFFER_FRAMES=Math.ceil((START_CONFIRM_MS+ONSET_PREROLL_MS)/AUDIO_FRAME_MS),MAX_DRAIN_FRAMES=24,SEMANTIC_CHECK_MS=750,HARD_ENDPOINT_MS=3500;let ws,timer,recording=false,awaitingResponse=false,responseActive=false,responseTailTimer=null,speechMs=0,silenceMs=0,candidateSpeechMs=0,pre=[],historyMessages=[],pendingTranscript='',endpointPending=false,nextEndpointAt=SEMANTIC_CHECK_MS,confirmationMode='automatic',audioCapture=false,pendingMessages=[];const confirmationToggle=document.createElement('button');confirmationToggle.textContent='Toggle confirmation';confirmation.insertAdjacentElement('afterend',confirmationToggle);const recordingToggle=document.createElement('button');recordingToggle.textContent='Enable test audio capture';recordingSetting.insertAdjacentElement('afterend',recordingToggle);
 const deleteRecordings=document.createElement('button');deleteRecordings.textContent='Delete all recordings';deleteRecordings.ariaLabel='Delete all locally retained microphone recordings';recordingToggle.insertAdjacentElement('afterend',deleteRecordings);
 function renderHistory(){historyList.replaceChildren();if(!historyMessages.length){const empty=document.createElement('div');empty.className='history-empty';empty.textContent='No conversation history yet.';historyList.appendChild(empty);return}for(const message of historyMessages.slice(-120).reverse()){const bubble=document.createElement('div');bubble.className='message '+message.role;const who=document.createElement('div');who.className='message-role';who.textContent=message.role==='user'?'You':'Assistant';const content=document.createElement('div');content.textContent=message.content;bubble.append(who,content);historyList.appendChild(bubble)}}
@@ -3942,7 +4058,8 @@ function installRealtimeListeners(){if(!ws||realtimeListenerSocket===ws)return;r
 const originalStart=start;start=function(){originalStart();installRealtimeListeners()};confirmationToggle.onclick=()=>sendWhenConnected({type:'set_confirmation',required:confirmationMode!=='confirm'});recordingToggle.onclick=()=>sendWhenConnected({type:'set_audio_capture',enabled:!audioCapture});sendDebug.onclick=()=>sendWhenConnected({type:'send_for_debug'});renderDebugStatus({state:'idle'});
 deleteRecordings.onclick=()=>{if(window.confirm('Delete all locally retained microphone recordings? This cannot be undone.'))sendWhenConnected({type:'delete_audio_captures'})};
 function stop(){if(timer)clearInterval(timer);timer=null;if(responseTailTimer)clearTimeout(responseTailTimer);responseTailTimer=null;try{OpenClawNativeAudio.stopCapture()}catch(e){}if(ws)ws.close();ws=null;recording=false;awaitingResponse=false;responseActive=false;candidateSpeechMs=0;bar.style.width='0%';state.textContent='Stopped'}
-document.getElementById('start').onclick=start;document.getElementById('stop').onclick=()=>{stop();try{OpenClawNativeApp.liveConversationStopped()}catch(e){}};window.addEventListener('pagehide',stop);if(new URLSearchParams(location.search).get('autostart')==='1')start();
+function newSession(){stop();historyMessages=[];pendingTranscript='';pre=[];user.textContent='—';assistant.textContent='—';route.textContent='waiting';metrics.textContent='';renderHistory();pendingMessages.push({type:'new_session'});start();state.textContent='Starting new session…'}
+document.getElementById('start').onclick=start;document.getElementById('stop').onclick=()=>{stop();try{OpenClawNativeApp.liveConversationStopped()}catch(e){}};document.getElementById('newSession').onclick=newSession;window.addEventListener('pagehide',stop);if(new URLSearchParams(location.search).get('autostart')==='1')start();
 </script></body></html>"""
 
 
@@ -4134,6 +4251,7 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
     ) -> None:
         if target_session is None:
             target_session = service.allocate_agent_session_key(transcript)
+        await service.create_project_session(target_session, transcript)
         service.register_agent_session(target_session, transcript, origin_turn_id)
         work = asyncio.create_task(service.agent_reply(transcript, target_session))
         refresh = asyncio.create_task(service.refresh_sessions(force=True))
@@ -4234,6 +4352,9 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
                 "working", request_id=request_id, requested_at=int(time.time()),
                 session_key=target_session, bundle_path=str(bundle_path),
                 message="Correction agent is diagnosing the captured conversation.",
+            )
+            await service.create_project_session(
+                target_session, "Diagnose and correct the submitted Live Conversation issue."
             )
             service.register_agent_session(
                 target_session,
@@ -4381,6 +4502,20 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
         elif kind == "delete_audio_captures":
             deleted = service.delete_audio_captures()
             await socket.send_json({"type": "recordings_deleted", **deleted})
+        elif kind == "new_session":
+            session_key = service.begin_new_conversation_session()
+            audio.clear()
+            online_transcript = OnlineTranscript.empty()
+            user_input_active = False
+            conversation_idle.set()
+            await socket.send_json({
+                "type": "new_session", "sessionKey": session_key,
+            })
+            await socket.send_json({"type": "history", "messages": []})
+            await socket.send_json({
+                "type": "state", "state": "listening",
+                "detail": "New conversation session started.",
+            })
         elif kind == "send_for_debug":
             if service.debug_status.get("state") in {"collecting", "working"}:
                 await socket.send_json(service.settings_payload())
