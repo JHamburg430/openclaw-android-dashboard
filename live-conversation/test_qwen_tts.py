@@ -89,6 +89,23 @@ class QwenTtsAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(pcm)
         self.assertLess(first_audio, 4.0, "cancelled synthesis blocked the next turn")
 
+    async def test_continuous_reply_keeps_up_with_realtime_consumer(self) -> None:
+        import asyncio
+        text = ("The weather is pleasant today, so we can take a walk after lunch "
+                "and spend some time outside together.")
+        started = time.perf_counter()
+        first = None
+        audio_seconds = 0.0
+        async for chunk in self.tts.stream_synthesize(text):
+            if first is None:
+                first = time.perf_counter()
+            duration = len(chunk) / (OUTPUT_SAMPLE_RATE * 2)
+            audio_seconds += duration
+            await asyncio.sleep(duration)
+        self.assertIsNotNone(first)
+        overhead = time.perf_counter() - first - audio_seconds
+        self.assertLess(overhead, 0.6, "synthesis gaps slowed continuous playback")
+
     async def _transcribe(self, pcm: bytes) -> str:
         def run() -> str:
             assert self.stt._model

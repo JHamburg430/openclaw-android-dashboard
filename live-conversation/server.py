@@ -1420,7 +1420,12 @@ class IncrementalSpeechStream:
                 })
                 self.started = True
 
+            playback_started: float | None = None
+
             async def send_chunk(chunk: bytes, total_bytes: int) -> bool:
+                nonlocal playback_started
+                if playback_started is None:
+                    playback_started = time.perf_counter()
                 if self.generation != self.service.speech_generation:
                     return False
                 await self.socket.send_json({
@@ -1429,10 +1434,11 @@ class IncrementalSpeechStream:
                     "sampleRate": OUTPUT_SAMPLE_RATE,
                     "audioBase64": base64.b64encode(chunk).decode("ascii"),
                 })
-                if total_bytes > round(
-                    OUTPUT_SAMPLE_RATE * 2 * PLAYBACK_PREFILL_SECONDS
-                ):
-                    await asyncio.sleep(len(chunk) / (OUTPUT_SAMPLE_RATE * 2))
+                delay = (total_bytes / (OUTPUT_SAMPLE_RATE * 2)
+                         - PLAYBACK_PREFILL_SECONDS
+                         - (time.perf_counter() - playback_started))
+                if delay > 0:
+                    await asyncio.sleep(delay)
                 return True
 
             tts_started = time.perf_counter()
@@ -1644,18 +1650,44 @@ class QwenVllmTtsClient:
         del speed
         await self.start()
         assert self.session
-        # The backend can finish an in-flight request after HTTP cancellation.
-        # Bound that residual work so a long interrupted reply cannot block the
-        # next turn behind tens of seconds of obsolete synthesis. Do not submit
-        # later pieces until the consumer has drained the current one.
-        for piece in split_spoken_text(text, max_chars=50):
-            if not piece:
-                continue
-            async with self.session.post(self.url, json=self.request_payload(piece)) as response:
-                response.raise_for_status()
-                async for chunk in response.content.iter_chunked(64 * 1024):
-                    if chunk:
-                        yield bytes(chunk)
+        # Keep synthesis ahead of realtime playback, but bound both buffered
+        # audio and obsolete backend work after interruption. A lazy HTTP
+        # iterator adds a fresh synthesis delay after every played phrase.
+        queue: asyncio.Queue[bytes | Exception | None] = asyncio.Queue(maxsize=20)
+        chunk_bytes = OUTPUT_SAMPLE_RATE * 2 // 10
+
+        async def produce() -> None:
+            try:
+                for piece in split_spoken_text(text, max_chars=50):
+                    if not piece:
+                        continue
+                    async with self.session.post(
+                        self.url, json=self.request_payload(piece)
+                    ) as response:
+                        response.raise_for_status()
+                        async for raw in response.content.iter_chunked(chunk_bytes):
+                            if raw:
+                                await queue.put(bytes(raw))
+            except Exception as error:
+                await queue.put(error)
+            else:
+                await queue.put(None)
+
+        producer = asyncio.create_task(produce())
+        try:
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                if isinstance(chunk, Exception):
+                    raise chunk
+                yield chunk
+        finally:
+            producer.cancel()
+            try:
+                await producer
+            except asyncio.CancelledError:
+                pass
 
     async def synthesize(self, text: str, speed: float | None = None) -> bytes:
         pcm = bytearray()
@@ -3539,8 +3571,12 @@ class LiveConversationService:
             interrupted = False
             tts_ms = 0
 
+            playback_started: float | None = None
+
             async def send_chunk(chunk: bytes) -> bool:
-                nonlocal total_pcm_bytes
+                nonlocal total_pcm_bytes, playback_started
+                if playback_started is None:
+                    playback_started = time.perf_counter()
                 if generation != self.speech_generation:
                     return False
                 await socket.send_json({
@@ -3552,8 +3588,10 @@ class LiveConversationService:
                 total_pcm_bytes += len(chunk)
                 # Keep a small PCM lead ahead of Android's AudioTrack. Sending
                 # exactly one 100 ms delta every 100 ms left no jitter margin.
-                if total_pcm_bytes > prefill_bytes:
-                    await asyncio.sleep(len(chunk) / (OUTPUT_SAMPLE_RATE * 2))
+                delay = ((total_pcm_bytes - prefill_bytes) / (OUTPUT_SAMPLE_RATE * 2)
+                         - (time.perf_counter() - playback_started))
+                if delay > 0:
+                    await asyncio.sleep(delay)
                 return True
 
             if pcm_override is None and hasattr(self.tts, "stream_synthesize"):

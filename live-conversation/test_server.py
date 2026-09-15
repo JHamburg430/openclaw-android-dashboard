@@ -2831,7 +2831,8 @@ class RoutingTests(unittest.TestCase):
             with patch("server.asyncio.sleep", AsyncMock()) as sleep:
                 await service.send_spoken_response(socket, "A short response.", "agent", "response-1")
             self.assertEqual(sleep.await_count, 1)
-            self.assertEqual(sleep.await_args_list[0].args[0], 0.1)
+            self.assertGreater(sleep.await_args_list[0].args[0], 0)
+            self.assertLessEqual(sleep.await_args_list[0].args[0], 0.1)
             payloads = [call.args[0] for call in socket.send_json.await_args_list]
             self.assertEqual(
                 sum(payload.get("type") == "response.output_audio.delta" for payload in payloads),
@@ -2884,7 +2885,8 @@ class RoutingTests(unittest.TestCase):
                     return self
 
                 async def iter_chunked(self, size):
-                    yield b"pcm"
+                    for _ in range(100):
+                        yield b"p" * size
 
             class Session:
                 def post(self, url, json):
@@ -2896,7 +2898,7 @@ class RoutingTests(unittest.TestCase):
             text = "A long explanation should stop when the user interrupts. " * 20
             with patch.object(client, "start", new=AsyncMock()):
                 stream = client.stream_synthesize(text)
-                self.assertEqual(await anext(stream), b"pcm")
+                self.assertEqual(await anext(stream), b"p" * 4800)
                 await stream.aclose()
             self.assertEqual(len(requests), 1)
             self.assertLessEqual(len(requests[0]), 50)
@@ -2945,6 +2947,36 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(len(deltas), 4)
             self.assertEqual(payloads[-1]["type"], "response.output_audio.done")
 
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_stream_pacing_does_not_add_synthesis_time_to_playback(self):
+        async def run_test():
+            clock = [100.0]
+            class StreamingTts:
+                speed = 1.0
+                async def stream_synthesize(self, _text, _speed):
+                    for _ in range(10):
+                        clock[0] += 0.1  # synthesis already took realtime
+                        yield b"\0" * 4800
+            service = LiveConversationService("agent:main:live-conversation", 1.0)
+            service.tts = StreamingTts()
+            async def sleep(delay):
+                clock[0] += delay
+            with patch("server.time.perf_counter", side_effect=lambda: clock[0]), patch(
+                "server.asyncio.sleep", side_effect=sleep
+            ):
+                await service.send_spoken_response(
+                    AsyncMock(), "A continuous sentence.", "direct", "cadence"
+                )
+            self.assertAlmostEqual(clock[0] - 100, 1.0, places=5)
+            clock[0] = 100.0
+            stream = IncrementalSpeechStream(service, AsyncMock(), "cadence", service.speech_generation)
+            with patch("server.time.perf_counter", side_effect=lambda: clock[0]), patch(
+                "server.asyncio.sleep", side_effect=sleep
+            ):
+                await stream._speak("A continuous sentence.")
+            self.assertAlmostEqual(clock[0] - 100, 1.0, places=5)
         import asyncio
         asyncio.run(run_test())
 
