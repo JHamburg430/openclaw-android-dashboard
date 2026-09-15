@@ -377,7 +377,8 @@ not accelerated, so the production gate rejects fallback-only deployments.
 The HTTP endpoint remains available for diagnosis and the watchdog's liveness
 check; model recovery is handled in-process rather than repeatedly restarting
 the audio service. The checked-in dedicated Ollama unit pins the model to the
-RTX 3090 by UUID because the general-purpose 3080 Ti server can fill that GPU.
+RTX 3080 Ti by UUID, separate from ASR/TTS on the RTX 3090. Its indefinite
+residency prevents idle expiry from freeing that allocation for other models.
 Verify actual `/api/ps` VRAM residency after deployment, not just CUDA settings.
 Ollama documents indefinite residency in its [keep-alive FAQ](https://docs.ollama.com/faq).
 Between conversations, run `LIVE_CONVERSATION_TEST_RECOVERY=1 python -m unittest
