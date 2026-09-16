@@ -429,6 +429,17 @@ whole patch atomically; stale revisions require reloading. **Reload saved**
 discards drafts, while **Restore defaults** only fills service defaults into the
 form until saved. Phone settings are stored separately on the device.
 
+Sub-settings follow the unsaved parent selection: Kokoro/Qwen engine controls,
+ASR VAD tuning, recording retention/quota, and spoken-acknowledgment text.
+Search and visible counts exclude inactive controls; hiding a control preserves
+its value, including across save/reload. Model and Qwen voice fields use dropdowns
+with a **Custom…** escape hatch and preserve deployment-specific values. Model
+suggestions are baseline identifiers, not an installed-model inventory. Qwen voice
+suggestions follow the [official speaker list](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice#supported-speakers).
+Instructions, vocabulary hints, and wake words remain free text; numeric tuning
+keeps exact numeric inputs. These presentation changes are served directly by the
+voice service: reopen Settings; no APK install or service restart is required.
+
 Confirmation and recording changes apply immediately. Microphone timing applies
 on the next conversation. Fields marked for service restart remain pending until
 **Apply pending service settings** restarts only the voice service. Existing

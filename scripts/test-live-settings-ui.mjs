@@ -56,13 +56,41 @@ try{
   for(const spec of initial.schema){const input=page.locator('#setting-'+spec.key);assert.equal(await input.count(),1,spec.key+' renders once');assert.ok(await input.getAttribute('id'));if(spec.type==='boolean')assert.equal(await input.isChecked(),spec.default);else assert.equal(await input.inputValue(),String(spec.default));}
   assert.equal(await page.locator('#groups .field').count(),initial.schema.length);
   assert.equal(await page.locator('#nativeFields .field').count(),5);
-  assert.equal(await page.locator('#count').textContent(),`${initial.schema.length+5} settings`);
+  assert.equal(await page.locator('#count').textContent(),`${initial.schema.length+5-10} settings`);
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'mobile has no horizontal overflow');
+  // Every dependent control follows the draft parent, including search and counts.
+  const row=key=>page.locator('#setting-'+key).locator('xpath=ancestor::div[contains(@class,"field")]');
+  const visibility=async(keys,visible)=>{for(const key of keys)assert.equal(await row(key).isVisible(),visible,key);assert.equal(await page.locator('#count').textContent(),`${await page.locator('.field:visible').count()} settings`);};
+  const qwen=initial.schema.filter(s=>s.key.startsWith('qwen_tts_')||s.key.startsWith('default_qwen_')).map(s=>s.key);
+  const kokoro=['tts_speaker_id','tts_threads','tts_speed'];
+  await visibility(qwen,false);await visibility(kokoro,true);
+  await page.locator('#setting-tts_backend').selectOption('qwen');await visibility(qwen,true);await visibility(kokoro,false);
+  await page.locator('#setting-qwen_tts_voice-choice').selectOption('aiden');
+  await page.locator('#setting-tts_backend').selectOption('kokoro');
+  await page.locator('#search').fill('qwen_tts_voice');assert.equal(await page.locator('.field:visible').count(),0);await page.locator('#search').fill('');
+  await page.locator('#setting-tts_backend').selectOption('qwen');assert.equal(await page.locator('#setting-qwen_tts_voice-choice').inputValue(),'aiden');
+  for(const [parent,keys] of [
+    ['asr_vad_filter',initial.schema.filter(s=>(s.key.startsWith('asr_vad_')&&s.key!=='asr_vad_filter')||['asr_min_speech_duration_ms','asr_min_silence_duration_ms','asr_speech_pad_final_ms','asr_speech_pad_partial_ms'].includes(s.key)).map(s=>s.key)],
+    ['audio_capture',['recording_retention_days','recording_max_bytes']],
+    ['spoken_backchannels_enabled',['backchannel_display_text']],
+  ]){await page.locator('#setting-'+parent).uncheck();await visibility(keys,false);await page.locator('#setting-'+parent).check();await visibility(keys,true);}
+  for(const key of ['speech_model','degraded_speech_model','qwen_tts_model','qwen_tts_voice']){
+    const select=page.locator('#setting-'+key+'-choice');assert.equal(await select.isVisible(),true);
+    await select.selectOption('__custom__');await page.locator('#setting-'+key).fill(key==='qwen_tts_voice'?'custom_voice':'custom/model:tag');
+  }
+  await page.locator('#setting-tts_backend').selectOption('kokoro');
+  await page.locator('#save').click();await page.waitForFunction(()=>!busy&&!dirty&&document.querySelector('#status').textContent.startsWith('Saved.'));
+  const customSaved=await (await page.request.get(base+'/api/settings')).json();assert.equal(customSaved.values.qwen_tts_voice,'custom_voice');
+  await page.reload();await page.waitForFunction(()=>document.querySelector('#setting-speech_model-choice')?.value==='custom/model:tag');
+  await page.locator('#setting-tts_backend').selectOption('qwen');assert.equal(await page.locator('#setting-qwen_tts_voice-choice').inputValue(),'custom_voice');
+  await page.locator('#reset').click();await visibility(qwen,false);await visibility(kokoro,true);assert.equal(await page.locator('#setting-speech_model-choice').inputValue(),initial.values.speech_model);
+  await page.locator('#save').click();await page.waitForFunction(()=>!busy&&!dirty&&document.querySelector('#status').textContent.startsWith('Saved.'));
+
   await page.locator('#search').fill('zzzz-no-matching-option');assert.equal(await page.locator('.field:visible').count(),0);assert.equal(await page.locator('#count').textContent(),'0 settings');
   await page.locator('#search').fill('speech_num_predict');assert.equal(await page.locator('.field:visible').count(),1);await page.locator('#search').fill('');
   await page.locator('#setting-action_confirmation').selectOption('confirm');await page.locator('#setting-audio_capture').check();await page.locator('#setting-speech_num_predict').fill('400');
   for(const key of ['aec','noise_suppression','automatic_gain','prefer_bluetooth'])await page.locator('#setting-'+key).uncheck();await page.locator('#setting-output_gain').fill('0.5');
-  await page.locator('#save').click();await page.waitForFunction(()=>document.querySelector('#status').textContent.startsWith('Saved.'));
+  await page.locator('#save').click();await page.waitForFunction(()=>!busy&&!dirty&&document.querySelector('#status').textContent.startsWith('Saved.'));
   assert.deepEqual(await page.evaluate(()=>window.phoneSaved),{aec:false,noise_suppression:false,automatic_gain:false,output_gain:.5,prefer_bluetooth:false});
   assert.equal(await page.locator('#restart').isVisible(),true);
   await page.locator('summary').click();assert.ok((await page.locator('#readOnly').textContent()).includes('16000'));
@@ -75,8 +103,8 @@ try{
   for(const [mode,text] of [['conflict','Settings changed elsewhere'],['failure','Simulated persistence failure']]){await page.request.post(base+'/test',{data:{mode}});await page.locator('#setting-speech_num_predict').fill('410');await page.locator('#save').click();await page.waitForFunction(text=>document.querySelector('#status').textContent.includes(text),text);assert.equal(await page.locator('#save').isEnabled(),true);assert.equal(await page.locator('#setting-speech_num_predict').inputValue(),'410');}
   await page.request.post(base+'/test',{data:{mode:'ok'}});await page.locator('#reload').click();await page.waitForFunction(()=>document.querySelector('#setting-speech_num_predict').value==='400');
   await page.evaluate(()=>window.phoneFailure=true);await page.locator('#setting-speech_num_predict').fill('420');await page.locator('#save').click();await page.waitForFunction(()=>document.querySelector('#status').textContent.includes('phone audio was not saved'));assert.equal(await page.locator('#save').isEnabled(),true);await page.evaluate(()=>window.phoneFailure=false);
-  await page.locator('#reset').click();assert.equal(await page.locator('#setting-speech_num_predict').inputValue(),String(initial.values.speech_num_predict));assert.equal((await (await page.request.get(base+'/api/settings')).json()).values.speech_num_predict,420,'reset does not persist without save');await page.locator('#save').click();await page.waitForFunction(()=>document.querySelector('#status').textContent.startsWith('Saved.'));
+  await page.locator('#reset').click();assert.equal(await page.locator('#setting-speech_num_predict').inputValue(),String(initial.values.speech_num_predict));assert.equal((await (await page.request.get(base+'/api/settings')).json()).values.speech_num_predict,420,'reset does not persist without save');await page.locator('#save').click();await page.waitForFunction(()=>!busy&&!dirty&&document.querySelector('#status').textContent.startsWith('Saved.'));
   await page.reload();await page.waitForFunction(()=>document.querySelector('#status').textContent==='Settings loaded.');assert.equal(await page.locator('#setting-speech_num_predict').inputValue(),String(initial.values.speech_num_predict));
-  const plain=await browser.newContext({viewport:{width:1280,height:800}}),unsupported=await plain.newPage();await unsupported.goto(base+'/settings');await unsupported.waitForFunction(()=>document.querySelector('#status').textContent==='Settings loaded.');assert.equal(await unsupported.locator('#nativeGroup').isVisible(),false);assert.equal(await unsupported.locator('#count').textContent(),`${initial.schema.length} settings`);await unsupported.locator('#setting-action_confirmation').selectOption('confirm');await unsupported.locator('#save').click();await unsupported.waitForFunction(()=>document.querySelector('#status').textContent.startsWith('Saved.'));assert.deepEqual(errors,[]);
+  const plain=await browser.newContext({viewport:{width:1280,height:800}}),unsupported=await plain.newPage();await unsupported.goto(base+'/settings');await unsupported.waitForFunction(()=>document.querySelector('#status').textContent==='Settings loaded.');assert.equal(await unsupported.locator('#nativeGroup').isVisible(),false);assert.equal(await unsupported.locator('#count').textContent(),`${initial.schema.length-10} settings`);await unsupported.locator('#setting-action_confirmation').selectOption('confirm');await unsupported.locator('#save').click();await unsupported.waitForFunction(()=>!busy&&!dirty&&document.querySelector('#status').textContent.startsWith('Saved.'));assert.deepEqual(errors,[]);
   console.log(`Real Chromium settings UI passed: ${initial.schema.length} schema controls, mobile layout, search, save/reload/defaults, validation, conflict/failure recovery, all five native settings, native failure and unsupported bridge.`);
 }finally{if(browser)await browser.close();server.kill();await rm(temp,{recursive:true,force:true});}
