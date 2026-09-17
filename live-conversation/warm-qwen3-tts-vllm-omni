@@ -14,6 +14,6 @@ done
 
 curl --fail --silent --show-error --max-time 180 \
   --header 'Content-Type: application/json' \
-  --data '{"model":"Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice","input":"Ready.","voice":"ryan","instructions":"Speak naturally as a calm, concise personal assistant.","language":"English","response_format":"pcm","stream":true,"stream_format":"audio","initial_codec_chunk_frames":10}' \
+  --data '{"model":"Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice","input":"Ready.","voice":"ryan","instructions":"Speak like a normal, intelligent American engineer in his mid-30s: relaxed, clear, warm, direct, and conversational.","language":"English","response_format":"pcm","stream":true,"stream_format":"audio","initial_codec_chunk_frames":10}' \
   --output /dev/null \
   http://127.0.0.1:8792/v1/audio/speech

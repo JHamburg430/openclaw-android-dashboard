@@ -6,8 +6,8 @@ const controls=new Map(),nativeControls=new Map();
 const choices={
   speech_model:['openclaw-live-conversation:4b','qwen3.5:4b','qwen3.5:0.8b'],
   degraded_speech_model:['qwen3.5:0.8b','openclaw-live-conversation:4b','qwen3.5:4b'],
-  qwen_tts_model:['Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice'],
-  // https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice#supported-speakers
+  qwen_tts_model:['Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice','Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice'],
+  // https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice#supported-speakers
   qwen_tts_voice:['ryan','aiden','vivian','serena','uncle_fu','dylan','eric','ono_anna','sohee'],
 };
 function applicable(key){

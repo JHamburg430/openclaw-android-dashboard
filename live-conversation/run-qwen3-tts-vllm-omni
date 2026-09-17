@@ -17,7 +17,7 @@ export LD_LIBRARY_PATH="$cuda_root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export LIBRARY_PATH="$cuda_root/lib:/usr/lib/x86_64-linux-gnu${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
 exec "$venv_root/bin/python" -m vllm.entrypoints.cli.main \
-  serve Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+  serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
   --omni \
   --host 127.0.0.1 \
   --port 8792 \

@@ -10,6 +10,7 @@ ExecStart=/home/john/openclaw-android-dashboard/live-conversation/run-qwen3-tts-
 ExecStartPost=/home/john/openclaw-android-dashboard/live-conversation/warm-qwen3-tts-vllm-omni
 Restart=on-failure
 RestartSec=5
+TimeoutStartSec=240
 TimeoutStopSec=20
 
 [Install]

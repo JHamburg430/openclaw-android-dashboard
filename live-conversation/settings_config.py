@@ -69,15 +69,15 @@ _global('wake_window_seconds', 'Wake recognition window (seconds)', 'Microphone'
 _global('wake_cooldown_seconds', 'Wake cooldown (seconds)', 'Microphone', 5.0, .5, 60.0)
 _setting('tts_speaker_id', 'Kokoro speaker ID', 'Speech output', 9, 0, 10)
 _setting('tts_threads', 'Kokoro worker threads', 'Speech output', 8, 1, 32)
-_global('default_qwen_first_utterance_chars', 'Qwen first utterance characters', 'Speech output', 320, 40, 2000)
+_global('default_qwen_first_utterance_chars', 'Qwen first utterance characters', 'Speech output', 48, 40, 2000)
 _global('default_qwen_followup_utterance_chars', 'Qwen follow-up utterance characters', 'Speech output', 480, 40, 4000)
 
 _setting('tts_backend', 'Speech engine', 'Speech output', 'kokoro', options=['kokoro', 'qwen'])
 _setting('tts_speed', 'Kokoro speaking speed', 'Speech output', 1.08, .5, 2.0)
-_setting('qwen_tts_model', 'Qwen speech model', 'Speech output', 'Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice', 1, 200)
+_setting('qwen_tts_model', 'Qwen speech model', 'Speech output', 'Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice', 1, 200)
 _setting('qwen_tts_voice', 'Qwen voice', 'Speech output', 'ryan', 1, 100)
 _setting('qwen_tts_instructions', 'Qwen voice direction', 'Speech output',
-         'Speak in a natural, relaxed conversational voice at a moderately brisk pace and normal indoor volume. Use ordinary sentence rhythm and neutral emphasis.', 0, 2000)
+         'Speak like a normal, intelligent American engineer in his mid-30s: relaxed, clear, warm, direct, and conversational. Use natural pauses, subtle emphasis, varied sentence rhythm, and understated confidence. Avoid announcer, theatrical, overly cheerful, robotic, breathy, or character-like delivery. Keep a moderately brisk pace and normal indoor volume.', 0, 2000)
 _setting('qwen_tts_initial_chunk_frames', 'Qwen initial chunk frames', 'Speech output', 10, 1, 100)
 _setting('qwen_tts_startup_wait_seconds', 'Qwen startup wait (seconds)', 'Speech output', 0.0, 0.0, 600.0)
 _setting('asr_model', 'Whisper model', 'ASR', 'small.en', options=['tiny.en', 'base.en', 'small.en', 'medium.en', 'tiny', 'base', 'small', 'medium', 'large-v3', 'turbo'])

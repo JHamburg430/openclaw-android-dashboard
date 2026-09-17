@@ -398,9 +398,11 @@ test_voice_residency.py` from this directory to unload only the dedicated model
 and require recovery on GPU within 30 seconds without restarting the audio
 service. Do not run this fault-injection gate during someone else's voice turn.
 
-Qwen requests are limited to 50-character spoken units and submitted lazily.
-The backend may continue an in-flight unit after disconnect, but cancelling a
-reply prevents remaining units from entering its queue. The optional Qwen
+Ordinary Qwen replies up to 480 characters stay in one request for continuous
+prosody. Longer replies start with a 48-character interruption-safe unit, then
+continue in sentence-aware units of up to 480 characters submitted lazily. The
+backend may continue an in-flight unit after disconnect, but cancelling a reply
+prevents remaining units from entering its queue. The optional Qwen
 acceptance suite interrupts a long real synthesis and requires the next reply's
 first audio within four seconds; the full WebSocket matrix checks the same
 user-visible interruption path.
@@ -435,7 +437,7 @@ Search and visible counts exclude inactive controls; hiding a control preserves
 its value, including across save/reload. Model and Qwen voice fields use dropdowns
 with a **Custom…** escape hatch and preserve deployment-specific values. Model
 suggestions are baseline identifiers, not an installed-model inventory. Qwen voice
-suggestions follow the [official speaker list](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice#supported-speakers).
+suggestions follow the [official speaker list](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice#supported-speakers).
 Instructions, vocabulary hints, and wake words remain free text; numeric tuning
 keeps exact numeric inputs. These presentation changes are served directly by the
 voice service: reopen Settings; no APK install or service restart is required.

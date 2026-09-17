@@ -3110,9 +3110,9 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(
             payload["initial_codec_chunk_frames"], DEFAULT_QWEN_INITIAL_CHUNK_FRAMES
         )
-        self.assertIn("natural, relaxed conversational voice", payload["instructions"])
+        self.assertIn("normal, intelligent American engineer", payload["instructions"])
         self.assertIn("normal indoor volume", payload["instructions"])
-        self.assertIn("neutral emphasis", payload["instructions"])
+        self.assertIn("understated confidence", payload["instructions"])
         self.assertEqual(payload["voice"], "ryan")
 
     def test_qwen_keeps_normal_reply_in_one_prosody_request(self):

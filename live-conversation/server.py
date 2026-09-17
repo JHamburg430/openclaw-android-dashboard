@@ -50,15 +50,18 @@ DEFAULT_TTS_MODEL_DIR = "/home/john/.openclaw/tools/sherpa-onnx-tts/models/kokor
 DEFAULT_TTS_SPEAKER_ID = 9  # bm_george, a British male voice
 DEFAULT_TTS_BACKEND = "kokoro"
 DEFAULT_QWEN_TTS_URL = "http://127.0.0.1:8792/v1/audio/speech"
-DEFAULT_QWEN_TTS_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+DEFAULT_QWEN_TTS_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 DEFAULT_QWEN_TTS_VOICE = "ryan"
 DEFAULT_QWEN_TTS_INSTRUCTIONS = (
-    "Speak in a natural, relaxed conversational voice at a moderately brisk "
-    "pace and normal indoor volume. Use ordinary sentence rhythm and neutral "
-    "emphasis."
+    "Speak like a normal, intelligent American engineer in his mid-30s: "
+    "relaxed, clear, warm, direct, and conversational. Use natural pauses, "
+    "subtle emphasis, varied sentence rhythm, and understated confidence. "
+    "Avoid announcer, theatrical, overly cheerful, robotic, breathy, or "
+    "character-like delivery. Keep a moderately brisk pace and normal indoor "
+    "volume."
 )
 DEFAULT_QWEN_INITIAL_CHUNK_FRAMES = 10
-DEFAULT_QWEN_FIRST_UTTERANCE_CHARS = 320
+DEFAULT_QWEN_FIRST_UTTERANCE_CHARS = 48
 DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS = 480
 SPEECH_MODEL_URL = "http://127.0.0.1:11439/api/chat"
 # Large enough for materially better natural-language supervision while staying
