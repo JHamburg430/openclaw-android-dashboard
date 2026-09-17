@@ -57,9 +57,9 @@ DEFAULT_QWEN_TTS_INSTRUCTIONS = (
     "nearby. Use a steady medium pace, restrained energy, subtle pitch movement, "
     "light emphasis, and natural pauses. Keep the delivery engaged and matter-of-fact."
 )
-DEFAULT_QWEN_INITIAL_CHUNK_FRAMES = 10
-DEFAULT_QWEN_FIRST_UTTERANCE_CHARS = 100
-DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS = 600
+DEFAULT_QWEN_INITIAL_CHUNK_FRAMES = 14
+DEFAULT_QWEN_FIRST_UTTERANCE_CHARS = 1800
+DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS = 1800
 DEFAULT_QWEN_TEMPERATURE = 0.7
 DEFAULT_QWEN_TOP_P = 0.95
 DEFAULT_QWEN_TOP_K = 40
@@ -201,8 +201,6 @@ FRAGMENT_RESOLUTION_SCHEMA = {
     "required": ["relation", "complete", "confidence", "assembled_text", "reason"],
     "additionalProperties": False,
 }
-SPEECH_OUTPUT_SCHEMA["properties"].update(TURN_UNDERSTANDING_SCHEMA["properties"])
-SPEECH_OUTPUT_SCHEMA["required"].extend(TURN_UNDERSTANDING_SCHEMA["required"])
 CAPABILITY_CACHE_SECONDS = 60
 SESSION_CACHE_SECONDS = 3
 SESSION_POLL_SECONDS = 10
@@ -1455,9 +1453,6 @@ def split_qwen_utterances(text: str) -> list[str]:
     normalized = normalize_spoken_text(text)
     if not normalized:
         return [""]
-    if len(normalized) <= DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS:
-        return [normalized]
-
     sentences = [
         match.group(0).strip()
         for match in re.finditer(
@@ -1465,6 +1460,23 @@ def split_qwen_utterances(text: str) -> list[str]:
         )
         if match.group(0).strip()
     ]
+    if len(normalized) <= DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS:
+        return [normalized]
+    # vLLM-Omni currently finishes an in-flight generation after a client
+    # disconnect before serving the next request. For unusually long,
+    # many-sentence answers, sentence-sized requests are the safe cancellation
+    # boundary: normal answers retain one continuous request, while barge-in
+    # cannot strand the single synthesis lane behind a long abandoned answer.
+    if (
+        len(normalized) > DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS
+        and len(sentences) > 4
+        and all(
+            len(sentence) <= DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS
+            for sentence in sentences
+        )
+    ):
+        return sentences
+
     units: list[str] = []
     current = ""
 
@@ -1574,6 +1586,14 @@ class IncrementalSpeechStream:
         self.worker: asyncio.Task[None] | None = None
 
     async def feed(self, structured_text: str) -> None:
+        # Qwen models the prosody of the complete input. Starting separate
+        # requests from partial JSON restarts its cadence at every sentence and
+        # uses the preceding turn's delivery state before the current semantic
+        # decision is final. Wait for finish() so normal replies use one request
+        # with the finalized delivery state; only very long replies are split by
+        # split_qwen_utterances() at safe boundaries.
+        if isinstance(self.service.tts, QwenVllmTtsClient):
+            return
         route, reply = partial_structured_reply(structured_text)
         if route != "direct" or not reply.startswith(self.spoken):
             return
@@ -2618,12 +2638,11 @@ class LiveConversationService:
     ) -> DeliveryState:
         """Carry a compact delivery state across turns with conservative hysteresis."""
         prior = self.delivery_state
-        relation = "continuation" if self.history else "new"
+        relation = "new"
         if understanding is not None:
             stance = understanding.delivery_stance
             question = understanding.delivery_question and reply.rstrip().endswith("?")
-            if understanding.relation == "continuation":
-                relation = "continuation"
+            relation = understanding.relation
         else:
             question = reply.rstrip().endswith("?")
             if question:
@@ -2632,11 +2651,22 @@ class LiveConversationService:
                 stance = "acknowledging"
             else:
                 stance = "explaining"
-        # Qwen's preset speakers overreact to small affect labels. Keep the
-        # acoustic baseline neutral-calm and low-arousal across ordinary turns;
-        # stance and genuine-question intonation provide the needed variation.
-        affect = "neutral-calm"
-        arousal = 1
+        if understanding is not None:
+            candidate_affect = understanding.delivery_affect
+            candidate_arousal = understanding.delivery_arousal
+        else:
+            candidate_affect = "neutral-calm"
+            candidate_arousal = 1
+
+        # Preserve a meaningful prior affect through continuations when the
+        # supervisor falls back to its neutral default. New topics can settle
+        # back to neutral immediately. Arousal moves at most one level per turn
+        # so a single noisy classification cannot create an abrupt performance.
+        if relation == "continuation" and candidate_affect == "neutral-calm":
+            affect = prior.affect
+        else:
+            affect = candidate_affect
+        arousal = max(prior.arousal - 1, min(prior.arousal + 1, candidate_arousal))
         state = DeliveryState(
             stance=stance, affect=affect, arousal=arousal,
             question=question, relation=relation,

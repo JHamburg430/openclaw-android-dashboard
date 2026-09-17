@@ -14,6 +14,6 @@ done
 
 curl --fail --silent --show-error --max-time 180 \
   --header 'Content-Type: application/json' \
-  --data '{"model":"Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice","input":"Ready.","voice":"ryan","instructions":"Speak like a normal, intelligent American engineer in his mid-30s: relaxed, clear, warm, direct, and conversational.","language":"English","response_format":"pcm","stream":true,"stream_format":"audio","initial_codec_chunk_frames":10}' \
+  --data '{"model":"Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice","input":"Ready.","voice":"vivian","instructions":"Speak in a calm, low-key conversational voice, as if talking to one colleague nearby. Use a steady medium pace, restrained energy, subtle pitch movement, light emphasis, and natural pauses. Keep the delivery engaged and matter-of-fact.","language":"English","response_format":"pcm","stream":true,"stream_format":"audio","initial_codec_chunk_frames":14,"seed":42,"extra_params":{"temperature":0.7,"top_p":0.95,"top_k":40,"repetition_penalty":1.05}}' \
   --output /dev/null \
   http://127.0.0.1:8792/v1/audio/speech

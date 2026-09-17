@@ -16,6 +16,7 @@ from server import (
     NEW_AGENT_SENTINEL,
     IGNORE_SENTINEL,
     SAY_SENTINEL,
+    SPEECH_OUTPUT_SCHEMA,
     SPEECH_MODEL,
     SPEECH_MODEL_CONTEXT,
     SPEECH_MODEL_KEEP_ALIVE,
@@ -2996,6 +2997,19 @@ class RoutingTests(unittest.TestCase):
         ))
         self.assertEqual(" ".join(parts), text.strip())
 
+    def test_qwen_long_answer_uses_sentence_cancellation_boundaries(self):
+        sentence = "A complete sentence carries natural rhythm and emphasis."
+        repetitions = DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS // len(sentence) + 2
+        text = " ".join([sentence] * repetitions)
+        self.assertGreater(len(text), DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS)
+        self.assertEqual(split_qwen_utterances(text), [sentence] * repetitions)
+
+    def test_qwen_short_five_sentence_answer_keeps_continuous_prosody(self):
+        sentences = [f"This is concise point {index}." for index in range(1, 6)]
+        text = " ".join(sentences)
+        self.assertLess(len(text), DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS)
+        self.assertEqual(split_qwen_utterances(text), [text])
+
     def test_qwen_dynamic_window_does_not_split_short_quoted_question(self):
         text = 'She asked, "Why does this phrase sound unusual?" Then she waited.'
         self.assertEqual(split_qwen_utterances(text), [text])
@@ -3126,20 +3140,76 @@ class RoutingTests(unittest.TestCase):
         })
         self.assertEqual(payload["voice"], "ryan")
 
+    def test_combined_speech_schema_has_unique_required_keys(self):
+        required = SPEECH_OUTPUT_SCHEMA["required"]
+        self.assertEqual(len(required), len(set(required)))
+
     def test_delivery_state_holds_arousal_and_marks_only_real_questions(self):
         service = LiveConversationService("agent:main:delivery", 1.08)
-        service.delivery_state = DeliveryState(arousal=1, affect="neutral-calm")
+        service.delivery_state = DeliveryState(arousal=0, affect="concerned")
         understanding = TurnUnderstanding(
             True, .95, "statement", "continuation", False, False, False,
             "Keep going", "continuation", delivery_stance="reporting",
-            delivery_affect="pleased", delivery_arousal=2,
+            delivery_affect="neutral-calm", delivery_arousal=2,
             delivery_question=True,
         )
         state = service.advance_delivery_state("The service is healthy.", "direct", understanding)
-        self.assertEqual(state.affect, "neutral-calm")
+        self.assertEqual(state.affect, "concerned")
         self.assertEqual(state.arousal, 1)
         self.assertFalse(state.question)
         self.assertIn("same vocal character", state.instruction())
+
+        new_topic = service.advance_delivery_state(
+            "Good news.", "direct",
+            TurnUnderstanding(
+                True, .95, "statement", "new", False, False, False,
+                "Good news", "new", delivery_stance="reporting",
+                delivery_affect="pleased", delivery_arousal=2,
+            ),
+        )
+        self.assertEqual(new_topic.affect, "pleased")
+        self.assertEqual(new_topic.arousal, 2)
+        self.assertEqual(new_topic.relation, "new")
+        self.assertNotIn("preceding turn", new_topic.instruction())
+
+        neutral_topic = service.advance_delivery_state(
+            "The build is ready.", "direct",
+            TurnUnderstanding(
+                True, .95, "statement", "new", False, False, False,
+                "The build is ready", "new", delivery_stance="reporting",
+                delivery_affect="neutral-calm", delivery_arousal=1,
+            ),
+        )
+        self.assertEqual(neutral_topic.affect, "neutral-calm")
+
+    def test_unclassified_reply_does_not_inherit_stale_delivery(self):
+        service = LiveConversationService("agent:main:delivery-reset", 1.08)
+        service.delivery_state = DeliveryState(
+            affect="concerned", arousal=2, relation="continuation"
+        )
+        service.history.append({"role": "assistant", "content": "Earlier warning."})
+        state = service.advance_delivery_state("Action confirmation is on.", "direct")
+        self.assertEqual(state.affect, "neutral-calm")
+        self.assertEqual(state.arousal, 1)
+        self.assertEqual(state.relation, "new")
+
+    def test_qwen_incremental_stream_waits_for_complete_reply(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:qwen-complete", 1.08)
+            service.tts = QwenVllmTtsClient()
+            service.tts.stream_synthesize = MagicMock()
+            socket = AsyncMock()
+            stream = IncrementalSpeechStream(
+                service, socket, "qwen-complete", service.speech_generation
+            )
+            await stream.feed(
+                '{"route":"direct","complete":true,"reply":"First sentence. Next'
+            )
+            self.assertIsNone(stream.worker)
+            service.tts.stream_synthesize.assert_not_called()
+
+        import asyncio
+        asyncio.run(run_test())
 
     def test_qwen_keeps_normal_reply_in_one_prosody_request(self):
         async def run_test():

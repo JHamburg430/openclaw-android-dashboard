@@ -69,8 +69,8 @@ _global('wake_window_seconds', 'Wake recognition window (seconds)', 'Microphone'
 _global('wake_cooldown_seconds', 'Wake cooldown (seconds)', 'Microphone', 5.0, .5, 60.0)
 _setting('tts_speaker_id', 'Kokoro speaker ID', 'Speech output', 9, 0, 10)
 _setting('tts_threads', 'Kokoro worker threads', 'Speech output', 8, 1, 32)
-_global('default_qwen_first_utterance_chars', 'Qwen first utterance characters', 'Speech output', 100, 40, 4000)
-_global('default_qwen_followup_utterance_chars', 'Qwen follow-up utterance characters', 'Speech output', 600, 40, 4000)
+_global('default_qwen_first_utterance_chars', 'Qwen first utterance characters', 'Speech output', 1800, 40, 4000)
+_global('default_qwen_followup_utterance_chars', 'Qwen follow-up utterance characters', 'Speech output', 1800, 40, 4000)
 
 _setting('tts_backend', 'Speech engine', 'Speech output', 'kokoro', options=['kokoro', 'qwen'])
 _setting('tts_speed', 'Kokoro speaking speed', 'Speech output', 1.08, .5, 2.0)
@@ -78,7 +78,7 @@ _setting('qwen_tts_model', 'Qwen speech model', 'Speech output', 'Qwen/Qwen3-TTS
 _setting('qwen_tts_voice', 'Qwen voice', 'Speech output', 'ryan', 1, 100)
 _setting('qwen_tts_instructions', 'Qwen voice direction', 'Speech output',
          'Speak in a calm, low-key conversational voice, as if talking to one colleague nearby. Use a steady medium pace, restrained energy, subtle pitch movement, light emphasis, and natural pauses. Keep the delivery engaged and matter-of-fact.', 0, 2000)
-_setting('qwen_tts_initial_chunk_frames', 'Qwen initial chunk frames', 'Speech output', 10, 1, 100)
+_setting('qwen_tts_initial_chunk_frames', 'Qwen initial chunk frames', 'Speech output', 14, 1, 100)
 _setting('qwen_tts_startup_wait_seconds', 'Qwen startup wait (seconds)', 'Speech output', 0.0, 0.0, 600.0)
 _setting('qwen_tts_temperature', 'Qwen sampling temperature', 'Speech output', .7, 0.0, 2.0)
 _setting('qwen_tts_top_p', 'Qwen sampling top P', 'Speech output', .95, 0.0, 1.0)
