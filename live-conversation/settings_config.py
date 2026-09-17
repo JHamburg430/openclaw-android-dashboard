@@ -77,7 +77,7 @@ _setting('tts_speed', 'Kokoro speaking speed', 'Speech output', 1.08, .5, 2.0)
 _setting('qwen_tts_model', 'Qwen speech model', 'Speech output', 'Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice', 1, 200)
 _setting('qwen_tts_voice', 'Qwen voice', 'Speech output', 'ryan', 1, 100)
 _setting('qwen_tts_instructions', 'Qwen voice direction', 'Speech output',
-         'Speak like a normal, intelligent American engineer in his mid-30s: relaxed, clear, warm, direct, and conversational. Use natural pauses, subtle emphasis, varied sentence rhythm, and understated confidence. Avoid announcer, theatrical, overly cheerful, robotic, breathy, or character-like delivery. Keep a moderately brisk pace and normal indoor volume.', 0, 2000)
+         'Speak casually and matter-of-factly, like an intelligent engineer talking with a colleague at a desk. Keep the emotional energy low and restrained. Use a steady medium pace, a narrow natural pitch range, light emphasis, brief pauses, and mostly level or gently falling sentence endings. Sound attentive and relaxed, but not excited, enthusiastic, upbeat, promotional, performative, or theatrical. Avoid punchy stress, dramatic pitch changes, and exclamation-like rises. Use normal indoor volume.', 0, 2000)
 _setting('qwen_tts_initial_chunk_frames', 'Qwen initial chunk frames', 'Speech output', 10, 1, 100)
 _setting('qwen_tts_startup_wait_seconds', 'Qwen startup wait (seconds)', 'Speech output', 0.0, 0.0, 600.0)
 _setting('asr_model', 'Whisper model', 'ASR', 'small.en', options=['tiny.en', 'base.en', 'small.en', 'medium.en', 'tiny', 'base', 'small', 'medium', 'large-v3', 'turbo'])
