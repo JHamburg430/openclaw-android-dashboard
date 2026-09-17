@@ -694,10 +694,11 @@ class RoutingTests(unittest.TestCase):
             tts_speed_for("Yes?", base=1.15), 1.15
         )
 
-    def test_page_exposes_direct_confirmation_control(self):
+    def test_page_routes_settings_to_the_dedicated_settings_page(self):
         page = render_page()
-        self.assertIn("Toggle confirmation", page)
-        self.assertIn("type:'set_confirmation'", page)
+        self.assertIn('class="settings-link" href="/settings"', page)
+        self.assertNotIn("type:'set_confirmation'", page)
+        self.assertNotIn("type:'set_audio_capture'", page)
 
     def test_stable_partial_prefetch_is_read_only(self):
         async def run_test():
@@ -1544,16 +1545,20 @@ class RoutingTests(unittest.TestCase):
 
     def test_page_displays_and_updates_the_rolling_history(self):
         page = render_page()
-        self.assertIn("Recent messages · newest first", page)
-        self.assertIn('<button id="newSession">New session</button>', page)
+        self.assertIn('<h2 id="historyHeading">Conversation</h2>', page)
+        self.assertIn('<button id="newSession" class="quiet-button">New conversation</button>', page)
         self.assertIn("pendingMessages.push({type:'new_session'})", page)
         self.assertIn("m.type==='history'", page)
-        self.assertIn("historyMessages.slice(-HISTORY_LIMIT).reverse()", page)
+        self.assertIn("historyMessages.slice(-HISTORY_LIMIT)", page)
+        self.assertNotIn("historyMessages.slice(-HISTORY_LIMIT).reverse()", page)
+        self.assertIn("historyList.scrollTop=historyList.scrollHeight", page)
         self.assertIn("addHistory('user',m.text)", page)
         self.assertIn("addHistory('assistant',m.text)", page)
         self.assertIn("get('autostart')==='1'", page)
         self.assertIn("liveConversationStopped", page)
-        self.assertIn("Action confirmation: loading", page)
+        self.assertIn('id="stop" disabled', page)
+        self.assertIn("setRunning(true)", page)
+        self.assertIn("setRunning(false)", page)
         self.assertIn("m.type==='settings'", page)
 
     def test_action_handoff_starts_before_acknowledgment_delivery(self):
@@ -3360,7 +3365,7 @@ class ProductionHardeningTests(unittest.TestCase):
 
     def test_page_exposes_confirmed_recording_deletion_control(self):
         page = render_page()
-        self.assertIn("Delete all recordings", page)
+        self.assertIn("Delete saved recordings", page)
         self.assertIn("window.confirm", page)
         self.assertIn("delete_audio_captures", page)
 

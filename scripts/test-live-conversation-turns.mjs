@@ -9,6 +9,16 @@ const source = readFileSync(
 );
 const scriptMatch = source.match(/<script>\n([\s\S]*?)\n<\/script>/);
 assert.ok(scriptMatch, "embedded Live Conversation script is present");
+assert.ok(source.includes('class="settings-link" href="/settings"'),
+  "the dedicated settings page is available from the header");
+assert.equal(source.includes("type:'set_confirmation'"), false,
+  "the conversation page no longer changes confirmation settings");
+assert.equal(source.includes("type:'set_audio_capture'"), false,
+  "the conversation page no longer changes capture settings");
+assert.ok(source.includes('id="state" class="state" role="status" aria-live="polite"'),
+  "conversation state is announced accessibly");
+assert.ok(source.includes('id="stop" disabled'),
+  "stop is disabled until listening starts");
 
 function pcm(level) {
   const value = Math.max(-32767, Math.min(32767, Math.round(level * 32768)));
@@ -32,8 +42,12 @@ function harness() {
       textContent: "",
       className: "",
       style: {},
+      attributes: {},
       children: [],
       onclick: null,
+      disabled: false,
+      parentElement: null,
+      setAttribute(name, value) { this.attributes[name] = String(value); },
       replaceChildren(...items) { this.children = items; },
       appendChild(item) { this.children.push(item); },
       append(...items) { this.children.push(...items); },
@@ -45,7 +59,11 @@ function harness() {
 
   const document = {
     getElementById(id) {
-      if (!elements.has(id)) elements.set(id, element(id));
+      if (!elements.has(id)) {
+        const current = element(id);
+        if (id === "bar") current.parentElement = element("meter");
+        elements.set(id, current);
+      }
       return elements.get(id);
     },
     createElement: () => element(),
@@ -144,27 +162,6 @@ function harness() {
     audio_capture: false,
     debug_status: { state: "idle", message: "No debug submission pending." },
   });
-  assert.equal(
-    app.elements.get("recording").textContent,
-    "Test audio capture: Off",
-    "recording disclosure shows capture is disabled by default",
-  );
-  const recordingButton = app.elements.get("recording").children[0];
-  recordingButton.onclick();
-  assert.ok(
-    app.sent.some((message) => message.type === "set_audio_capture" && message.enabled === true),
-    "recording toggle explicitly opts in",
-  );
-  app.socket.server({
-    type: "settings",
-    action_confirmation: "automatic",
-    audio_capture: true,
-    debug_status: { state: "idle", message: "No debug submission pending." },
-  });
-  assert.equal(app.elements.get("recording").textContent,
-    "Test audio capture: On — saving microphone turns locally");
-  assert.equal(recordingButton.textContent, "Disable test audio capture");
-
   const debugButton = app.elements.get("sendDebug");
   debugButton.onclick();
   assert.ok(
@@ -209,8 +206,10 @@ function harness() {
     ],
   });
   const bubbles = app.elements.get("history").children;
-  assert.equal(bubbles[0].children[1].textContent, "Newest message",
-    "the newest message is rendered at the top");
+  assert.equal(bubbles[0].children[1].textContent, "Older message",
+    "the transcript is rendered in reading order");
+  assert.equal(bubbles[1].children[1].textContent, "Newest message",
+    "the latest message is rendered at the bottom");
   app.socket.server({ type: "action_status", state: "acknowledged" });
   assert.equal(app.elements.get("state").textContent, "Working…",
     "the UI shows work only after the acknowledgment event");
