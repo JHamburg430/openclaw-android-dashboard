@@ -154,9 +154,10 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
         config = validate_settings({'tts_speaker_id': 4, 'tts_threads': 3, 'tts_speed': 1.4})
         worker = configured_tts_backend(config['tts_speed'], config)
         self.assertEqual((worker.speaker_id, worker.threads, worker.speed), (4, 3, 1.4))
-        config = validate_settings({'tts_backend': 'qwen', 'qwen_tts_voice': 'aiden', 'qwen_tts_instructions': 'Speak quietly', 'qwen_tts_initial_chunk_frames': 12, 'qwen_tts_startup_wait_seconds': 30.0})
+        config = validate_settings({'tts_backend': 'qwen', 'qwen_tts_voice': 'aiden', 'qwen_tts_instructions': 'Speak quietly', 'qwen_tts_initial_chunk_frames': 12, 'qwen_tts_startup_wait_seconds': 30.0, 'qwen_tts_temperature': .65, 'qwen_tts_top_p': .9, 'qwen_tts_top_k': 30, 'qwen_tts_repetition_penalty': 1.1, 'qwen_tts_seed': 7})
         client = configured_tts_backend(config['tts_speed'], config)
         self.assertEqual((client.voice, client.instructions, client.initial_chunk_frames, client.startup_wait_seconds), ('aiden', 'Speak quietly', 12, 30.0))
+        self.assertEqual((client.temperature, client.top_p, client.top_k, client.repetition_penalty, client.seed), (.65, .9, 30, 1.1, 7))
 
 
 if __name__ == '__main__':

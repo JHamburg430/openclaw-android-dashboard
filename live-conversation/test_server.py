@@ -33,6 +33,7 @@ from server import (
     DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS,
     DEGRADED_SPEECH_CONTEXT,
     DEGRADED_SPEECH_MODEL,
+    DeliveryState,
     LiveConversationService,
     IncrementalSpeechStream,
     OnlineTranscript,
@@ -2985,7 +2986,7 @@ class RoutingTests(unittest.TestCase):
 
     def test_qwen_dynamic_window_uses_larger_followup_units(self):
         sentence = "A complete sentence carries natural rhythm and emphasis. "
-        text = sentence * 14
+        text = sentence * 50
         parts = split_qwen_utterances(text.strip())
         self.assertGreater(len(parts), 1)
         self.assertLessEqual(len(parts[0]), DEFAULT_QWEN_FIRST_UTTERANCE_CHARS)
@@ -3103,18 +3104,42 @@ class RoutingTests(unittest.TestCase):
 
     def test_qwen_backend_builds_raw_chunked_pcm_request(self):
         client = QwenVllmTtsClient()
-        payload = client.request_payload("Hello from Jarvis.")
+        delivery = DeliveryState(relation="continuation").instruction()
+        payload = client.request_payload("Hello from Jarvis.", delivery)
         self.assertEqual(payload["response_format"], "pcm")
         self.assertEqual(payload["stream_format"], "audio")
         self.assertTrue(payload["stream"])
         self.assertEqual(
             payload["initial_codec_chunk_frames"], DEFAULT_QWEN_INITIAL_CHUNK_FRAMES
         )
-        self.assertIn("casually and matter-of-factly", payload["instructions"])
-        self.assertIn("normal indoor volume", payload["instructions"])
-        self.assertIn("emotional energy low and restrained", payload["instructions"])
+        self.assertIn("calm, low-key conversational voice", payload["instructions"])
+        self.assertIn("restrained energy", payload["instructions"])
+        self.assertIn("same vocal character", payload["instructions"])
         self.assertIn("gently falling sentence endings", payload["instructions"])
+        self.assertLess(len(payload["instructions"]), 500)
+        self.assertEqual(payload["seed"], 42)
+        self.assertEqual(payload["extra_params"], {
+            "temperature": .7,
+            "top_p": .95,
+            "top_k": 40,
+            "repetition_penalty": 1.05,
+        })
         self.assertEqual(payload["voice"], "ryan")
+
+    def test_delivery_state_holds_arousal_and_marks_only_real_questions(self):
+        service = LiveConversationService("agent:main:delivery", 1.08)
+        service.delivery_state = DeliveryState(arousal=1, affect="neutral-calm")
+        understanding = TurnUnderstanding(
+            True, .95, "statement", "continuation", False, False, False,
+            "Keep going", "continuation", delivery_stance="reporting",
+            delivery_affect="pleased", delivery_arousal=2,
+            delivery_question=True,
+        )
+        state = service.advance_delivery_state("The service is healthy.", "direct", understanding)
+        self.assertEqual(state.affect, "neutral-calm")
+        self.assertEqual(state.arousal, 1)
+        self.assertFalse(state.question)
+        self.assertIn("same vocal character", state.instruction())
 
     def test_qwen_keeps_normal_reply_in_one_prosody_request(self):
         async def run_test():

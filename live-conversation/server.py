@@ -53,17 +53,18 @@ DEFAULT_QWEN_TTS_URL = "http://127.0.0.1:8792/v1/audio/speech"
 DEFAULT_QWEN_TTS_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 DEFAULT_QWEN_TTS_VOICE = "ryan"
 DEFAULT_QWEN_TTS_INSTRUCTIONS = (
-    "Speak casually and matter-of-factly, like an intelligent engineer talking "
-    "with a colleague at a desk. Keep the emotional energy low and restrained. "
-    "Use a steady medium pace, a narrow natural pitch range, light emphasis, "
-    "brief pauses, and mostly level or gently falling sentence endings. Sound "
-    "attentive and relaxed, but not excited, enthusiastic, upbeat, promotional, "
-    "performative, or theatrical. Avoid punchy stress, dramatic pitch changes, "
-    "and exclamation-like rises. Use normal indoor volume."
+    "Speak in a calm, low-key conversational voice, as if talking to one colleague "
+    "nearby. Use a steady medium pace, restrained energy, subtle pitch movement, "
+    "light emphasis, and natural pauses. Keep the delivery engaged and matter-of-fact."
 )
 DEFAULT_QWEN_INITIAL_CHUNK_FRAMES = 10
-DEFAULT_QWEN_FIRST_UTTERANCE_CHARS = 48
-DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS = 480
+DEFAULT_QWEN_FIRST_UTTERANCE_CHARS = 100
+DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS = 600
+DEFAULT_QWEN_TEMPERATURE = 0.7
+DEFAULT_QWEN_TOP_P = 0.95
+DEFAULT_QWEN_TOP_K = 40
+DEFAULT_QWEN_REPETITION_PENALTY = 1.05
+DEFAULT_QWEN_SEED = 42
 SPEECH_MODEL_URL = "http://127.0.0.1:11439/api/chat"
 # Large enough for materially better natural-language supervision while staying
 # within the sub-second warm-response budget on the local Ollama GPUs.
@@ -142,11 +143,37 @@ TURN_UNDERSTANDING_SCHEMA = {
         "clarification_needed": {"type": "boolean"},
         "assembled_text": {"type": "string"},
         "reason": {"type": "string"},
+        "delivery_stance": {
+            "type": "string",
+            "enum": ["acknowledging", "explaining", "reporting", "guiding", "asking"],
+        },
+        "delivery_affect": {
+            "type": "string",
+            "enum": ["neutral-calm", "reassuring", "serious", "concerned", "pleased"],
+        },
+        "delivery_arousal": {"type": "integer", "minimum": 0, "maximum": 2},
+        "delivery_question": {"type": "boolean"},
     },
     "required": [
         "complete", "confidence", "speech_act", "relation", "actionable",
         "requires_grounding", "supersedes_previous", "clarification_needed",
         "assembled_text", "reason",
+        "delivery_stance", "delivery_affect", "delivery_arousal", "delivery_question",
+    ],
+    "additionalProperties": False,
+}
+# The supervisor makes one decision for routing, semantic continuity, and vocal
+# delivery. Keep one schema-constrained object so those decisions cannot drift
+# across separate model calls.
+SPEECH_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        **SPEECH_OUTPUT_SCHEMA["properties"],
+        **TURN_UNDERSTANDING_SCHEMA["properties"],
+    },
+    "required": [
+        "route", "reply", "session_key",
+        *TURN_UNDERSTANDING_SCHEMA["required"],
     ],
     "additionalProperties": False,
 }
@@ -745,6 +772,37 @@ class TurnUnderstanding:
     assembled_text: str
     reason: str
     clarification_needed: bool = False
+    delivery_stance: str = "explaining"
+    delivery_affect: str = "neutral-calm"
+    delivery_arousal: int = 1
+    delivery_question: bool = False
+
+
+@dataclass(frozen=True)
+class DeliveryState:
+    """Stable, low-variance speaking intent carried across adjacent turns."""
+
+    stance: str = "explaining"
+    affect: str = "neutral-calm"
+    arousal: int = 1
+    question: bool = False
+    relation: str = "new"
+
+    def instruction(self) -> str:
+        continuity = (
+            "Maintain the same vocal character and emotional baseline as the preceding turn. "
+            if self.relation == "continuation" else ""
+        )
+        ending = (
+            "Use a slight upward turn only at the final direct question."
+            if self.question else
+            "Use level or gently falling sentence endings."
+        )
+        affect = self.affect.replace("-", " ")
+        return (
+            f"{continuity}Deliver this turn as {self.stance}, with a {affect} tone "
+            f"and low, steady energy level {self.arousal}. {ending}"
+        )
 
 
 VALID_SPEECH_ACTS = frozenset({
@@ -812,7 +870,8 @@ Recent dialogue: {context}
 Return exactly one JSON object containing every one of these keys, even when a value is empty:
 `route`, `reply`, `session_key`, `complete`, `confidence`, `speech_act`, `relation`,
 `actionable`, `requires_grounding`, `supersedes_previous`, `clarification_needed`,
-`assembled_text`, and `reason`.
+`assembled_text`, `reason`, `delivery_stance`, `delivery_affect`, `delivery_arousal`,
+and `delivery_question`.
 Never omit a key. `confidence` must be a JSON number from 0 through 1. `relation` must be exactly
 one of `new`, `continuation`, `correction`, or `meta`; incompleteness belongs only in `complete`.
 - `speech_act` must be exactly one of `request`, `question`, `answer`, `statement`, `correction`,
@@ -829,8 +888,15 @@ one of `new`, `continuation`, `correction`, or `meta`; incompleteness belongs on
 - When an unresolved fragment is nonempty, first test whether the current transcript can supply its missing subject, object, predicate, complement, condition, or proposition. Classify the current words alone only after rejecting that coherent assembly. A short noun phrase or clause may be a complete continuation even when it would be incomplete in isolation.
 - `reply` must address the current assembled meaning, not reuse an acknowledgment from examples or history. For a casual statement, respond to its specific subject or emotion. For an informational question combined with a prohibition, answer the informational question without performing the prohibited action. A generic listening/testing acknowledgment or merely agreeing not to act is not an answer.
 - `reason` is a short semantic explanation, never a keyword citation.
+- `delivery_stance` describes how the reply should be spoken: `acknowledging`, `explaining`,
+  `reporting`, `guiding`, or `asking`. `delivery_affect` is `neutral-calm` by default and may be
+  `reassuring`, `serious`, `concerned`, or `pleased` only when the current meaning clearly calls
+  for it. `delivery_arousal` is 0, 1, or 2; default to 1 and avoid changing it merely because a
+  new turn began. `delivery_question` is true only when the assistant reply itself genuinely asks
+  John a question. Continue the preceding delivery for conversational continuations.
 
-Complete examples (the reply wording may vary, but all keys are mandatory):
+Semantic examples (the reply wording may vary; the required delivery fields follow the rules
+above and are omitted from these examples only for readability):
 Current: "What are the latest updates for the"
 {{"route":"direct","reply":"","session_key":null,"complete":false,"confidence":0.98,"speech_act":"question","relation":"new","actionable":false,"requires_grounding":false,"supersedes_previous":false,"clarification_needed":false,"assembled_text":"What are the latest updates for the","reason":"The requested subject is missing, so the thought is unfinished."}}
 
@@ -890,6 +956,11 @@ Return one JSON object matching the required schema. Choose `route` before writi
 - `new_agent`: only when John explicitly requests another, new, separate, or additional agent. Multiple agents may work concurrently.
 - `session`: only for a follow-up clearly aimed at one listed session. Copy its exact key into `session_key`; never invent one.
 - `ignore`: only speech clearly not addressed to you and having no plausible conversational meaning. Use an empty reply.
+Also select the reply's delivery. Keep `delivery_affect` at `neutral-calm` and
+`delivery_arousal` at 1 unless the meaning clearly requires a small change. Preserve the prior
+delivery for a continuation. Set `delivery_question` true only when your reply genuinely asks
+John a question. `delivery_stance` describes the reply as `acknowledging`, `explaining`,
+`reporting`, `guiding`, or `asking`; it does not describe the user's transcript.
 For every action route (`agent`, `new_agent`, or `session`), `reply` is a brief, natural acknowledgment. Say what you are about to do; never imply the action already happened or include an unverified result. Once routing and authorization are final, the bridge dispatches the action while the acknowledgment is spoken. A silent stop command is the sole exception because its purpose is to stop speech immediately.
 Use an empty `session_key` for every route except `session`. A question about status or currently running work is `direct`; answer it from the session summary. If a transcript is semantically unfinished, set `complete` false, use `direct` with an empty reply, and take no action; the bridge will keep listening for the continuation. Imperfect grammar alone is not grounds to ignore a turn.
 
@@ -1045,6 +1116,15 @@ def parse_turn_understanding(text: str, transcript: str) -> TurnUnderstanding:
     if not isinstance(assembled, str) or not assembled.strip():
         assembled = transcript
     reason = str(payload.get("reason") or "semantic classification").strip()[:240]
+    delivery_stance = str(payload.get("delivery_stance") or "explaining")
+    if delivery_stance not in {"acknowledging", "explaining", "reporting", "guiding", "asking"}:
+        delivery_stance = "explaining"
+    delivery_affect = str(payload.get("delivery_affect") or "neutral-calm")
+    if delivery_affect not in {"neutral-calm", "reassuring", "serious", "concerned", "pleased"}:
+        delivery_affect = "neutral-calm"
+    raw_arousal = payload.get("delivery_arousal", 1)
+    delivery_arousal = raw_arousal if type(raw_arousal) is int else 1
+    delivery_arousal = max(0, min(2, delivery_arousal))
     clarification_needed = payload.get("clarification_needed") is True
     # Enforce internal agreement in the model's structured decision. This does
     # not inspect transcript words: it repairs the case where the controller's
@@ -1073,6 +1153,10 @@ def parse_turn_understanding(text: str, transcript: str) -> TurnUnderstanding:
         assembled_text=re.sub(r"\s+", " ", assembled).strip(),
         reason=reason,
         clarification_needed=clarification_needed,
+        delivery_stance=delivery_stance,
+        delivery_affect=delivery_affect,
+        delivery_arousal=delivery_arousal,
+        delivery_question=payload.get("delivery_question") is True,
     )
 
 
@@ -1476,11 +1560,13 @@ class IncrementalSpeechStream:
     def __init__(
         self, service: "LiveConversationService", socket: web.WebSocketResponse,
         response_id: str, generation: int,
+        delivery_state: DeliveryState | None = None,
     ):
         self.service = service
         self.socket = socket
         self.response_id = response_id
         self.generation = generation
+        self.delivery_state = delivery_state or service.delivery_state
         self.spoken = ""
         self.started = False
         self.tts_ms = 0
@@ -1568,9 +1654,13 @@ class IncrementalSpeechStream:
             total_bytes = 0
             if hasattr(self.service.tts, "stream_synthesize"):
                 pending_pcm = bytearray()
-                stream = self.service.tts.stream_synthesize(
-                    text, tts_speed_for(text, "direct", self.service.tts.speed)
-                )
+                speed = tts_speed_for(text, "direct", self.service.tts.speed)
+                if isinstance(self.service.tts, QwenVllmTtsClient):
+                    stream = self.service.tts.stream_synthesize(
+                        text, speed, self.delivery_state.instruction()
+                    )
+                else:
+                    stream = self.service.tts.stream_synthesize(text, speed)
                 first_audio = True
                 try:
                     async for raw_chunk in stream:
@@ -1719,6 +1809,11 @@ class QwenVllmTtsClient:
         speed: float = 1.0,
         initial_chunk_frames: int = DEFAULT_QWEN_INITIAL_CHUNK_FRAMES,
         startup_wait_seconds: float = 0.0,
+        temperature: float = DEFAULT_QWEN_TEMPERATURE,
+        top_p: float = DEFAULT_QWEN_TOP_P,
+        top_k: int = DEFAULT_QWEN_TOP_K,
+        repetition_penalty: float = DEFAULT_QWEN_REPETITION_PENALTY,
+        seed: int | None = DEFAULT_QWEN_SEED,
     ):
         self.url = url
         self.model = model
@@ -1727,6 +1822,11 @@ class QwenVllmTtsClient:
         self.speed = speed
         self.initial_chunk_frames = initial_chunk_frames
         self.startup_wait_seconds = startup_wait_seconds
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+        self.repetition_penalty = repetition_penalty
+        self.seed = seed
         self.session: aiohttp.ClientSession | None = None
 
     async def start(self) -> None:
@@ -1750,21 +1850,34 @@ class QwenVllmTtsClient:
                     raise
                 await asyncio.sleep(1)
 
-    def request_payload(self, text: str) -> dict[str, Any]:
+    def request_payload(
+        self, text: str, delivery_instruction: str | None = None
+    ) -> dict[str, Any]:
+        instructions = self.instructions
+        if delivery_instruction:
+            instructions = f"{instructions} {delivery_instruction}".strip()
         return {
             "model": self.model,
             "input": text,
             "voice": self.voice,
-            "instructions": self.instructions,
+            "instructions": instructions,
             "language": "English",
             "response_format": "pcm",
             "stream": True,
             "stream_format": "audio",
             "initial_codec_chunk_frames": self.initial_chunk_frames,
+            "seed": self.seed,
+            "extra_params": {
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "top_k": self.top_k,
+                "repetition_penalty": self.repetition_penalty,
+            },
         }
 
     async def stream_synthesize(
-        self, text: str, speed: float | None = None
+        self, text: str, speed: float | None = None,
+        delivery_instruction: str | None = None,
     ) -> AsyncIterator[bytes]:
         # Qwen3-TTS does not currently expose reliable native rate control. The
         # argument is accepted for parity with Kokoro; prosody comes from the
@@ -1788,7 +1901,7 @@ class QwenVllmTtsClient:
                     if not piece:
                         continue
                     async with self.session.post(
-                        self.url, json=self.request_payload(piece)
+                        self.url, json=self.request_payload(piece, delivery_instruction)
                     ) as response:
                         response.raise_for_status()
                         async for raw in response.content.iter_chunked(chunk_bytes):
@@ -1815,9 +1928,12 @@ class QwenVllmTtsClient:
             except asyncio.CancelledError:
                 pass
 
-    async def synthesize(self, text: str, speed: float | None = None) -> bytes:
+    async def synthesize(
+        self, text: str, speed: float | None = None,
+        delivery_instruction: str | None = None,
+    ) -> bytes:
         pcm = bytearray()
-        async for chunk in self.stream_synthesize(text, speed):
+        async for chunk in self.stream_synthesize(text, speed, delivery_instruction):
             pcm.extend(chunk)
         return bytes(pcm)
 
@@ -1836,6 +1952,10 @@ def configured_tts_backend(speed: float, config: dict | None = None) -> Persiste
                 instructions=config['qwen_tts_instructions'],
                 initial_chunk_frames=config['qwen_tts_initial_chunk_frames'],
                 startup_wait_seconds=config['qwen_tts_startup_wait_seconds'],
+                temperature=config['qwen_tts_temperature'], top_p=config['qwen_tts_top_p'],
+                top_k=config['qwen_tts_top_k'],
+                repetition_penalty=config['qwen_tts_repetition_penalty'],
+                seed=config['qwen_tts_seed'],
             )
         worker = PersistentTtsWorker(DEFAULT_TTS_WORKER, DEFAULT_TTS_RUNTIME, DEFAULT_TTS_MODEL_DIR, speed)
         worker.speaker_id = config['tts_speaker_id']
@@ -1924,6 +2044,7 @@ class LiveConversationService:
         self.pending_fragment = ""
         self.pending_fragment_turn_id: str | None = None
         self.last_turn_understanding: TurnUnderstanding | None = None
+        self.delivery_state = DeliveryState()
         self.speech_model_accelerated: bool | None = None
         self.speech_model_acceleration_checked_at = 0.0
         self.speech_model_recovery_at = float("-inf")
@@ -2380,6 +2501,22 @@ class LiveConversationService:
                 content = message.get("content")
                 if role in ("user", "assistant") and isinstance(content, str) and content.strip():
                     self.history.append({"role": role, "content": content.strip()})
+            for event in reversed(self.events):
+                metadata = event.get("metadata") if isinstance(event, dict) else None
+                delivery = metadata.get("delivery") if isinstance(metadata, dict) else None
+                if not isinstance(delivery, dict):
+                    continue
+                try:
+                    self.delivery_state = DeliveryState(
+                        stance=str(delivery.get("stance") or "explaining"),
+                        affect=str(delivery.get("affect") or "neutral-calm"),
+                        arousal=max(0, min(2, int(delivery.get("arousal", 1)))),
+                        question=delivery.get("question") is True,
+                        relation=str(delivery.get("relation") or "continuation"),
+                    )
+                except (TypeError, ValueError):
+                    pass
+                break
             if not self.events:
                 now_ms = int(time.time() * 1000)
                 for index, message in enumerate(self.history):
@@ -2475,6 +2612,38 @@ class LiveConversationService:
         if reply.strip():
             self.pending_spoken_replies.append(reply.strip())
 
+    def advance_delivery_state(
+        self, reply: str, route: str,
+        understanding: TurnUnderstanding | None = None,
+    ) -> DeliveryState:
+        """Carry a compact delivery state across turns with conservative hysteresis."""
+        prior = self.delivery_state
+        relation = "continuation" if self.history else "new"
+        if understanding is not None:
+            stance = understanding.delivery_stance
+            question = understanding.delivery_question and reply.rstrip().endswith("?")
+            if understanding.relation == "continuation":
+                relation = "continuation"
+        else:
+            question = reply.rstrip().endswith("?")
+            if question:
+                stance = "asking"
+            elif route in {"agent", "new_agent", "session", "confirmation"}:
+                stance = "acknowledging"
+            else:
+                stance = "explaining"
+        # Qwen's preset speakers overreact to small affect labels. Keep the
+        # acoustic baseline neutral-calm and low-arousal across ordinary turns;
+        # stance and genuine-question intonation provide the needed variation.
+        affect = "neutral-calm"
+        arousal = 1
+        state = DeliveryState(
+            stance=stance, affect=affect, arousal=arousal,
+            question=question, relation=relation,
+        )
+        self.delivery_state = state
+        return state
+
     def allocate_agent_session_key(self, request: str) -> str:
         words = re.findall(r"[a-z0-9]+", request.lower())
         stop_words = {
@@ -2514,6 +2683,7 @@ class LiveConversationService:
         self.pending_fragment = ""
         self.pending_fragment_turn_id = None
         self.last_turn_understanding = None
+        self.delivery_state = DeliveryState()
         self.superseded_turn_ids.clear()
         self._save_history()
         return self.session_key
@@ -3778,8 +3948,11 @@ class LiveConversationService:
         expected_generation: int | None = None,
         display_text: str | None = None,
         pcm_override: bytes | None = None,
+        delivery_state: DeliveryState | None = None,
     ) -> int:
         """Synthesize and stream one complete spoken response."""
+        if delivery_state is None:
+            delivery_state = self.advance_delivery_state(text, route)
         generation = (
             self.speech_generation if expected_generation is None else expected_generation
         )
@@ -3841,9 +4014,13 @@ class LiveConversationService:
                 # same 100 ms deltas used by Android, keeping enough initial
                 # audio queued to bridge the model's next codec chunk.
                 pending_pcm = bytearray()
-                stream = self.tts.stream_synthesize(
-                    text, tts_speed_for(text, route, self.tts.speed)
-                )
+                speed = tts_speed_for(text, route, self.tts.speed)
+                if isinstance(self.tts, QwenVllmTtsClient):
+                    stream = self.tts.stream_synthesize(
+                        text, speed, delivery_state.instruction()
+                    )
+                else:
+                    stream = self.tts.stream_synthesize(text, speed)
                 audio_started = False
                 try:
                     async for raw_chunk in stream:
@@ -3955,8 +4132,13 @@ class LiveConversationService:
             stage = time.perf_counter()
             turn_id = f"turn-{time.time_ns()}"
             response_id = f"response-{time.monotonic_ns()}"
+            understanding: TurnUnderstanding | None = None
             incremental_speech = IncrementalSpeechStream(
-                self, socket, response_id, turn_generation
+                self, socket, response_id, turn_generation,
+                replace(
+                    self.delivery_state,
+                    relation="continuation" if self.history else "new",
+                ),
             )
             assembled_text = transcript
             handoff_request: str | None = None
@@ -4082,6 +4264,9 @@ class LiveConversationService:
             if route != "direct":
                 await incremental_speech.cancel()
 
+            delivery_state = self.advance_delivery_state(reply, route, understanding)
+            incremental_speech.delivery_state = delivery_state
+
             self.remember(
                 "user", transcript, turn_id=turn_id,
                 metadata={"assembled_text": assembled_text},
@@ -4098,7 +4283,10 @@ class LiveConversationService:
                 return None
             self.remember(
                 "assistant", reply, turn_id=turn_id,
-                metadata={"route": route, "session_key": target_session},
+                metadata={
+                    "route": route, "session_key": target_session,
+                    "delivery": asdict(delivery_state),
+                },
             )
             self.update_audio_capture(
                 capture_id,
@@ -4139,6 +4327,7 @@ class LiveConversationService:
                 metrics.tts_ms = await self.send_spoken_response(
                     socket, reply, metrics.route, response_id,
                     expected_generation=turn_generation,
+                    delivery_state=delivery_state,
                 )
             metrics.total_ms = round((time.perf_counter() - started) * 1000)
             self.observe_turn_metrics(metrics)
