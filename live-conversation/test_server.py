@@ -3010,6 +3010,15 @@ class RoutingTests(unittest.TestCase):
         self.assertLess(len(text), DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS)
         self.assertEqual(split_qwen_utterances(text), [text])
 
+    def test_qwen_medium_five_sentence_answer_bounds_cancelled_backend_work(self):
+        sentences = [
+            f"This is explanation point {index}, with enough detail to sound natural."
+            for index in range(1, 6)
+        ]
+        text = " ".join(sentences)
+        self.assertLess(len(text), DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS)
+        self.assertEqual(split_qwen_utterances(text), sentences)
+
     def test_qwen_dynamic_window_does_not_split_short_quoted_question(self):
         text = 'She asked, "Why does this phrase sound unusual?" Then she waited.'
         self.assertEqual(split_qwen_utterances(text), [text])

@@ -1461,15 +1461,14 @@ def split_qwen_utterances(text: str) -> list[str]:
         )
         if match.group(0).strip()
     ]
-    if len(normalized) <= DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS:
-        return [normalized]
     # vLLM-Omni currently finishes an in-flight generation after a client
-    # disconnect before serving the next request. For unusually long,
-    # many-sentence answers, sentence-sized requests are the safe cancellation
-    # boundary: normal answers retain one continuous request, while barge-in
-    # cannot strand the single synthesis lane behind a long abandoned answer.
+    # disconnect before serving the next request. Once a multi-sentence answer
+    # is long enough to leave several seconds of abandoned synthesis behind,
+    # sentence-sized requests are the safe cancellation boundary. Concise
+    # answers still retain one continuous request and their complete prosody.
+    cancellation_window_chars = 240
     if (
-        len(normalized) > DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS
+        len(normalized) > cancellation_window_chars
         and len(sentences) > 4
         and all(
             len(sentence) <= DEFAULT_QWEN_FOLLOWUP_UTTERANCE_CHARS
