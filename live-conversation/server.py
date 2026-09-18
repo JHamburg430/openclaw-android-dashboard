@@ -34,6 +34,7 @@ from pipecat.transcriptions.language import Language
 from semantic_turn import SemanticTurnDetector, TurnDecision
 from settings_config import SETTINGS_SCHEMA, GLOBAL_KEYS, defaults as settings_defaults, validate_settings
 import settings_api
+import test_results_api
 
 
 SAMPLE_RATE = 16_000
@@ -5037,12 +5038,14 @@ async def build_app(args: argparse.Namespace) -> web.Application:
     app["live_sockets"] = set()
     app["wake_sockets"] = set()
     settings_api.install(app, _origin_matches_request)
+    test_runner = test_results_api.install(app, _origin_matches_request)
     app.router.add_get("/", index)
     app.router.add_get("/health", health)
     app.router.add_get("/metrics", metrics)
     app.router.add_get("/wake", wake_websocket)
     app.router.add_get("/ws", websocket)
     async def cleanup(_: web.Application) -> None:
+        await test_runner.close()
         await service.stop()
 
     app.on_cleanup.append(cleanup)

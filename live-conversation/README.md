@@ -316,6 +316,15 @@ assets are installed under `/home/john/.openclaw`.
 
 ## Verify
 
+Open **Settings → Tests** to run the same allowlisted gates from the Live
+Conversation UI. The results page polls while a run is active, shows step and
+process output in near real time, retains the latest 20 completed runs in
+`~/.openclaw/state/live-conversation-test-results.json`, and prevents overlapping
+runs. Browser input selects only fixed suite identifiers; it cannot provide a
+command, path, environment variable, or service name. The **Full release
+validation** button runs the service smoke gate, browser checks, complete Python
+suite, real Qwen/Whisper acceptance, and deployed audio conversation matrix.
+
 ```bash
 PYTHONPATH=live-conversation \
   ~/.openclaw/tools/pipecat-live-conversation/venv/bin/python \

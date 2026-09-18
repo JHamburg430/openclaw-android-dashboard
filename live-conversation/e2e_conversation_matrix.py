@@ -270,6 +270,7 @@ async def run_matrix(url: str, ordinary_only: bool = False) -> dict:
             health = await response.json()
         router_mode = str((health.get("speech_router") or {}).get("mode") or "unknown")
         report["router_mode"] = router_mode
+        print(f"READY deployed router mode: {router_mode}", flush=True)
         socket = await client.ws_connect(url, heartbeat=20)
         live = LiveSocket(socket)
         try:
@@ -283,6 +284,7 @@ async def run_matrix(url: str, ordinary_only: bool = False) -> dict:
                     "case": label, "transcript": result.transcript,
                     "reply": result.reply, "response_pcm_bytes": len(result.response_pcm),
                 })
+                print(f"PASS speed/noise: {label}", flush=True)
 
             ordinary_matrix = (
                 ("quiet_casual_statement", apply_gain(ordinary_cases[0], 0.35),
@@ -319,6 +321,7 @@ async def run_matrix(url: str, ordinary_only: bool = False) -> dict:
                     "route": result.route,
                     "response_pcm_bytes": len(result.response_pcm),
                 })
+                print(f"PASS ordinary conversation: {label}", flush=True)
 
             if ordinary_only:
                 return report
@@ -352,6 +355,7 @@ async def run_matrix(url: str, ordinary_only: bool = False) -> dict:
                     "gap": gap_ms, "endpoint": endpoint,
                     "transcript": result.transcript, "reply": result.reply,
                 })
+                print(f"PASS pause gap: {gap_ms} ms", flush=True)
 
             # An incomplete long thought must stay silent. Spoken listening
             # acknowledgments overlap normal phone speech and sound like an
@@ -387,6 +391,7 @@ async def run_matrix(url: str, ordinary_only: bool = False) -> dict:
                 "enabled": False, "endpoint": endpoint,
                 "reply": seasonal.reply,
             }
+            print("PASS unfinished-turn silence", flush=True)
 
             # Two separately committed ASR turns must remain one semantic
             # sentence: the first waits silently and the second gets one real
@@ -425,6 +430,7 @@ async def run_matrix(url: str, ordinary_only: bool = False) -> dict:
                 "assembled_reply": second_fragment.reply,
                 "response_pcm_bytes": len(second_fragment.response_pcm),
             }
+            print("PASS split-sentence assembly", flush=True)
 
             # Interrupt actual response PCM, then verify a second real utterance,
             # model response, and audio response survive the barge-in.
@@ -454,6 +460,7 @@ async def run_matrix(url: str, ordinary_only: bool = False) -> dict:
                 "second_reply": second.reply,
                 "second_pcm_bytes": len(second.response_pcm),
             }
+            print("PASS barge-in recovery", flush=True)
         finally:
             await live.close()
     return report

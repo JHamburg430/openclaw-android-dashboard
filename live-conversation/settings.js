@@ -1,5 +1,6 @@
 'use strict';
 const $=id=>document.getElementById(id);
+const testsLink=document.createElement('a');testsLink.href='/tests';testsLink.textContent='Tests';document.querySelector('nav span').prepend(testsLink,' · ');
 let snapshot=null,dirty=false,busy=false,nativeSnapshot=null;
 const controls=new Map(),nativeControls=new Map();
 // Presentation only: never reset inactive values or change runtime defaults.
