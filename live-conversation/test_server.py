@@ -1653,7 +1653,7 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(SPEECH_MODEL, "openclaw-live-conversation:4b")
         self.assertEqual(SPEECH_MODEL_CONTEXT, 8192)
         self.assertEqual(SPEECH_MODEL_URL, "http://127.0.0.1:11437/api/chat")
-        self.assertEqual(SPEECH_MODEL_KEEP_ALIVE, -1)
+        self.assertEqual(SPEECH_MODEL_KEEP_ALIVE, "10m")
         self.assertEqual(SPEECH_NUM_PREDICT, 384)
         self.assertEqual(SPEECH_RETRY_NUM_PREDICT, 640)
 
@@ -1768,7 +1768,7 @@ class RoutingTests(unittest.TestCase):
             with patch("server.time.monotonic", return_value=222):
                 await service.maintain_speech_model()
             self.assertEqual(service.warm_speech_model.await_count, 2)
-            self.assertEqual(SPEECH_MODEL_KEEP_ALIVE, -1)
+            self.assertEqual(SPEECH_MODEL_KEEP_ALIVE, "10m")
         import asyncio
         asyncio.run(run_test())
 

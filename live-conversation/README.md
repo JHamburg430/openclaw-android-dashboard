@@ -49,7 +49,9 @@ in the Android Dashboard plus menu.
    The Ollama-compatible AI gateway on port 11437 routes the dedicated model
    across every healthy worker that has it installed. Residency is preferred,
    so warm interactive sessions stay put while idle or unavailable workers can
-   fail over to another local GPU or the connected remote Ollama server.
+   fail over to another local GPU or the connected remote Ollama server. Its
+   10-minute keep-alive preserves conversational warmth without permanently
+   blocking other models from using a worker.
    Only the newest 8 routing-relevant history messages (up to 4,000 characters)
    are included once, while up to 120 messages remain persisted and visible.
    Every auxiliary inference path uses the same 8k context allocation so an

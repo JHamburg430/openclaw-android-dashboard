@@ -72,7 +72,7 @@ SPEECH_MODEL_URL = "http://127.0.0.1:11437/api/chat"
 # Use a dedicated Ollama model identity so the shared AI gateway can route the
 # fixed-context supervisor independently across every eligible Ollama worker.
 SPEECH_MODEL = "openclaw-live-conversation:4b"
-SPEECH_MODEL_KEEP_ALIVE = -1  # Dedicated interactive model must survive idle periods.
+SPEECH_MODEL_KEEP_ALIVE = "10m"  # Keep it warm without blocking model swaps forever.
 CONVERSATION_INSTRUCTIONS = ''
 SPEECH_TEMPERATURE = 0.0
 SPEECH_TIMEOUT_SECONDS = 30.0
