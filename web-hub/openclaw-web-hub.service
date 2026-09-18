@@ -1,0 +1,28 @@
+[Unit]
+Description=OpenClaw Web Hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/john/openclaw-android-dashboard/web-hub
+Environment=HOST=127.0.0.1
+Environment=PORT=8789
+ExecStart=/home/john/node-v24.15.0-linux-x64/bin/node /home/john/openclaw-android-dashboard/web-hub/server.js
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=128M
+TasksMax=64
+
+[Install]
+WantedBy=default.target
