@@ -46,9 +46,10 @@ in the Android Dashboard plus menu.
    supervisor while remaining responsive once warm on the installed GPUs. Its
    fixed 8k context and dedicated identity prevent unrelated qwen3.5 callers
    with 16k or 32k contexts from repeatedly replacing and reloading its runner.
-   A loopback-only companion Ollama process on port 11439 isolates the live
-   runner from the shared system Ollama scheduler, which otherwise evicted it
-   even while its 30-minute keep-alive was active.
+   The Ollama-compatible AI gateway on port 11437 routes the dedicated model
+   across every healthy worker that has it installed. Residency is preferred,
+   so warm interactive sessions stay put while idle or unavailable workers can
+   fail over to another local GPU or the connected remote Ollama server.
    Only the newest 8 routing-relevant history messages (up to 4,000 characters)
    are included once, while up to 120 messages remain persisted and visible.
    Every auxiliary inference path uses the same 8k context allocation so an
@@ -299,13 +300,14 @@ chmod +x live-conversation/build-tts-worker.sh
 live-conversation/build-tts-worker.sh
 mkdir -p ~/.config/systemd/user
 cp live-conversation/openclaw-live-conversation.service ~/.config/systemd/user/
-cp live-conversation/openclaw-live-ollama.service ~/.config/systemd/user/
 cp live-conversation/openclaw-qwen3-tts.service ~/.config/systemd/user/
+# Install openclaw-live-conversation:4b from this Modelfile on every Ollama
+# worker that should serve interactive traffic through the AI gateway.
 ollama create openclaw-live-conversation:4b -f live-conversation/Modelfile
 systemctl --user daemon-reload
-systemctl --user enable --now openclaw-live-ollama.service
 systemctl --user enable --now openclaw-qwen3-tts.service
 systemctl --user enable --now openclaw-live-conversation.service
+curl -fsS http://127.0.0.1:11437/gateway/status
 curl -fsS http://127.0.0.1:8792/health
 curl -fsS http://127.0.0.1:8790/health
 ```

@@ -1,7 +1,7 @@
 [Unit]
 Description=OpenClaw Pipecat Live Conversation
-After=network-online.target openclaw-gateway.service openclaw-live-ollama.service openclaw-qwen3-tts.service
-Wants=openclaw-live-ollama.service openclaw-qwen3-tts.service
+After=network-online.target openclaw-gateway.service openclaw-ai-gateway.service openclaw-qwen3-tts.service
+Wants=openclaw-ai-gateway.service openclaw-qwen3-tts.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 

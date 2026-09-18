@@ -1652,7 +1652,7 @@ class RoutingTests(unittest.TestCase):
     def test_speech_supervisor_uses_higher_quality_local_model(self):
         self.assertEqual(SPEECH_MODEL, "openclaw-live-conversation:4b")
         self.assertEqual(SPEECH_MODEL_CONTEXT, 8192)
-        self.assertEqual(SPEECH_MODEL_URL, "http://127.0.0.1:11439/api/chat")
+        self.assertEqual(SPEECH_MODEL_URL, "http://127.0.0.1:11437/api/chat")
         self.assertEqual(SPEECH_MODEL_KEEP_ALIVE, -1)
         self.assertEqual(SPEECH_NUM_PREDICT, 384)
         self.assertEqual(SPEECH_RETRY_NUM_PREDICT, 640)

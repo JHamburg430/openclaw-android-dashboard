@@ -66,11 +66,11 @@ DEFAULT_QWEN_TOP_P = 0.95
 DEFAULT_QWEN_TOP_K = 40
 DEFAULT_QWEN_REPETITION_PENALTY = 1.05
 DEFAULT_QWEN_SEED = 42
-SPEECH_MODEL_URL = "http://127.0.0.1:11439/api/chat"
+SPEECH_MODEL_URL = "http://127.0.0.1:11437/api/chat"
 # Large enough for materially better natural-language supervision while staying
 # within the sub-second warm-response budget on the local Ollama GPUs.
-# Use a dedicated Ollama model identity so unrelated qwen3.5 requests with a
-# different context size cannot replace Live Conversation's warm runner.
+# Use a dedicated Ollama model identity so the shared AI gateway can route the
+# fixed-context supervisor independently across every eligible Ollama worker.
 SPEECH_MODEL = "openclaw-live-conversation:4b"
 SPEECH_MODEL_KEEP_ALIVE = -1  # Dedicated interactive model must survive idle periods.
 CONVERSATION_INSTRUCTIONS = ''
