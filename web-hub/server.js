@@ -12,7 +12,7 @@ const ROOT = __dirname;
 const REQUEST_TIMEOUT_MS = 1800;
 
 const APPS = Object.freeze([
-  { id: "control-ui", name: "Control UI", description: "Chat, agents, sessions, nodes, settings, and dashboards.", publicPort: 443, localPort: 38179 },
+  { id: "control-ui", name: "Control UI", description: "Chat, agents, sessions, nodes, settings, and dashboards.", publicPort: 443, localPort: 18789 },
   { id: "live-conversation", name: "Live Conversation", description: "Hands-free voice conversations with Jarvis.", publicPort: 8443, localPort: 8790 },
   { id: "teams-help", name: "Teams Help", description: "Review collaboration records and supporting evidence.", publicPort: 8445, localPort: 8504 },
   { id: "contacts", name: "Contacts", description: "Search and inspect the synchronized contact database.", publicPort: 8446, localPort: 8503 },
