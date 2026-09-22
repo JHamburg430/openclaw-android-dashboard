@@ -33,6 +33,8 @@ const sockets = [];
 const timers = [];
 let prepared = 0;
 let finished = 0;
+let interrupted = 0;
+let nativePlaybackActive = false;
 
 class FakeSocket {
   constructor(url, protocols) {
@@ -66,6 +68,10 @@ class FakeSocket {
     }
     return stopped;
   }
+
+  dispatchEvent(event) {
+    return !this.emit(event.type, event.data);
+  }
 }
 
 FakeSocket.CONNECTING = 0;
@@ -81,7 +87,15 @@ const window = {
     finishAgentResponsePlayback() {
       finished += 1;
     },
+    interruptAgentResponsePlayback() {
+      interrupted += 1;
+      nativePlaybackActive = false;
+    },
+    isAgentResponsePlaybackActive() {
+      return nativePlaybackActive;
+    },
     playAgentResponsePcm16Base64(base64, sampleRate) {
+      nativePlaybackActive = true;
       played.push({ base64, sampleRate, agent: true });
     },
     playPcm16Base64(base64, sampleRate) {
@@ -97,6 +111,16 @@ const window = {
     },
   },
   WebSocket: FakeSocket,
+  MessageEvent: class MessageEvent {
+    constructor(type, init) {
+      this.type = type;
+      this.data = init.data;
+    }
+  },
+};
+window.setTimeout = (callback) => {
+  timers.push(callback);
+  return timers.length;
 };
 
 vm.runInNewContext(script, {
@@ -104,13 +128,16 @@ vm.runInNewContext(script, {
   Object,
   JSON,
   String,
-  setTimeout(callback) {
-    timers.push(callback);
-    return timers.length;
-  },
+  setTimeout: window.setTimeout,
+  MessageEvent: window.MessageEvent,
 });
 
 const socket = new window.WebSocket("wss://gateway.example/ws");
+const downstreamRelayTypes = [];
+socket.addEventListener("message", (event) => {
+  const message = JSON.parse(event.data);
+  if (message.event === "talk.event") downstreamRelayTypes.push(message.payload?.type);
+});
 
 socket.send(JSON.stringify({
   type: "req",
@@ -144,14 +171,22 @@ const emitTalk = (payload) => socket.emit("message", JSON.stringify({
 }));
 
 emitTalk({ type: "output.audio.started" });
-emitTalk({ type: "audio", audioBase64: "AAAA", sampleRate: 24000 });
-emitTalk({ type: "output.audio.delta", delta: "BBBB", sampleRateHz: 16000 });
-emitTalk({ type: "output.audio.delta", payload: { audioBase64: "CCCC", sampleRateHz: 22050 } });
-emitTalk({ type: "response.audio.delta", audio: { data: "data:audio/pcm;base64,DDDD", sampleRateHz: 8000 } });
-emitTalk({ type: "output.audio.done" });
+const audioStops = [
+  emitTalk({ type: "audio", audioBase64: "AAAA", sampleRate: 24000 }),
+  emitTalk({ type: "output.audio.delta", delta: "BBBB", sampleRateHz: 16000 }),
+  emitTalk({ type: "output.audio.delta", payload: { audioBase64: "CCCC", sampleRateHz: 22050 } }),
+  emitTalk({ type: "response.audio.delta", audio: { data: "data:audio/pcm;base64,DDDD", sampleRateHz: 8000 } }),
+];
+assert.deepEqual(audioStops, [true, true, true, true], "native-owned PCM must not reach the Web UI playback/barge-in path");
+const markStopped = emitTalk({ type: "mark", markName: "response-one" });
+assert.equal(markStopped, true, "playback mark waits for native AudioTrack drain");
+nativePlaybackActive = false;
+for (const timer of timers.splice(0)) timer();
+emitTalk({ type: "audioDone" });
 // A provider without explicit started still establishes a fresh boundary.
 emitTalk({ type: "audio", audioBase64: "EEEE", sampleRate: 24000 });
-emitTalk({ type: "local_realtime.output_audio.done" });
+const clearStopped = emitTalk({ type: "clear", reason: "provider_speech_started" });
+assert.equal(clearStopped, false, "provider-confirmed clear still reaches the Control UI state machine");
 emitTalk({ type: "output.audio.delta" });
 emitTalk({ type: "output.text.done", text: "This text already has relay audio." });
 const noReplyStopped = emitTalk({ type: "output.text.done", text: "NO_REPLY" });
@@ -167,12 +202,22 @@ assert.deepEqual(played, [
   { base64: "EEEE", sampleRate: 24000, agent: true },
 ]);
 assert.equal(prepared, 2, "explicit and lazy response starts both prepare native playback");
-assert.equal(finished, 2, "each response completion drains its native playback boundary");
+assert.equal(finished, 1, "the completed response drains its native playback boundary");
+assert.equal(interrupted, 1, "provider-confirmed clear interrupts native playback exactly once");
 assert.equal(noReplyStopped, true);
 assert.equal(emptyTextStopped, true);
 assert.deepEqual(spoken, []);
 assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.audio_missing"));
 assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.event" && entry.payload.type === "session.ready"));
 assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.suppressed"));
+assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.audio_native_owned"));
+assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.mark_deferred"));
+assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.provider_clear"));
+assert.equal(downstreamRelayTypes.includes("audio"), false,
+  "native-owned PCM never reaches the Control UI audio queue");
+assert.equal(downstreamRelayTypes.filter((type) => type === "mark").length, 1,
+  "the completion mark reaches the Control UI once after native drain");
+assert.equal(downstreamRelayTypes.filter((type) => type === "clear").length, 1,
+  "provider-confirmed interruption still reaches the Control UI once");
 
 console.log("talk relay patch handles rewrite and audio playback shapes");

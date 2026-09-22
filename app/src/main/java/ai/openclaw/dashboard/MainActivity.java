@@ -1745,6 +1745,7 @@ public final class MainActivity extends Activity {
                 + "var relayAudioChunks=0;"
                 + "var relayResponseActive=false;"
                 + "var relayTextSequence=0;"
+                + "var deferredRelayMessages=0;"
                 + "function parse(data){if(typeof data!=='string')return null;try{return JSON.parse(data);}catch(_){return null;}}"
                 + "function firstString(){for(var i=0;i<arguments.length;i++){var value=arguments[i];if(typeof value==='string'&&value.trim())return value.trim();}return '';}"
                 + "function traceSession(message){if(!message||typeof message!=='object')return;var found={};var stack=[message],seen=[],steps=0;while(stack.length&&steps++<80){var value=stack.pop();if(!value||typeof value!=='object'||seen.indexOf(value)>=0)continue;seen.push(value);var keys=Object.keys(value);for(var i=0;i<keys.length;i++){var key=keys[i],child=value[key];if((key==='sessionKey'||key==='sessionId'||key==='agentId')&&typeof child==='string'&&child.trim())found[key]=child.trim();else if((key==='title'||key==='displayName')&&typeof child==='string'&&child.trim()&&!found.title)found.title=child.trim();else if(child&&typeof child==='object')stack.push(child);}}if(found.sessionKey||found.sessionId){diag('session.context',found);}}"
@@ -1766,9 +1767,22 @@ public final class MainActivity extends Activity {
                 + "if(typeof params.ttlMs==='number')clean.ttlMs=params.ttlMs;"
                 + "return clean;"
                 + "}"
-                + "function handleRelayMessage(data){"
+                + "function nativePlaybackActive(){try{return !!(nativeAudio&&typeof nativeAudio.isAgentResponsePlaybackActive==='function'&&nativeAudio.isAgentResponsePlaybackActive());}catch(_){return false;}}"
+                + "function deferUntilNativePlaybackDrains(socket,data){"
+                + "var message=parse(data);if(!message)return false;"
+                + "var deferId=++deferredRelayMessages;var startedAt=Date.now();"
+                + "function release(){"
+                + "if(nativePlaybackActive()&&Date.now()-startedAt<30000){window.setTimeout(release,25);return;}"
+                + "message.__openclawNativePlaybackReleased=true;"
+                + "diag('talk.relay.deferred_release',{'id':deferId,'waitMs':Date.now()-startedAt});"
+                + "try{socket.dispatchEvent(new MessageEvent('message',{data:JSON.stringify(message)}));}catch(error){diag('talk.relay.deferred_release.error',{'message':String(error)});}"
+                + "}"
+                + "window.setTimeout(release,25);return true;"
+                + "}"
+                + "function handleRelayMessage(socket,data){"
                 + "var message=parse(data);"
                 + "if(!message||message.type!=='event'||message.event!=='talk.event'||!message.payload)return;"
+                + "if(message.__openclawNativePlaybackReleased)return;"
                 + "var payload=message.payload;"
                 + "if(shouldSuppressRelayMessage(payload)){diag('talk.relay.suppressed',{'type':String(payload.type||''),'reason':'empty_or_no_reply'});return true;}"
                 + "var kind=String(payload.type||'');"
@@ -1779,14 +1793,22 @@ public final class MainActivity extends Activity {
                 + "relayAudioChunks=0;relayResponseActive=true;"
                 + "try{if(nativeAudio&&typeof nativeAudio.prepareAgentResponsePlayback==='function')nativeAudio.prepareAgentResponsePlayback();}catch(error){diag('talk.relay.native_prepare.error',{'message':String(error)});}"
                 + "diag('talk.relay.audio_started',{'type':kind});"
-                + "}else if(isAudioDone){"
+                + "}else if(isAudioDone||kind==='audioDone'){"
                 + "if(relayResponseActive){relayResponseActive=false;try{if(nativeAudio&&typeof nativeAudio.finishAgentResponsePlayback==='function')nativeAudio.finishAgentResponsePlayback();}catch(error){diag('talk.relay.native_finish.error',{'message':String(error)});}diag('talk.relay.audio_done',{'type':kind,'chunks':relayAudioChunks});}else{diag('talk.relay.audio_done_duplicate',{'type':kind});}"
+                + "}else if(kind==='mark'){"
+                + "if(relayResponseActive){relayResponseActive=false;try{if(nativeAudio&&typeof nativeAudio.finishAgentResponsePlayback==='function')nativeAudio.finishAgentResponsePlayback();}catch(error){diag('talk.relay.native_finish.error',{'message':String(error)});}diag('talk.relay.audio_done',{'type':kind,'chunks':relayAudioChunks});}"
+                + "if(nativePlaybackActive()){diag('talk.relay.mark_deferred',{'markName':String(payload.markName||'')});return deferUntilNativePlaybackDrains(socket,data);}"
+                + "}else if(kind==='clear'){"
+                + "relayResponseActive=false;"
+                + "try{if(nativeAudio&&typeof nativeAudio.interruptAgentResponsePlayback==='function')nativeAudio.interruptAgentResponsePlayback();}catch(error){diag('talk.relay.native_interrupt.error',{'message':String(error)});}"
+                + "diag('talk.relay.provider_clear',{'reason':String(payload.reason||'')});"
                 + "}else if(base64&&(kind==='audio'||kind==='output.audio.delta'||kind.indexOf('audio')>=0)){"
                 + "if(!relayResponseActive){relayResponseActive=true;relayAudioChunks=0;try{if(nativeAudio&&typeof nativeAudio.prepareAgentResponsePlayback==='function')nativeAudio.prepareAgentResponsePlayback();}catch(error){diag('talk.relay.native_prepare.error',{'message':String(error)});}}"
                 + "relayAudioChunks++;"
                 + "var sampleRate=audioSampleRate(payload);"
                 + "if(relayAudioChunks===1||relayAudioChunks%20===0){diag('talk.relay.audio',{'type':kind,'chunks':relayAudioChunks,'sampleRate':sampleRate,'bytes':String(base64).length});}"
                 + "try{if(nativeAudio&&typeof nativeAudio.playAgentResponsePcm16Base64==='function'){nativeAudio.playAgentResponsePcm16Base64(String(base64),sampleRate);}else if(nativeAudio&&typeof nativeAudio.playPcm16Base64==='function'){nativeAudio.playPcm16Base64(String(base64),sampleRate);}else{diag('talk.relay.native_play.unavailable',{});}}catch(error){diag('talk.relay.native_play.error',{'message':String(error)});}"
+                + "diag('talk.relay.audio_native_owned',{'type':kind});return true;"
                 + "}else if(kind==='audio'||kind==='output.audio.delta'||kind.indexOf('audio')>=0){"
                 + "diag('talk.relay.audio_missing',{'type':kind,'keys':Object.keys(payload).join(',')});"
                 + "}else{"
@@ -1796,7 +1818,7 @@ public final class MainActivity extends Activity {
                 + "}"
                 + "}"
                 + "function patchSocket(socket){"
-                + "try{socket.addEventListener('message',function(event){traceSession(parse(event&&event.data));if(handleRelayMessage(event&&event.data)===true){try{event.stopImmediatePropagation&&event.stopImmediatePropagation();}catch(_){}}});}catch(_){ }"
+                + "try{socket.addEventListener('message',function(event){traceSession(parse(event&&event.data));if(handleRelayMessage(socket,event&&event.data)===true){try{event.stopImmediatePropagation&&event.stopImmediatePropagation();}catch(_){}}});}catch(_){ }"
                 + "var originalSend=socket.send;"
                 + "socket.send=function(data){"
                 + "try{"
@@ -2582,6 +2604,11 @@ public final class MainActivity extends Activity {
                 outputLock.notifyAll();
             }
             recordDiagnostic("native_audio_output.delivery_done", "queue=" + outputQueue.size());
+        }
+
+        @JavascriptInterface
+        public boolean isAgentResponsePlaybackActive() {
+            return outputRunning.get();
         }
 
         @JavascriptInterface
