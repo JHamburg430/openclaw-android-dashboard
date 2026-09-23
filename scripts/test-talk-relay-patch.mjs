@@ -122,6 +122,7 @@ window.setTimeout = (callback) => {
   timers.push(callback);
   return timers.length;
 };
+const originalWebSocket = window.WebSocket;
 
 vm.runInNewContext(script, {
   window,
@@ -131,6 +132,9 @@ vm.runInNewContext(script, {
   setTimeout: window.setTimeout,
   MessageEvent: window.MessageEvent,
 });
+
+assert.equal(window.WebSocket, originalWebSocket,
+  "the relay shim must not replace the Control UI's global WebSocket constructor");
 
 const socket = new window.WebSocket("wss://gateway.example/ws");
 const downstreamRelayTypes = [];
