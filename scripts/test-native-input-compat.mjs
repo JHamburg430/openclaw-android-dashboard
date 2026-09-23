@@ -15,8 +15,18 @@ const script = Array.from(method.matchAll(/"((?:\\.|[^"\\])*)"/g))
 
 class FakeAudioContext {}
 FakeAudioContext.prototype.createMediaStreamSource = function createMediaStreamSource() {};
+let browserProcessorConnects = 0;
 FakeAudioContext.prototype.createScriptProcessor = function createScriptProcessor() {
-  return { connect() {}, disconnect() {} };
+  return {
+    connect(destination) {
+      browserProcessorConnects += 1;
+      return destination;
+    },
+    disconnect() {},
+  };
+};
+FakeAudioContext.prototype.createGain = function createGain() {
+  return { connect(destination) { return destination; } };
 };
 
 const nativeChunks = [];
@@ -66,6 +76,7 @@ const liveStream = await navigator.mediaDevices.getUserMedia({ audio: true });
 const context = new FakeAudioContext();
 context.sampleRate = 24000;
 const processor = context.createScriptProcessor(4096, 1, 1);
+const sink = context.createGain();
 const frames = [];
 let nowMs = 0;
 let maxPendingRequests = 0;
@@ -79,6 +90,12 @@ processor.onaudioprocess = (event) => {
   maxPendingRequests = Math.max(maxPendingRequests, pendingRequestAcks.length);
 };
 context.createMediaStreamSource(liveStream).connect(processor);
+assert.equal(processor.connect(sink), sink);
+assert.equal(browserProcessorConnects, 0, "native input must not connect the real WebAudio processor graph");
+
+const browserProcessor = context.createScriptProcessor(4096, 1, 1);
+assert.equal(browserProcessor.connect(sink), sink);
+assert.equal(browserProcessorConnects, 1, "non-native processors must preserve their original connection behavior");
 
 const tenMsPcm16 = Buffer.alloc(160 * 2).toString("base64");
 for (let index = 0; index < 68; index += 1) {
@@ -101,4 +118,4 @@ for (let index = 0; index < 300; index += 1) {
 assert.ok(maxPendingRequests < 4, `1,811 ms cancellation-plus-relay latency must stay below the four-request guard; saw ${maxPendingRequests}`);
 processor.disconnect();
 
-console.log("native input bridge implements the MediaStreamTrack contract and emits 16384-sample Talk frames tolerant of cancellation-plus-relay latency");
+console.log("native input bridge implements the MediaStreamTrack contract, bypasses duplicate WebAudio callbacks, and emits 16384-sample Talk frames tolerant of cancellation-plus-relay latency");
