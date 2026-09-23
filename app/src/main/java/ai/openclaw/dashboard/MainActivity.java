@@ -836,7 +836,7 @@ public final class MainActivity extends Activity {
     private void connectDashboardNode() {
         try {
             savePrefs();
-            toGatewayWebSocketUrl(value(urlInput));
+            GatewayUrls.toWebSocket(value(urlInput));
             nodeStatusText.setText("Connecting custom dashboard node...");
             Intent service = new Intent(this, PhoneNodeService.class).setAction(PhoneNodeService.ACTION_RECONNECT);
             startForegroundService(service);
@@ -1692,14 +1692,18 @@ public final class MainActivity extends Activity {
     private String buildNativeAuthScript() {
         String token = value(tokenInput);
         String password = value(passwordInput);
+        String dashboardIdentity = "window.__OPENCLAW_ANDROID_DASHBOARD__={versionName:"
+                + JSONObject.quote(APP_VERSION_NAME) + ",versionCode:" + APP_VERSION_CODE + "};";
+        if (!GatewayUrls.hasExplicitCredentials(token, password)) {
+            return dashboardIdentity;
+        }
         StringBuilder auth = new StringBuilder();
-        auth.append("{\"gatewayUrl\":").append(JSONObject.quote(buildDashboardUrl()));
+        auth.append("{\"gatewayUrl\":").append(JSONObject.quote(GatewayUrls.toWebSocket(buildDashboardUrl())));
         if (!token.isEmpty()) auth.append(",\"token\":").append(JSONObject.quote(token));
         if (!password.isEmpty()) auth.append(",\"password\":").append(JSONObject.quote(password));
         auth.append("}");
         return "window.__OPENCLAW_NATIVE_CONTROL_AUTH__=" + auth + ";"
-                + "window.__OPENCLAW_ANDROID_DASHBOARD__={versionName:" + JSONObject.quote(APP_VERSION_NAME)
-                + ",versionCode:" + APP_VERSION_CODE + "};";
+                + dashboardIdentity;
     }
 
     private String buildDiagnosticsScript() {
@@ -1921,17 +1925,6 @@ public final class MainActivity extends Activity {
         } catch (Exception ignored) {
             return false;
         }
-    }
-
-    private static String toGatewayWebSocketUrl(String raw) {
-        String value = raw == null ? "" : raw.trim();
-        if (value.isEmpty()) throw new IllegalStateException("Gateway URL is required.");
-        if (value.startsWith("ws://") || value.startsWith("wss://")) return value;
-        if (value.startsWith("https://")) value = "wss://" + value.substring(8);
-        else if (value.startsWith("http://")) value = "ws://" + value.substring(7);
-        else value = "wss://" + value;
-        if (!value.endsWith("/")) value = value + "/";
-        return value;
     }
 
     private static String firstNonEmpty(String... values) {

@@ -112,3 +112,20 @@ export ANDROID_HOME=/home/john/.android-build/android-sdk
 export PATH=/home/john/.android-build/jdk-17.0.19+10/bin:/home/john/.android-build/gradle-8.10.2/bin:$ANDROID_HOME/platform-tools:$PATH
 gradle --no-daemon assembleDebug
 ```
+
+## Pre-release emulator
+
+The reusable `openclaw-talk-test` Pixel 7 AVD runs Android 15 / API 35 with host
+microphone and speaker support. From the repository root, start it, build and
+install the current debug APK, forward the host Gateway, and bootstrap the
+Control UI with:
+
+```sh
+scripts/start-emulator.sh
+```
+
+The script uses `adb reverse` for the loopback Gateway and a short-lived browser
+bootstrap URL, so no Gateway password is printed or stored in the repository.
+It leaves the emulator running for manual UI and Talk checks. Emulator results
+are a pre-release regression gate; hardware-specific behavior still requires
+the physical-phone acceptance listed in `PRODUCTION.md`.
