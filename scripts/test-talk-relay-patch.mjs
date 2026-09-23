@@ -154,12 +154,14 @@ socket.send(JSON.stringify({
 }));
 
 assert.equal(sent.length, 1);
-const rewritten = JSON.parse(sent[0]);
-assert.equal(rewritten.method, "talk.session.create");
-assert.deepEqual(rewritten.params, {
+const forwarded = JSON.parse(sent[0]);
+assert.equal(forwarded.method, "talk.client.create",
+  "the current Control UI must own its talk.client.create to talk.session.create fallback lifecycle");
+assert.deepEqual(forwarded.params, {
   mode: "realtime",
   transport: "gateway-relay",
   brain: "agent-consult",
+  language: "en-US",
   sessionKey: "abc",
   vadThreshold: 0.006,
 });
@@ -220,4 +222,4 @@ assert.equal(downstreamRelayTypes.filter((type) => type === "mark").length, 1,
 assert.equal(downstreamRelayTypes.filter((type) => type === "clear").length, 1,
   "provider-confirmed interruption still reaches the Control UI once");
 
-console.log("talk relay patch handles rewrite and audio playback shapes");
+console.log("talk relay patch preserves the Control UI session lifecycle and handles native audio playback shapes");
