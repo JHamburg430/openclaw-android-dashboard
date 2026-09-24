@@ -31,6 +31,7 @@ const spoken = [];
 const sent = [];
 const sockets = [];
 const timers = [];
+const emittedSequences = [];
 let prepared = 0;
 let finished = 0;
 let interrupted = 0;
@@ -138,9 +139,13 @@ assert.equal(window.WebSocket, originalWebSocket,
 
 const socket = new window.WebSocket("wss://gateway.example/ws");
 const downstreamRelayTypes = [];
+const downstreamSequences = [];
 socket.addEventListener("message", (event) => {
   const message = JSON.parse(event.data);
-  if (message.event === "talk.event") downstreamRelayTypes.push(message.payload?.type);
+  if (message.event === "talk.event") {
+    downstreamRelayTypes.push(message.payload?.type);
+    downstreamSequences.push(message.seq);
+  }
 });
 
 socket.send(JSON.stringify({
@@ -170,11 +175,17 @@ assert.deepEqual(forwarded.params, {
   vadThreshold: 0.006,
 });
 
-const emitTalk = (payload) => socket.emit("message", JSON.stringify({
-  type: "event",
-  event: "talk.event",
-  payload,
-}));
+let nextSequence = 1;
+const emitTalk = (payload) => {
+  const seq = nextSequence++;
+  emittedSequences.push(seq);
+  return socket.emit("message", JSON.stringify({
+    type: "event",
+    event: "talk.event",
+    seq,
+    payload,
+  }));
+};
 
 emitTalk({ type: "output.audio.started" });
 const audioStops = [
@@ -185,9 +196,17 @@ const audioStops = [
 ];
 assert.deepEqual(audioStops, [true, true, true, true], "native-owned PCM must not reach the Web UI playback/barge-in path");
 const markStopped = emitTalk({ type: "mark", markName: "response-one" });
-assert.equal(markStopped, true, "playback mark waits for native AudioTrack drain");
+assert.equal(markStopped, false, "the mark reaches the Control UI immediately to preserve gateway sequence order");
+socket.send(JSON.stringify({
+  type: "req",
+  id: 2,
+  method: "talk.session.acknowledgeMark",
+  params: { markName: "response-one" },
+}));
+assert.equal(sent.length, 1, "mark acknowledgement waits while native AudioTrack playback is active");
 nativePlaybackActive = false;
 for (const timer of timers.splice(0)) timer();
+assert.equal(sent.length, 2, "mark acknowledgement is released after native playback drains");
 emitTalk({ type: "audioDone" });
 // A provider without explicit started still establishes a fresh boundary.
 emitTalk({ type: "audio", audioBase64: "EEEE", sampleRate: 24000 });
@@ -217,7 +236,10 @@ assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.audio_missing")
 assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.event" && entry.payload.type === "session.ready"));
 assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.suppressed"));
 assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.audio_native_owned"));
-assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.mark_deferred"));
+assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.sequence_forwarded"));
+assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.mark_pending_native_drain"));
+assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.mark_ack_deferred"));
+assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.mark_ack_released"));
 assert.ok(diagnostics.some((entry) => entry.kind === "talk.relay.provider_clear"));
 assert.equal(downstreamRelayTypes.includes("audio"), false,
   "native-owned PCM never reaches the Control UI audio queue");
@@ -225,5 +247,7 @@ assert.equal(downstreamRelayTypes.filter((type) => type === "mark").length, 1,
   "the completion mark reaches the Control UI once after native drain");
 assert.equal(downstreamRelayTypes.filter((type) => type === "clear").length, 1,
   "provider-confirmed interruption still reaches the Control UI once");
+assert.deepEqual(downstreamSequences, emittedSequences,
+  "native-owned and suppressed Talk events still advance every gateway sequence number in order");
 
 console.log("talk relay patch preserves the Control UI session lifecycle and handles native audio playback shapes");

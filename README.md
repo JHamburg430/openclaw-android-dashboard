@@ -126,6 +126,15 @@ scripts/start-emulator.sh
 
 The script uses `adb reverse` for the loopback Gateway and a short-lived browser
 bootstrap URL, so no Gateway password is printed or stored in the repository.
-It leaves the emulator running for manual UI and Talk checks. Emulator results
-are a pre-release regression gate; hardware-specific behavior still requires
-the physical-phone acceptance listed in `PRODUCTION.md`.
+It also exposes the running Dashboard WebView on local CDP port 9223. With a
+24 kHz mono PCM16 speech fixture, run the repeatable two-turn Talk acceptance:
+
+```sh
+node scripts/test-emulator-talk.mjs /path/to/prompt.pcm
+```
+
+The acceptance requires two recognized utterances and two settled native-audio
+responses in one still-open Talk session, with no failed audio appends or
+WebSocket closure. Emulator results are a pre-release regression gate;
+hardware-specific behavior still requires the physical-phone acceptance listed
+in `PRODUCTION.md`.

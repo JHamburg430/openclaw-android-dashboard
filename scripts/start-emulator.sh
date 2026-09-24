@@ -47,4 +47,18 @@ $ADB -s "$serial" shell pm grant ai.openclaw.dashboard android.permission.RECORD
 $ADB -s "$serial" shell pm grant ai.openclaw.dashboard android.permission.POST_NOTIFICATIONS || true
 node scripts/connect-emulator-dashboard.mjs "$serial"
 
+devtools_socket=""
+for _ in $(seq 1 30); do
+  devtools_socket="$($ADB -s "$serial" shell cat /proc/net/unix 2>/dev/null \
+    | awk '/@webview_devtools_remote_/ {sub(/^@/, "", $NF); print $NF; exit}' \
+    | tr -d '\r')"
+  [[ -n "$devtools_socket" ]] && break
+  sleep 1
+done
+if [[ -n "$devtools_socket" ]]; then
+  $ADB -s "$serial" forward tcp:9223 "localabstract:$devtools_socket" >/dev/null
+else
+  echo "Warning: WebView DevTools socket was not available; automated Talk acceptance is unavailable." >&2
+fi
+
 echo "Android Dashboard is ready on $serial ($AVD_NAME)."
