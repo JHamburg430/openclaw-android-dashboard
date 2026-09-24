@@ -3359,7 +3359,19 @@ class LiveConversationService:
                 self.openclaw_json("agents", "list", "--json"),
                 self.openclaw_json("skills", "list", "--agent", "main", "--json"),
             )
-            agent_lines = [f"agent {item['id']}: {item.get('name', item['id'])}" for item in agents]
+            # `agents list --json` currently returns a top-level array, but keep
+            # this tolerant of the object-shaped response used by some older
+            # OpenClaw builds. A failed shape assumption used to leave the
+            # catalog empty for the whole connection.
+            if isinstance(agents, dict):
+                agents = agents.get("agents", [])
+            if not isinstance(agents, list):
+                raise ValueError("Unexpected agents list response")
+            agent_lines = [
+                f"agent {item['id']}: {item.get('name', item['id'])}"
+                for item in agents
+                if isinstance(item, dict) and item.get("id")
+            ]
             skill_lines = [
                 f"skill {item['name']}: {item.get('description', '')}"
                 for item in skills.get("skills", [])
@@ -3555,6 +3567,16 @@ class LiveConversationService:
         if time.monotonic() - self.capabilities_updated_at >= CAPABILITY_CACHE_SECONDS:
             if not self.capability_refresh_task or self.capability_refresh_task.done():
                 self.capability_refresh_task = asyncio.create_task(self.refresh_capabilities())
+            # The catalog is part of the model's current system prompt. Do not
+            # race prompt construction against the refresh, especially on the
+            # first turn after service startup when Odoo/agent entries would
+            # otherwise be omitted.
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self.capability_refresh_task), timeout=2.5
+                )
+            except asyncio.TimeoutError:
+                LOGGER.warning("capability_refresh_prompt_timeout")
         if time.monotonic() - self.sessions_updated_at >= SESSION_CACHE_SECONDS:
             if not self.session_refresh_task or self.session_refresh_task.done():
                 self.session_refresh_task = asyncio.create_task(self.refresh_sessions())

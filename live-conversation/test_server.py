@@ -2157,6 +2157,40 @@ class RoutingTests(unittest.TestCase):
         import asyncio
         asyncio.run(run_test())
 
+    def test_capability_catalog_exposes_configured_odoo_agent(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.openclaw_json = AsyncMock(side_effect=[
+                [{"id": "main", "name": "Main"}, {"id": "odoo", "name": "Odoo"}],
+                {"skills": []},
+            ])
+            catalog = await service.refresh_capabilities()
+            self.assertIn("agent odoo: Odoo", catalog)
+
+        import asyncio
+        asyncio.run(run_test())
+
+    def test_stale_capability_catalog_is_ready_before_prompt_build(self):
+        async def run_test():
+            service = LiveConversationService("agent:main:live-conversation", 1.15)
+            service.speech_model_accelerated = True
+            service.openclaw_json = AsyncMock(side_effect=[
+                [{"id": "main", "name": "Main"}, {"id": "odoo", "name": "Odoo"}],
+                {"skills": []},
+            ])
+            client, session = mock_semantic_model(semantic_decision(
+                "direct", "Odoo is available through the Odoo agent.",
+                speech_act="question", assembled_text="What about Odoo?",
+            ))
+            with patch("server.aiohttp.ClientSession", return_value=client):
+                await service.speech_reply("What about Odoo?")
+            payload = session.post.call_args.kwargs["json"]
+            prompt = payload["messages"][0]["content"]
+            self.assertIn("agent odoo: Odoo", prompt)
+
+        import asyncio
+        asyncio.run(run_test())
+
     def test_live_session_catalog_exposes_authoritative_status_and_keys(self):
         async def run_test():
             service = LiveConversationService("agent:main:live-conversation", 1.15)
