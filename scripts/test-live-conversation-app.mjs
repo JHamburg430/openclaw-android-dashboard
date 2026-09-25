@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 const source = readFileSync(new URL("../app/src/main/java/ai/openclaw/dashboard/MainActivity.java", import.meta.url), "utf8");
+const controlPage = readFileSync(new URL("../live-conversation/nemotron.html", import.meta.url), "utf8");
+const controlScript = readFileSync(new URL("../live-conversation/nemotron.js", import.meta.url), "utf8");
+const controlUnit = readFileSync(new URL("../live-conversation/openclaw-live-conversation-control.service", import.meta.url), "utf8");
 const methodStart = source.indexOf("private void openLiveConversation()");
 const methodEnd = source.indexOf("private void openNativeToolsPage()", methodStart);
 const method = source.slice(methodStart, methodEnd);
@@ -26,5 +29,8 @@ assert.equal(prepareMethod.includes("preferBluetoothAudioRoute"), true);
 assert.equal(source.includes('"openclaw-native-output-prepare"'), false);
 assert.ok(source.includes("public void interruptAgentResponsePlayback()"));
 assert.ok(source.includes('recordDiagnostic("native_audio_output.cleared", "speech_started")'));
+assert.match(controlPage, /Nemotron Control/);
+assert.match(controlScript, /api\/nemotron\/status/);
+assert.match(controlUnit, /control_server\.py/);
 
-console.log("Live Conversation opens the dedicated Pipecat service");
+console.log("Live Conversation opens the Nemotron control service");

@@ -37,13 +37,11 @@ SUITES = {
         ],
     },
     "browser": {
-        "label": "Browser UI",
-        "description": "Exercises the Live Conversation and settings pages in headless Chromium.",
+        "label": "Nemotron control surface",
+        "description": "Exercises the deployed Nemotron monitoring, routing, and validation console.",
         "kind": "fast",
         "steps": [
-            {"label": "Conversation page", "argv": [NODE, str(REPOSITORY / "scripts/test-live-conversation-app.mjs")], "env": {}},
-            {"label": "Conversation turn UI", "argv": [NODE, str(REPOSITORY / "scripts/test-live-conversation-turns.mjs")], "env": {}},
-            {"label": "Test results page", "argv": [NODE, str(REPOSITORY / "scripts/test-live-conversation-tests.mjs")], "env": {}},
+            {"label": "Nemotron dashboard and health", "argv": [NODE, str(REPOSITORY / "scripts/test-nemotron-control.mjs")], "env": {}},
         ],
     },
     "unit": {

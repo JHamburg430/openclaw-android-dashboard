@@ -1,4 +1,40 @@
-# Pipecat Live Conversation
+# Live Conversation — Nemotron Control
+
+The Live Conversation app is now the private **Nemotron monitoring, control,
+and validation console**. It stays on the existing port 8790 and is opened by
+the Android Dashboard shortcut, so existing ingress and bookmarks continue to
+work.
+
+## Active Nemotron architecture
+
+- `openclaw-live-conversation-control.service` serves the console on
+  `127.0.0.1:8790`.
+- `openclaw-nemo-voicechat.service` owns the Nemotron provider on
+  `127.0.0.1:8793`.
+- The Gateway owns the realtime Talk relay and uses
+  `nemotron-realtime-voice` with `gateway-relay` transport.
+- The console reads effective routing and health, shows provider logs, and
+  exposes only fixed start/stop/restart operations plus allowlisted tests.
+- The former Pipecat/Qwen service remains installed as a disabled rollback
+  target; it is not part of the active Nemotron path.
+
+The old Pipecat conversation implementation remains in `server.py` for
+rollback and source-level regression coverage. It is not started by the
+Nemotron control service.
+
+## Console checks
+
+```bash
+curl -fsS http://127.0.0.1:8790/health
+curl -fsS http://127.0.0.1:8790/api/nemotron/status
+node scripts/test-nemotron-control.mjs
+```
+
+The dashboard's validation buttons run provider health, Gateway health, the
+Nemotron plugin tests, the Android relay patch test, and the native input
+batching compatibility test. Browser requests are same-origin only.
+
+## Legacy implementation reference
 
 This is the dedicated low-latency voice surface opened by **Live Conversation**
 in the Android Dashboard plus menu.

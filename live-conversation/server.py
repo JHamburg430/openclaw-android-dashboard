@@ -34,6 +34,7 @@ from pipecat.transcriptions.language import Language
 from semantic_turn import SemanticTurnDetector, TurnDecision
 from settings_config import SETTINGS_SCHEMA, GLOBAL_KEYS, defaults as settings_defaults, validate_settings
 import settings_api
+import nemotron_control
 import test_results_api
 
 
@@ -4431,7 +4432,14 @@ startButton.onclick=start;stopButton.onclick=()=>{stop();try{OpenClawNativeApp.l
 </script></body></html>"""
 
 
-async def index(_: web.Request) -> web.Response:
+async def index(_: web.Request) -> web.StreamResponse:
+    # The root is now the Nemotron operations console.  Keep the old Pipecat
+    # conversation surface available during migration at /conversation so an
+    # Android shortcut or bookmark never becomes a dead end.
+    return web.FileResponse(Path(__file__).parent / "nemotron.html", headers={"Cache-Control": "no-store"})
+
+
+async def legacy_conversation(_: web.Request) -> web.Response:
     return web.Response(text=render_page(), content_type="text/html", headers={"Cache-Control": "no-store"})
 
 
@@ -5062,13 +5070,16 @@ async def build_app(args: argparse.Namespace) -> web.Application:
     app["wake_sockets"] = set()
     settings_api.install(app, _origin_matches_request)
     test_runner = test_results_api.install(app, _origin_matches_request)
+    nemotron_jobs = nemotron_control.install(app, _origin_matches_request)
     app.router.add_get("/", index)
+    app.router.add_get("/conversation", legacy_conversation)
     app.router.add_get("/health", health)
     app.router.add_get("/metrics", metrics)
     app.router.add_get("/wake", wake_websocket)
     app.router.add_get("/ws", websocket)
     async def cleanup(_: web.Application) -> None:
         await test_runner.close()
+        await nemotron_jobs.close()
         await service.stop()
 
     app.on_cleanup.append(cleanup)
