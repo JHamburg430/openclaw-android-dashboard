@@ -16,13 +16,14 @@ const script = Array.from(method.matchAll(/"((?:\\.|[^"\\])*)"/g))
 class FakeAudioContext {}
 FakeAudioContext.prototype.createMediaStreamSource = function createMediaStreamSource() {};
 let browserProcessorConnects = 0;
+let browserProcessorDisconnects = 0;
 FakeAudioContext.prototype.createScriptProcessor = function createScriptProcessor() {
   return {
     connect(destination) {
       browserProcessorConnects += 1;
       return destination;
     },
-    disconnect() {},
+    disconnect() { browserProcessorDisconnects += 1; },
   };
 };
 FakeAudioContext.prototype.createGain = function createGain() {
@@ -75,6 +76,14 @@ assert.equal(typeof track.dispatchEvent, "function");
 const liveStream = await navigator.mediaDevices.getUserMedia({ audio: true });
 const context = new FakeAudioContext();
 context.sampleRate = 24000;
+const connectFirstProcessor = context.createScriptProcessor(4096, 1, 1);
+const connectFirstSink = context.createGain();
+assert.equal(connectFirstProcessor.connect(connectFirstSink), connectFirstSink);
+assert.equal(browserProcessorConnects, 1, "pre-attachment processor connection initially uses the browser graph");
+context.createMediaStreamSource(liveStream).connect(connectFirstProcessor);
+assert.equal(browserProcessorDisconnects, 1,
+  "native attachment must disconnect a browser graph connected before source attachment");
+
 const processor = context.createScriptProcessor(4096, 1, 1);
 const sink = context.createGain();
 const frames = [];
@@ -91,11 +100,11 @@ processor.onaudioprocess = (event) => {
 };
 context.createMediaStreamSource(liveStream).connect(processor);
 assert.equal(processor.connect(sink), sink);
-assert.equal(browserProcessorConnects, 0, "native input must not connect the real WebAudio processor graph");
+assert.equal(browserProcessorConnects, 1, "native input must not connect the real WebAudio processor graph");
 
 const browserProcessor = context.createScriptProcessor(4096, 1, 1);
 assert.equal(browserProcessor.connect(sink), sink);
-assert.equal(browserProcessorConnects, 1, "non-native processors must preserve their original connection behavior");
+assert.equal(browserProcessorConnects, 2, "non-native processors must preserve their original connection behavior");
 
 const tenMsPcm16 = Buffer.alloc(160 * 2).toString("base64");
 for (let index = 0; index < 68; index += 1) {
@@ -118,4 +127,4 @@ for (let index = 0; index < 300; index += 1) {
 assert.ok(maxPendingRequests < 4, `1,811 ms cancellation-plus-relay latency must stay below the four-request guard; saw ${maxPendingRequests}`);
 processor.disconnect();
 
-console.log("native input bridge implements the MediaStreamTrack contract, bypasses duplicate WebAudio callbacks, and emits 16384-sample Talk frames tolerant of cancellation-plus-relay latency");
+console.log("native input bridge handles both processor connection orders, bypasses duplicate WebAudio callbacks, and emits 16384-sample Talk frames tolerant of cancellation-plus-relay latency");
